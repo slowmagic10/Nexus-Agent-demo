@@ -1,5 +1,8 @@
 export class OpenAICompatibleProvider {
   constructor({ apiKey, baseUrl, model }) {
+    if (!apiKey || apiKey.startsWith("REPLACE_WITH_")) {
+      throw new Error("模型 API Key 尚未配置；请先填写本地环境文件中的 OPENAI_API_KEY");
+    }
     this.name = `openai-compatible/${model}`;
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, "");

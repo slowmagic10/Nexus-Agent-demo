@@ -29,6 +29,37 @@ npm start
 
 通过 `--workspace=/绝对路径` 可切换工作区；默认使用本仓库根目录。
 
+## 固定使用本地 DeepSeek 配置
+
+仓库提供 `.env.deepseek.example`，本机实际配置使用 `.env.deepseek.local`。后者已被 Git 忽略，API Key 不会进入提交。
+
+首次使用时，打开 `.env.deepseek.local`，只替换这一行：
+
+```dotenv
+OPENAI_API_KEY=你的DeepSeek密钥
+```
+
+模型和接口已经固定为：
+
+```dotenv
+OPENAI_BASE_URL=https://api.deepseek.com
+OPENAI_MODEL=deepseek-v4-flash
+```
+
+启动 DeepSeek CLI：
+
+```bash
+npm run deepseek
+```
+
+启动 DeepSeek Web 控制台：
+
+```bash
+npm run gateway:deepseek
+```
+
+然后打开 `http://127.0.0.1:4317`。需要临时切换到 `deepseek-v4-pro` 时，只修改本地配置文件中的 `OPENAI_MODEL`。
+
 ## 基础能力
 
 - Agent Loop：模型、工具、Observation 循环，默认最多 8 步，并有单轮 Token 预算。

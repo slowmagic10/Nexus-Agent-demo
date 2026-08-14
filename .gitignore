@@ -3,3 +3,4 @@
 .nexus/nexus.db-wal
 .nexus/mcp.json
 .nexus/exports/
+.env.deepseek.local
