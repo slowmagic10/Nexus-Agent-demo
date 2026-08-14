@@ -19,23 +19,41 @@ export class TerminalUI {
   render(state) {
     console.clear();
     const event = state.events.at(-1);
-    console.log(`${bold}${cyan}NEXUS AGENT${reset} ${yellow}PROTOTYPE — 临时代码${reset}`);
+    console.log(`${bold}${cyan}NEXUS AGENT${reset} ${yellow}FOUNDATION — 本地基础版${reset}`);
     console.log(`${dim}问题：审批、事件流、工具反馈、记忆与 Skills 组成的最小 Agent 状态模型是否顺手？${reset}\n`);
     console.log(`${bold}会话${reset}      ${state.id}`);
     console.log(`${bold}阶段${reset}      ${state.phase}`);
     console.log(`${bold}模型${reset}      ${state.provider}`);
     console.log(`${bold}工作区${reset}    ${state.workspace}`);
     console.log(`${bold}进度${reset}      step ${state.step} · 模型 ${state.metrics.modelCalls} · 工具 ${state.metrics.toolCalls} · 审批 ${state.metrics.approvals}`);
+    console.log(`${bold}用量${reset}      ${state.metrics.totalTokens || 0} tokens · 模型 ${state.metrics.modelDurationMs || 0}ms · 工具 ${state.metrics.toolDurationMs || 0}ms`);
     console.log(`${bold}记忆/技能${reset} ${state.memory.length} / ${state.loadedSkills.length}`);
     console.log(`${bold}最新事件${reset}  ${event ? `${event.seq} ${event.type}` : "（无）"}`);
     if (state.lastError) console.log(`${bold}错误${reset}      ${state.lastError}`);
     console.log(`\n${bold}最近回答${reset}\n${this.lastAnswer}`);
-    console.log(`\n${dim}/help 帮助  /state 完整状态  /events 事件  /memory 记忆  /quit 退出${reset}`);
+    console.log(`\n${dim}/help 帮助  /state 状态  /events 事件  /memory 会话记忆  /long-memory 长期记忆  /sessions 会话  /export 导出  /quit 退出${reset}`);
   }
 
   question(prompt) {
     if (this.closed) return Promise.resolve(null);
-    return new Promise((resolve) => this.rl.question(prompt, resolve));
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        this.rl.off("close", onClose);
+        resolve(value);
+      };
+      const onClose = () => finish(null);
+      this.rl.once("close", onClose);
+      try {
+        this.rl.question(prompt, finish);
+      } catch (error) {
+        this.rl.off("close", onClose);
+        if (error.code === "ERR_USE_AFTER_CLOSE") finish(null);
+        else reject(error);
+      }
+    });
   }
 
   async approve(call, description, state) {
@@ -58,5 +76,5 @@ export class TerminalUI {
 }
 
 export function helpText() {
-  return `离线演示可尝试：\n- 查看工作区有哪些文件\n- 读取 AGENTS.md\n- 搜索：Agent Loop\n- 记住：我偏好本地模型\n- 查看记忆\n- 查看技能\n- 创建 prototype-output.txt 内容：hello nexus（需要审批）\n- 运行：pwd（需要审批）\n\n真实模型：设置 OPENAI_API_KEY、OPENAI_MODEL；可选 OPENAI_BASE_URL。`;
+  return `离线演示可尝试：\n- 查看工作区有哪些文件\n- 读取 AGENTS.md\n- 搜索：Agent Loop\n- 记住：我偏好本地模型\n- 查看记忆\n- 查看技能\n- 创建 nexus-output.txt 内容：hello nexus（需要审批）\n- 运行：pwd（需要审批）\n- 使用 demo:mcp 启动后输入 MCP 回显：hello（需要审批）\n\n会话：/sessions 查看；长期记忆：/long-memory；导出：/export。\n退出后用 --resume=latest 或 --resume=会话ID 恢复。\n真实模型：设置 OPENAI_API_KEY、OPENAI_MODEL；可选 OPENAI_BASE_URL。`;
 }

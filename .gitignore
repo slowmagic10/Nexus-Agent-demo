@@ -1,0 +1,5 @@
+.nexus/nexus.db
+.nexus/nexus.db-shm
+.nexus/nexus.db-wal
+.nexus/mcp.json
+.nexus/exports/

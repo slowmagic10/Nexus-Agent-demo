@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "echo": {
+      "command": "node",
+      "args": ["scripts/mcp-echo-server.js"],
+      "env": {}
+    }
+  }
+}

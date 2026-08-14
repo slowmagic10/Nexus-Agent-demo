@@ -6,7 +6,7 @@ export class OpenAICompatibleProvider {
     this.model = model;
   }
 
-  async complete({ systemPrompt, messages, tools }) {
+  async complete({ systemPrompt, messages, tools, signal }) {
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -19,6 +19,7 @@ export class OpenAICompatibleProvider {
         tools,
         tool_choice: "auto",
       }),
+      signal,
     });
 
     if (!response.ok) throw new Error(`模型接口返回 ${response.status}：${await response.text()}`);
@@ -33,6 +34,11 @@ export class OpenAICompatibleProvider {
         name: call.function.name,
         arguments: parseArguments(call.function.arguments),
       })),
+      usage: {
+        inputTokens: payload.usage?.prompt_tokens || 0,
+        outputTokens: payload.usage?.completion_tokens || 0,
+        totalTokens: payload.usage?.total_tokens || 0,
+      },
     };
   }
 }

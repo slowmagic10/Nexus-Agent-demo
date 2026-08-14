@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>Nexus Agent</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="sidebar">
+        <header class="brand">
+          <div class="mark">N</div>
+          <div><strong>Nexus</strong><span>Local Agent</span></div>
+        </header>
+        <button id="new-session" class="primary">＋ 新建会话</button>
+        <div class="section-label">会话</div>
+        <nav id="session-list" class="session-list"></nav>
+        <div class="sidebar-foot"><span id="health-dot" class="dot"></span><span id="health-text">连接中</span></div>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <h1 id="session-title">选择或新建会话</h1>
+            <p id="session-meta">本地执行 · 人工审批 · 实时事件</p>
+          </div>
+          <div class="actions">
+            <button id="export-session" disabled>导出</button>
+            <button id="cancel-run" class="danger" disabled>取消任务</button>
+          </div>
+        </header>
+
+        <section class="metrics" id="metrics">
+          <div><span>阶段</span><strong>idle</strong></div>
+          <div><span>模型调用</span><strong>0</strong></div>
+          <div><span>工具调用</span><strong>0</strong></div>
+          <div><span>Token</span><strong>0</strong></div>
+          <div><span>本轮耗时</span><strong>0ms</strong></div>
+        </section>
+
+        <section id="approval" class="approval hidden"></section>
+
+        <div class="content-grid">
+          <section class="conversation panel">
+            <div id="messages" class="messages"><div class="empty">创建会话后开始使用 Nexus。</div></div>
+            <form id="message-form" class="composer">
+              <textarea id="message-input" rows="2" placeholder="描述任务，Enter 发送，Shift+Enter 换行" disabled></textarea>
+              <button type="submit" class="primary" disabled>发送</button>
+            </form>
+          </section>
+
+          <aside class="inspector panel">
+            <div class="tabs">
+              <button class="tab active" data-tab="events">事件</button>
+              <button class="tab" data-tab="memory">长期记忆</button>
+            </div>
+            <div id="events-view" class="tab-view"><div id="events" class="events"></div></div>
+            <div id="memory-view" class="tab-view hidden">
+              <form id="memory-form" class="memory-form">
+                <input id="memory-input" placeholder="新增一条长期记忆">
+                <button type="submit">保存</button>
+              </form>
+              <div id="memory-list" class="memory-list"></div>
+            </div>
+          </aside>
+        </div>
+      </main>
+    </div>
+    <div id="toast" class="toast hidden"></div>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
+

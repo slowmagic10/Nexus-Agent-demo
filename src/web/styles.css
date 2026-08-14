@@ -1,0 +1,58 @@
+:root {
+  --bg: #090c12;
+  --panel: #10151e;
+  --panel-2: #151c27;
+  --line: #232d3d;
+  --text: #edf2f7;
+  --muted: #8190a5;
+  --accent: #77e6bd;
+  --accent-2: #3ba986;
+  --danger: #ff7d8a;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; color: var(--text); background: radial-gradient(circle at 70% -20%, #173128 0, transparent 35%), var(--bg); }
+button, input, textarea { font: inherit; }
+button { color: var(--text); background: var(--panel-2); border: 1px solid var(--line); border-radius: 10px; padding: 9px 13px; cursor: pointer; }
+button:hover:not(:disabled) { border-color: #40516a; transform: translateY(-1px); }
+button:disabled { opacity: .38; cursor: not-allowed; }
+button.primary { color: #06130f; background: var(--accent); border-color: var(--accent); font-weight: 750; }
+button.danger { color: var(--danger); }
+.shell { min-height: 100vh; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
+.sidebar { padding: 22px 16px; background: rgba(10, 14, 20, .92); border-right: 1px solid var(--line); display: flex; flex-direction: column; gap: 16px; }
+.brand { display: flex; gap: 11px; align-items: center; padding: 0 4px 8px; }
+.mark { width: 38px; height: 38px; display: grid; place-items: center; color: #08130f; background: linear-gradient(135deg, var(--accent), #9bdcff); border-radius: 12px; font-weight: 900; }
+.brand strong, .brand span { display: block; }.brand span { color: var(--muted); font-size: 12px; margin-top: 2px; }
+.section-label { color: var(--muted); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; margin: 5px 5px 0; }
+.session-list { display: flex; flex-direction: column; gap: 5px; overflow: auto; }
+.session-item { text-align: left; padding: 10px; background: transparent; border-color: transparent; }
+.session-item.active { background: var(--panel-2); border-color: var(--line); }
+.session-item strong, .session-item span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.session-item span { color: var(--muted); font-size: 11px; margin-top: 4px; }
+.sidebar-foot { margin-top: auto; color: var(--muted); display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 5px; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #687386; }.dot.online { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+.workspace { min-width: 0; padding: 24px 28px; }
+.topbar { display: flex; justify-content: space-between; gap: 20px; align-items: center; }
+.topbar h1 { margin: 0; font-size: 22px; }.topbar p { color: var(--muted); margin: 5px 0 0; font-size: 13px; }
+.actions { display: flex; gap: 8px; }
+.metrics { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 10px; margin: 20px 0; }
+.metrics div { background: rgba(16, 21, 30, .78); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+.metrics span, .metrics strong { display: block; }.metrics span { color: var(--muted); font-size: 11px; }.metrics strong { margin-top: 6px; font-size: 15px; }
+.content-grid { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 14px; height: calc(100vh - 170px); min-height: 520px; }
+.panel { background: rgba(16, 21, 30, .9); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; }
+.conversation { display: flex; flex-direction: column; }.messages { flex: 1; overflow: auto; padding: 22px; }
+.message { max-width: 84%; margin-bottom: 16px; padding: 12px 14px; border-radius: 13px; white-space: pre-wrap; word-break: break-word; line-height: 1.55; }
+.message.user { margin-left: auto; background: #17382f; }.message.assistant { background: var(--panel-2); }.message.tool { color: #a9bbce; background: #0d1118; border: 1px dashed #2b384a; font-family: ui-monospace, monospace; font-size: 12px; }
+.role { color: var(--muted); display: block; font-size: 10px; text-transform: uppercase; margin-bottom: 5px; }
+.composer { display: flex; gap: 10px; padding: 14px; border-top: 1px solid var(--line); background: #0d1118; }
+.composer button { min-width: 72px; white-space: nowrap; }
+textarea, input { width: 100%; color: var(--text); background: #0a0e14; border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; outline: none; }
+textarea:focus, input:focus { border-color: var(--accent-2); }.composer textarea { resize: none; }
+.inspector { display: flex; flex-direction: column; }.tabs { display: flex; border-bottom: 1px solid var(--line); }.tab { flex: 1; border: 0; border-radius: 0; background: transparent; color: var(--muted); }.tab.active { color: var(--accent); box-shadow: inset 0 -2px var(--accent); }
+.tab-view { min-height: 0; overflow: auto; padding: 14px; }.events { display: flex; flex-direction: column; gap: 8px; }
+.event { border-left: 2px solid #314057; padding: 4px 0 4px 10px; }.event strong { font-size: 12px; }.event span { display: block; color: var(--muted); font-size: 10px; margin-top: 3px; }
+.approval { margin-bottom: 14px; padding: 14px; border: 1px solid #735d24; background: #2a2414; border-radius: 12px; }.approval code { display: block; color: #ffe8a3; margin: 7px 0 12px; white-space: pre-wrap; }.approval .row { display: flex; gap: 8px; }
+.memory-form { display: flex; gap: 7px; margin-bottom: 12px; }.memory-list { display: flex; flex-direction: column; gap: 8px; }.memory { padding: 10px; border: 1px solid var(--line); border-radius: 10px; }.memory p { margin: 0 0 8px; font-size: 13px; }.memory button { padding: 4px 7px; font-size: 11px; color: var(--danger); }
+.empty { color: var(--muted); text-align: center; margin-top: 18vh; }.hidden { display: none !important; }
+.toast { position: fixed; right: 22px; bottom: 22px; max-width: 360px; padding: 12px 16px; border-radius: 10px; background: #263246; box-shadow: 0 12px 40px #0008; }
+@media (max-width: 920px) { .shell { grid-template-columns: 1fr; }.sidebar { display: none; }.workspace { padding: 16px; }.content-grid { grid-template-columns: 1fr; height: auto; }.conversation { min-height: 65vh; }.inspector { min-height: 360px; }.metrics { grid-template-columns: repeat(2, 1fr); } }

@@ -3,7 +3,7 @@ import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 
-export function createToolRegistry({ workspace, bundledSkills }) {
+export function createToolRegistry({ workspace, bundledSkills, memoryStore, extraTools = [] }) {
   const root = realpathSync(path.resolve(workspace));
   const skillRoots = [path.join(root, ".nexus", "skills"), bundledSkills];
   const tools = new Map();
@@ -20,6 +20,36 @@ export function createToolRegistry({ workspace, bundledSkills }) {
       return entries.slice(0, 120).map((entry) => `${entry.isDirectory() ? "目录" : "文件"}\t${path.join(requested, entry.name)}`).join("\n") || "（空目录）";
     },
   });
+
+  if (memoryStore) {
+    define({
+      name: "memory_save",
+      description: "保存一条跨会话长期记忆。属于持久化写入，每次要求审批。",
+      approval: "always",
+      parameters: objectSchema({
+        content: { type: "string" },
+        tags: { type: "array", items: { type: "string" } },
+      }, ["content"]),
+      execute: async ({ content, tags = [] }, context) => {
+        const memory = memoryStore.addMemory(content, { tags, sourceSession: context.state.id });
+        return `已保存长期记忆 ${memory.id}：${memory.content}`;
+      },
+    });
+    define({
+      name: "memory_search",
+      description: "搜索跨会话长期记忆。只读，自动执行。",
+      approval: "never",
+      parameters: objectSchema({ query: { type: "string" } }),
+      execute: async ({ query = "" }) => formatMemories(memoryStore.searchMemories(query, 20)),
+    });
+    define({
+      name: "memory_delete",
+      description: "按 ID 删除长期记忆。属于持久化删除，每次要求审批。",
+      approval: "always",
+      parameters: objectSchema({ id: { type: "string" } }, ["id"]),
+      execute: async ({ id }) => memoryStore.deleteMemory(id) ? `已删除长期记忆：${id}` : `未找到长期记忆：${id}`,
+    });
+  }
 
   define({
     name: "read_file",
@@ -70,12 +100,12 @@ export function createToolRegistry({ workspace, bundledSkills }) {
     description: "在工作区执行 Shell 命令。高风险，每次都要求人工审批，危险命令会被策略层拒绝。",
     approval: "always",
     parameters: objectSchema({ command: { type: "string" } }, ["command"]),
-    execute: async ({ command }) => runShell(root, command),
+    execute: async ({ command }, context) => runShell(root, command, context.signal),
   });
 
   define({
     name: "remember",
-    description: "把一条信息加入当前会话的短期记忆。原型退出后清空。",
+    description: "把一条信息加入当前会话记忆。记忆随会话一起保存在本地。",
     approval: "never",
     parameters: objectSchema({ content: { type: "string" } }, ["content"]),
     execute: async ({ content }, context) => {
@@ -117,6 +147,11 @@ export function createToolRegistry({ workspace, bundledSkills }) {
     },
   });
 
+  for (const tool of extraTools) {
+    if (tools.has(tool.name)) throw new Error(`工具名称冲突：${tool.name}`);
+    define(tool);
+  }
+
   return {
     get: (name) => tools.get(name),
     schemas: () => [...tools.values()].map((tool) => ({
@@ -151,7 +186,7 @@ async function walk(root, limit) {
       if ([".git", "node_modules", "dist", "build"].includes(entry.name)) continue;
       const target = path.join(current, entry.name);
       if (entry.isDirectory()) queue.push(target);
-      else if (entry.isFile() && (await fs.stat(target)).size < 1_000_000) results.push(target);
+      else if (entry.isFile() && !/^nexus\.db(?:-(?:wal|shm))?$/.test(entry.name) && (await fs.stat(target)).size < 1_000_000) results.push(target);
       if (results.length >= limit) break;
     }
   }
@@ -176,7 +211,7 @@ async function discoverSkills(roots) {
   return found;
 }
 
-function runShell(cwd, command) {
+function runShell(cwd, command, signal) {
   const denied = /(^|\s)(rm\s+-rf|sudo|shutdown|reboot|mkfs|dd\s+if=|git\s+reset\s+--hard)(\s|$)/i;
   if (denied.test(command)) throw new Error("安全策略拒绝了危险命令");
   return new Promise((resolve, reject) => {
@@ -186,11 +221,18 @@ function runShell(cwd, command) {
       child.kill("SIGTERM");
       reject(new Error("命令执行超过 15 秒，已终止"));
     }, 15_000);
+    const onAbort = () => child.kill("SIGTERM");
+    signal?.addEventListener("abort", onAbort, { once: true });
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.stderr.on("data", (chunk) => { output += chunk; });
     child.on("error", reject);
     child.on("close", (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted) {
+        reject(signal.reason || new Error("任务已取消"));
+        return;
+      }
       const summary = truncate(output.trim(), 12_000) || "（无输出）";
       if (code === 0) resolve(summary);
       else reject(new Error(`退出码 ${code}\n${summary}`));
@@ -200,4 +242,8 @@ function runShell(cwd, command) {
 
 function truncate(value, length) {
   return value.length > length ? `${value.slice(0, length)}\n…（已截断）` : value;
+}
+
+function formatMemories(memories) {
+  return memories.map((item) => `${item.id}\t${item.tags.join(",")}\t${item.content}`).join("\n") || "没有匹配的长期记忆。";
 }

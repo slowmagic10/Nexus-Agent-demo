@@ -4,7 +4,7 @@ export class DemoProvider {
     this.sequence = 0;
   }
 
-  async complete({ messages }) {
+  async complete({ messages, tools }) {
     this.sequence += 1;
     const last = messages.at(-1);
     if (last?.role === "tool") {
@@ -17,7 +17,17 @@ export class DemoProvider {
       toolCalls: [{ id: `demo-${this.sequence}`, name, arguments: args }],
     });
 
+    const mcp = input.match(/(?:MCP\s*回显|MCP\s*echo)[:：\s]+(.+)/i);
+    if (mcp) {
+      const echoTool = tools.find((tool) => tool.function.name.startsWith("mcp__") && /echo/i.test(tool.function.name));
+      if (!echoTool) return { text: "当前没有连接包含 echo 的 MCP 工具。", toolCalls: [] };
+      return call(echoTool.function.name, { text: mcp[1] });
+    }
     const remember = input.match(/(?:记住|remember)[:：\s]*(.+)/i);
+    const longRemember = input.match(/(?:长期记住|长期记忆保存)[:：\s]*(.+)/i);
+    if (longRemember) return call("memory_save", { content: longRemember[1], tags: [] });
+    const longSearch = input.match(/(?:搜索长期记忆|长期记忆搜索)[:：\s]*(.*)/i);
+    if (longSearch) return call("memory_search", { query: longSearch[1] || "" });
     if (remember) return call("remember", { content: remember[1] });
     const read = input.match(/(?:读取|查看|read)\s+([^\s]+\.[\w-]+)/i);
     if (read) return call("read_file", { path: read[1] });
