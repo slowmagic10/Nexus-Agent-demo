@@ -1,5 +1,7 @@
+import { applyStatePatch } from "/state-patch.js";
+
 const $ = (selector) => document.querySelector(selector);
-const state = { sessionId: null, session: null, source: null };
+const state = { sessionId: null, session: null, cursor: 0, source: null };
 
 const elements = {
   sessionList: $("#session-list"), messages: $("#messages"), events: $("#events"),
@@ -49,15 +51,34 @@ async function createSession() {
 
 async function selectSession(id) {
   state.sessionId = id;
-  const { session } = await api(`/sessions/${encodeURIComponent(id)}`);
+  const { session, cursor } = await api(`/sessions/${encodeURIComponent(id)}`);
+  state.cursor = cursor;
   renderSession(session); connectEvents(); await loadSessions();
 }
 
 function connectEvents() {
   state.source?.close();
-  state.source = new EventSource(`/sessions/${encodeURIComponent(state.sessionId)}/events`);
-  state.source.addEventListener("state", (event) => renderSession(JSON.parse(event.data)));
+  state.source = new EventSource(`/sessions/${encodeURIComponent(state.sessionId)}/events?after=${state.cursor}`);
+  state.source.addEventListener("session_event", handleSessionEvent);
   state.source.onerror = () => toast("事件流暂时断开，浏览器将自动重连");
+}
+
+async function handleSessionEvent(message) {
+  const event = JSON.parse(message.data);
+  if (event.cursor <= state.cursor) return;
+  if (event.baseline) {
+    state.session = event.baseline;
+  } else if (event.patch) {
+    state.session = applyStatePatch(state.session, event.patch);
+  } else {
+    const current = await api(`/sessions/${encodeURIComponent(state.sessionId)}`);
+    state.session = current.session;
+    state.cursor = current.cursor;
+    renderSession(state.session);
+    return;
+  }
+  state.cursor = event.cursor;
+  renderSession(state.session);
 }
 
 function renderSession(session) {
@@ -131,7 +152,7 @@ async function cancelRun() {
 async function exportSession() {
   const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/export`);
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.sessionId}.json`; link.click();
+  const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.sessionId}.journal.json`; link.click();
   URL.revokeObjectURL(link.href);
 }
 

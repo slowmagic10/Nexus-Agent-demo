@@ -1,6 +1,7 @@
 // FOUNDATION — coordinates isolated Agent sessions for local HTTP/SSE clients.
 import { createSession, reduceSession } from "../core/state.js";
 import { AgentRuntime } from "../core/agent.js";
+import { AgentSession } from "../core/session.js";
 
 export class GatewaySessionManager {
   constructor({ workspace, provider, tools, systemPrompt, store }) {
@@ -12,7 +13,7 @@ export class GatewaySessionManager {
     this.sessions = new Map();
   }
 
-  create({ resume } = {}) {
+  async create({ resume } = {}) {
     let state = resume === "latest"
       ? this.store.latest(this.workspace)
       : resume
@@ -23,48 +24,82 @@ export class GatewaySessionManager {
       throw new GatewayError(404, resume === "latest" ? "没有可恢复的会话" : `未找到会话：${resume}`);
     }
 
-    state = state
-      ? reduceSession(state, { type: "RESUMED", provider: this.provider.name, workspace: this.workspace })
-      : createSession({ provider: this.provider.name, workspace: this.workspace });
-
-    const existing = this.sessions.get(state.id);
+    const existing = state ? this.sessions.get(state.id) : null;
     if (existing) return existing.state;
 
+    const resumed = Boolean(state);
+    state ||= createSession({ provider: this.provider.name, workspace: this.workspace });
+    const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
+
     const entry = {
-      state,
+      state: session.state,
+      session,
       runtime: null,
       run: null,
       approval: null,
       subscribers: new Set(),
     };
     entry.runtime = new AgentRuntime({
-      state,
-      reducer: reduceSession,
+      session,
       provider: this.provider,
       tools: this.tools,
       systemPrompt: this.systemPrompt,
       retrieveMemory: (query) => this.store.searchMemories(query, 5),
-      onState: (next) => this.update(entry, next),
     });
+    session.subscribe((next) => this.update(entry, next));
     this.sessions.set(state.id, entry);
-    this.store.save(state);
-    return state;
+    if (resumed) {
+      await session.dispatch({ type: "RESUMED", provider: this.provider.name, workspace: this.workspace });
+    }
+    return session.state;
   }
 
   list() {
     return this.store.list(this.workspace);
   }
 
-  get(id) {
-    const entry = this.ensureLoaded(id);
+  async get(id) {
+    const entry = await this.ensureLoaded(id);
     return entry.state;
   }
 
-  sendMessage(id, content) {
+  async view(id) {
+    const entry = await this.ensureLoaded(id);
+    return { state: entry.state, cursor: entry.session.cursor };
+  }
+
+  async branch(id, { cursor } = {}) {
+    const entry = await this.ensureLoaded(id);
+    const parentCursor = cursor ?? entry.session.cursor;
+    if (!Number.isInteger(parentCursor) || parentCursor < 1 || parentCursor > entry.session.cursor) {
+      throw new GatewayError(400, `cursor 必须是 1 到 ${entry.session.cursor} 的整数`);
+    }
+    return this.store.branchSession(id, {
+      cursor: parentCursor,
+      provider: this.provider.name,
+      workspace: this.workspace,
+    });
+  }
+
+  async exportSession(id) {
+    await this.ensureLoaded(id);
+    return this.store.exportJournal(id);
+  }
+
+  async importSession(archive, { id } = {}) {
+    try {
+      return this.store.importJournal(archive, { id, workspace: this.workspace });
+    } catch (error) {
+      if (/会话已存在/.test(error.message)) throw new GatewayError(409, error.message);
+      throw new GatewayError(400, error.message);
+    }
+  }
+
+  async sendMessage(id, content) {
     if (typeof content !== "string" || !content.trim()) {
       throw new GatewayError(400, "content 必须是非空字符串");
     }
-    const entry = this.ensureLoaded(id);
+    const entry = await this.ensureLoaded(id);
     if (entry.run) throw new GatewayError(409, "该会话已有正在运行的任务");
 
     entry.run = entry.runtime.runTurn(content.trim(), (call, description) => (
@@ -78,9 +113,9 @@ export class GatewaySessionManager {
     return entry.state;
   }
 
-  decideApproval(id, callId, approved) {
+  async decideApproval(id, callId, approved) {
     if (typeof approved !== "boolean") throw new GatewayError(400, "approved 必须是布尔值");
-    const entry = this.ensureLoaded(id);
+    const entry = await this.ensureLoaded(id);
     if (!entry.approval || entry.approval.call.id !== callId) {
       throw new GatewayError(409, "该工具调用当前不在等待审批");
     }
@@ -90,8 +125,8 @@ export class GatewaySessionManager {
     return entry.state;
   }
 
-  cancel(id) {
-    const entry = this.ensureLoaded(id);
+  async cancel(id) {
+    const entry = await this.ensureLoaded(id);
     if (!entry.run) throw new GatewayError(409, "该会话当前没有正在运行的任务");
     entry.runtime.cancel("用户通过 Gateway 取消了任务");
     if (entry.approval) {
@@ -116,11 +151,21 @@ export class GatewaySessionManager {
     if (!this.store.deleteMemory(id)) throw new GatewayError(404, `未找到长期记忆：${id}`);
   }
 
-  subscribe(id, listener) {
-    const entry = this.ensureLoaded(id);
+  async subscribe(id, listener) {
+    const entry = await this.ensureLoaded(id);
     entry.subscribers.add(listener);
     listener(entry.state);
     return () => entry.subscribers.delete(listener);
+  }
+
+  async subscribeEvents(id, listener, { after = 0 } = {}) {
+    const entry = await this.ensureLoaded(id);
+    return entry.session.subscribeEvents(listener, { after });
+  }
+
+  async cursor(id) {
+    const entry = await this.ensureLoaded(id);
+    return entry.session.cursor;
   }
 
   async close() {
@@ -139,19 +184,17 @@ export class GatewaySessionManager {
     await Promise.allSettled(runs);
   }
 
-  ensureLoaded(id) {
+  async ensureLoaded(id) {
     const existing = this.sessions.get(id);
     if (existing) return existing;
     const stored = this.store.load(id);
     if (!stored || stored.workspace !== this.workspace) throw new GatewayError(404, `未找到会话：${id}`);
-    this.create({ resume: id });
+    await this.create({ resume: id });
     return this.sessions.get(id);
   }
 
   update(entry, state) {
     entry.state = state;
-    entry.runtime.state = state;
-    this.store.save(state);
     for (const listener of entry.subscribers) listener(state);
   }
 }

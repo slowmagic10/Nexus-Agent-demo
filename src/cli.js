@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import { createSession, reduceSession } from "./core/state.js";
 import { AgentRuntime } from "./core/agent.js";
+import { AgentSession } from "./core/session.js";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 import { DemoProvider } from "./providers/demo.js";
 import { createToolRegistry } from "./tools/registry.js";
@@ -22,6 +23,8 @@ const workspace = path.resolve(workspaceArg || path.resolve(here, ".."));
 const forceDemo = args.includes("--demo");
 const resumeArg = args.find((arg) => arg === "--resume" || arg.startsWith("--resume="));
 const resumeTarget = resumeArg === "--resume" ? "latest" : resumeArg?.slice("--resume=".length);
+const importFile = args.find((arg) => arg.startsWith("--import="))?.slice("--import=".length);
+const importAs = args.find((arg) => arg.startsWith("--import-as="))?.slice("--import-as=".length);
 const listOnly = args.includes("--sessions");
 const provider = !forceDemo && process.env.OPENAI_API_KEY
   ? new OpenAICompatibleProvider({
@@ -31,7 +34,6 @@ const provider = !forceDemo && process.env.OPENAI_API_KEY
     })
   : new DemoProvider();
 
-const context = await loadWorkspaceContext(workspace);
 const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"));
 
 if (listOnly) {
@@ -39,6 +41,28 @@ if (listOnly) {
   store.close();
   process.exit(0);
 }
+
+if (importFile) {
+  try {
+    const archive = JSON.parse(await fs.readFile(path.resolve(importFile), "utf8"));
+    const imported = store.importJournal(archive, { id: importAs, workspace });
+    console.log(`已导入会话 ${imported.id}（${store.latestSessionCursor(imported.id)} 个 durable events）到 ${workspace}`);
+    store.close();
+    process.exit(0);
+  } catch (error) {
+    store.close();
+    console.error(`导入失败：${error.message}`);
+    process.exit(1);
+  }
+}
+
+if (importAs) {
+  store.close();
+  console.error("--import-as 必须与 --import 一起使用");
+  process.exit(1);
+}
+
+const context = await loadWorkspaceContext(workspace);
 
 const mcp = await connectMcpTools(await loadMcpConfig(mcpConfigArg, workspace));
 const tools = createToolRegistry({
@@ -62,21 +86,19 @@ if (resumeTarget && !initialState) {
   process.exit(1);
 }
 
-initialState = initialState
-  ? reduceSession(initialState, { type: "RESUMED", provider: provider.name, workspace })
-  : createSession({ provider: provider.name, workspace });
-store.save(initialState);
+const resumed = Boolean(initialState);
+initialState ||= createSession({ provider: provider.name, workspace });
+const session = new AgentSession({ state: initialState, reducer: reduceSession, journal: store });
+session.subscribe((state) => ui.render(state));
+if (resumed) {
+  await session.dispatch({ type: "RESUMED", provider: provider.name, workspace });
+}
 const runtime = new AgentRuntime({
-  state: initialState,
-  reducer: reduceSession,
+  session,
   provider,
   tools,
   systemPrompt: buildSystemPrompt(context),
   retrieveMemory: (query) => store.searchMemories(query, 5),
-  onState: (state) => {
-    store.save(state);
-    ui.render(state);
-  },
 });
 
 ui.render(runtime.state);
@@ -118,10 +140,11 @@ while (true) {
   }
   if (input === "/export") {
     const exportDir = path.join(workspace, ".nexus", "exports");
-    const exportFile = path.join(exportDir, `${runtime.state.id}.json`);
+    const exportFile = path.join(exportDir, `${runtime.state.id}.journal.json`);
+    const archive = store.exportJournal(runtime.state.id);
     await fs.mkdir(exportDir, { recursive: true });
-    await fs.writeFile(exportFile, `${JSON.stringify(runtime.state, null, 2)}\n`, "utf8");
-    ui.lastAnswer = `会话已导出：${exportFile}`;
+    await fs.writeFile(exportFile, `${JSON.stringify(archive, null, 2)}\n`, "utf8");
+    ui.lastAnswer = `可重放 journal 已导出：${exportFile}`;
     ui.render(runtime.state);
     continue;
   }

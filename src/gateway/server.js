@@ -48,7 +48,7 @@ async function route(request, response, manager, staticRoot) {
     throw new GatewayError(415, "POST 请求必须使用 application/json");
   }
 
-  if (request.method === "GET" && staticRoot && ["/", "/app.js", "/styles.css"].includes(url.pathname)) {
+  if (request.method === "GET" && staticRoot && ["/", "/app.js", "/styles.css", "/state-patch.js"].includes(url.pathname)) {
     await sendStatic(response, staticRoot, url.pathname);
     return;
   }
@@ -82,7 +82,15 @@ async function route(request, response, manager, staticRoot) {
 
   if (request.method === "POST" && url.pathname === "/sessions") {
     const body = await readJson(request);
-    const state = manager.create({ resume: body.resume });
+    const state = await manager.create({ resume: body.resume });
+    sendJson(response, 201, { session: state });
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/sessions/imports") {
+    const body = await readJson(request, { maxBytes: 10_000_000 });
+    if (!body.archive) throw new GatewayError(400, "archive 必须是 portable journal 对象");
+    const state = await manager.importSession(body.archive, { id: body.id });
     sendJson(response, 201, { session: state });
     return;
   }
@@ -90,31 +98,41 @@ async function route(request, response, manager, staticRoot) {
   if (parts[0] === "sessions" && parts[1]) {
     const id = parts[1];
     if (request.method === "GET" && parts.length === 2) {
-      sendJson(response, 200, { session: manager.get(id) });
+      const view = await manager.view(id);
+      sendJson(response, 200, {
+        session: view.state,
+        cursor: view.cursor,
+      });
       return;
     }
     if (request.method === "GET" && parts[2] === "export" && parts.length === 3) {
-      sendJson(response, 200, { exportedAt: new Date().toISOString(), session: manager.get(id) });
+      sendJson(response, 200, await manager.exportSession(id));
       return;
     }
     if (request.method === "GET" && parts[2] === "events" && parts.length === 3) {
-      openEventStream(request, response, manager, id);
+      await openEventStream(request, response, manager, id, eventCursor(url, request));
       return;
     }
     if (request.method === "POST" && parts[2] === "messages" && parts.length === 3) {
       const body = await readJson(request);
-      const state = manager.sendMessage(id, body.content);
+      const state = await manager.sendMessage(id, body.content);
       sendJson(response, 202, { accepted: true, session: state });
       return;
     }
+    if (request.method === "POST" && parts[2] === "branches" && parts.length === 3) {
+      const body = await readJson(request);
+      const state = await manager.branch(id, { cursor: body.cursor });
+      sendJson(response, 201, { session: state });
+      return;
+    }
     if (request.method === "POST" && parts[2] === "cancel" && parts.length === 3) {
-      const state = manager.cancel(id);
+      const state = await manager.cancel(id);
       sendJson(response, 202, { accepted: true, session: state });
       return;
     }
     if (request.method === "POST" && parts[2] === "approvals" && parts[3] && parts.length === 4) {
       const body = await readJson(request);
-      const state = manager.decideApproval(id, parts[3], body.approved);
+      const state = await manager.decideApproval(id, parts[3], body.approved);
       sendJson(response, 202, { accepted: true, session: state });
       return;
     }
@@ -123,15 +141,18 @@ async function route(request, response, manager, staticRoot) {
   throw new GatewayError(404, "接口不存在");
 }
 
-function openEventStream(request, response, manager, id) {
+async function openEventStream(request, response, manager, id, after) {
+  await manager.get(id);
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
     connection: "keep-alive",
+    "x-accel-buffering": "no",
   });
-  const unsubscribe = manager.subscribe(id, (state) => {
-    response.write(`event: state\ndata: ${JSON.stringify(state)}\n\n`);
-  });
+  response.flushHeaders?.();
+  const unsubscribe = await manager.subscribeEvents(id, (event) => {
+    response.write(`id: ${event.cursor}\nevent: session_event\ndata: ${JSON.stringify(event)}\n\n`);
+  }, { after });
   const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
   request.once("close", () => {
     clearInterval(heartbeat);
@@ -139,18 +160,42 @@ function openEventStream(request, response, manager, id) {
   });
 }
 
-async function readJson(request) {
-  let body = "";
+function eventCursor(url, request) {
+  const query = parseCursor(url.searchParams.get("after"), "after");
+  const lastEventId = parseCursor(request.headers["last-event-id"], "Last-Event-ID");
+  return Math.max(query, lastEventId);
+}
+
+function parseCursor(value, label) {
+  if (value === null || value === undefined || value === "") return 0;
+  if (!/^\d+$/.test(String(value))) throw new GatewayError(400, `${label} 必须是非负整数`);
+  const cursor = Number(value);
+  if (!Number.isSafeInteger(cursor)) throw new GatewayError(400, `${label} 超出安全整数范围`);
+  return cursor;
+}
+
+async function readJson(request, { maxBytes = 1_000_000 } = {}) {
+  const chunks = [];
+  let size = 0;
   for await (const chunk of request) {
-    body += chunk;
-    if (Buffer.byteLength(body) > 1_000_000) throw new GatewayError(413, "请求体超过 1 MB");
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    size += buffer.length;
+    if (size > maxBytes) {
+      throw new GatewayError(413, `请求体超过 ${formatByteLimit(maxBytes)}`);
+    }
+    chunks.push(buffer);
   }
+  const body = Buffer.concat(chunks).toString("utf8");
   if (!body) return {};
   try {
     return JSON.parse(body);
   } catch {
     throw new GatewayError(400, "请求体必须是合法 JSON");
   }
+}
+
+function formatByteLimit(bytes) {
+  return Number.isInteger(bytes / 1_000_000) ? `${bytes / 1_000_000} MB` : `${bytes} bytes`;
 }
 
 function sendJson(response, status, payload) {
@@ -168,7 +213,8 @@ function isLoopback(host) {
 
 async function sendStatic(response, root, pathname) {
   const file = pathname === "/" ? "index.html" : pathname.slice(1);
-  const body = await fs.readFile(path.join(root, file));
+  const target = file === "state-patch.js" ? path.resolve(root, "..", file) : path.join(root, file);
+  const body = await fs.readFile(target);
   const type = file.endsWith(".html") ? "text/html" : file.endsWith(".js") ? "text/javascript" : "text/css";
   response.writeHead(200, {
     "content-type": `${type}; charset=utf-8`,

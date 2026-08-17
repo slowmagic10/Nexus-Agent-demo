@@ -64,12 +64,13 @@ npm run gateway:deepseek
 
 - Agent Loop：模型、工具、Observation 循环，默认最多 8 步，并有单轮 Token 预算。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
+- 模型上下文：只从 durable event 投影消息、记忆与 Skills；默认按 32,000 estimated input tokens 规划窗口，超限时只保留连续的最近完整 turn，运行指标、审批和 UI 状态不会进入模型输入。
 - 工具安全：路径锁定工作区；读操作自动执行；写文件、Shell、长期记忆修改及 MCP 操作逐次审批；危险 Shell 模式硬拒绝；工具有超时与取消信号。
 - Workspace 与 Skills：读取 `AGENTS.md`、`SOUL.md`，按需加载 `.nexus/skills/*/SKILL.md`。
-- 持久化：SQLite 保存会话、消息、事件、短期记忆、已加载 Skills 和跨会话长期记忆。
-- 恢复与导出：按 ID 恢复会话，安全闭合中断的工具调用，并导出完整 JSON 快照。
+- 持久化：SQLite 保存会话、消息、事件、短期记忆、已加载 Skills 和跨会话长期记忆；自动执行事务化 schema migration，并用带校验和的 checkpoint 加速长会话恢复。
+- 恢复与迁移：按 ID 恢复会话，安全闭合中断的工具调用，并导入、导出可重放 Journal Archive。
 - 可观测性：记录模型/工具调用数、审批数、Token 用量以及模型、工具和单轮耗时。
-- 本地 Gateway：HTTP API、SSE 状态流、远程审批、取消、记忆管理和同源 Web 控制台。
+- 本地 Gateway：HTTP API、带游标的增量 SSE、远程审批、取消、记忆管理和同源 Web 控制台。
 - MCP stdio：支持 Tools、Resources、Resource Templates 和 Prompts；能力名称隔离并统一审批。
 - 凭据脱敏：持久化工具参数、输出和错误前过滤常见 API Key、Token 与 Authorization 值。
 
@@ -84,6 +85,10 @@ npm run demo -- --sessions
 # 恢复最近一次或指定会话
 npm run demo -- --resume=latest
 npm run demo -- --resume=session-xxxxxxxxxxxx
+
+# 导入归档到当前工作区；可选映射为新 ID
+npm run demo -- --import=/绝对路径/session.journal.json
+npm run demo -- --import=/绝对路径/session.journal.json --import-as=session-new-id
 ```
 
 CLI 中可用：
@@ -95,6 +100,8 @@ CLI 中可用：
 
 如果进程在审批或工具执行期间中断，恢复时会为未闭合调用补充“执行状态未知”的安全结果，不会自动重放可能有副作用的操作。
 
+Model Context 不会按单条消息硬截断。assistant tool call 与对应 tool result 属于同一个完整 turn；如果当前 turn 或 system prompt、Skills、工具 schema 的固定成本自身超过预算，本轮会在调用模型前进入 `failed`。每次窗口规划都会产生 `model.context_prepared` 或 `model.context_compacted` durable audit event。
+
 ## Web 控制台与 Gateway API
 
 Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web 控制台提供会话列表、消息发送、实时状态、运行指标、审批、取消、长期记忆和会话导出。
@@ -105,9 +112,11 @@ Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web
 GET    /health
 GET    /sessions
 POST   /sessions
+POST   /sessions/imports
 GET    /sessions/:id
 POST   /sessions/:id/messages
 GET    /sessions/:id/events
+POST   /sessions/:id/branches
 POST   /sessions/:id/approvals/:callId
 POST   /sessions/:id/cancel
 GET    /sessions/:id/export
@@ -127,9 +136,33 @@ curl -X POST http://127.0.0.1:4317/sessions \
 curl -X POST http://127.0.0.1:4317/sessions/会话ID/messages \
   -H 'content-type: application/json' -d '{"content":"查看工作区文件"}'
 
-# 订阅状态
-curl -N http://127.0.0.1:4317/sessions/会话ID/events
+# 从头订阅 durable session event；SSE id 即事件游标
+curl -N 'http://127.0.0.1:4317/sessions/会话ID/events?after=0'
+
+# 从游标 42 之后继续，避免重复接收
+curl -N 'http://127.0.0.1:4317/sessions/会话ID/events?after=42'
 ```
+
+事件流使用 `session_event` 类型，数据包含 `cursor`、`type`、durable `action` 和客户端 `patch`。浏览器自动重连时，Gateway 也接受标准 `Last-Event-ID` 并从较新的游标继续推送。
+
+`GET /sessions/:id/export` 返回带 SHA-256 校验和的 `nexus.session-journal` 归档，而不是单一 state 快照。归档保留完整 durable event 与 lineage，不包含可重建的 checkpoint。
+
+导入时会先验证 format version、稳定 SHA-256 校验和、连续 cursor、事件 schema、patch 与 reducer 重放结果；任何失败都不会留下半导入 Session。默认保留原 ID，`id` 可显式重映射，workspace 固定重定位到当前 Gateway：
+
+```bash
+jq '{archive: ., id: "session-new-id"}' session.journal.json | \
+  curl -X POST http://127.0.0.1:4317/sessions/imports \
+    -H 'content-type: application/json' --data-binary @-
+```
+
+从指定 cursor 创建独立 Session Branch：
+
+```bash
+curl -X POST http://127.0.0.1:4317/sessions/父会话ID/branches \
+  -H 'content-type: application/json' -d '{"cursor":42}'
+```
+
+省略 `cursor` 时从父会话最新 durable event 创建。分支会安全闭合当时未决的工具调用，不会执行或重放副作用。
 
 ## MCP 扩展
 
@@ -162,7 +195,7 @@ npm run gateway:mcp
 npm test
 ```
 
-测试覆盖会话保存与恢复、中断调用修复、长期记忆、指标、取消、敏感信息脱敏，以及 MCP Tools/Resources/Prompts。
+测试覆盖会话保存与恢复、事件游标、客户端与模型上下文投影、中断调用修复、长期记忆、指标、取消、敏感信息脱敏，以及 MCP Tools/Resources/Prompts。
 
 ## 安全边界与后续扩展
 

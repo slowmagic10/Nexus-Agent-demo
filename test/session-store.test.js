@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { DatabaseSync } from "node:sqlite";
 import { createSession, reduceSession } from "../src/core/state.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 
@@ -76,6 +77,65 @@ test("长期记忆支持保存、搜索和删除", () => {
     assert.equal(fixture.store.searchMemories("preference")[0].content, "偏好本地模型");
     assert.equal(fixture.store.deleteMemory(memory.id), true);
     assert.deepEqual(fixture.store.searchMemories("本地"), []);
+  } finally {
+    fixture.close();
+  }
+});
+
+test("旧数据库会按顺序执行显式 schema migration", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "nexus-migration-test-"));
+  const file = path.join(workspace, "nexus.db");
+  const legacy = new DatabaseSync(file);
+  legacy.exec(`
+    CREATE TABLE sessions (
+      id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      provider TEXT NOT NULL,
+      workspace TEXT NOT NULL,
+      phase TEXT NOT NULL,
+      message_count INTEGER NOT NULL,
+      state_json TEXT NOT NULL
+    );
+    CREATE TABLE session_events (
+      session_id TEXT NOT NULL,
+      seq INTEGER NOT NULL,
+      at TEXT NOT NULL,
+      type TEXT NOT NULL,
+      event_json TEXT NOT NULL,
+      PRIMARY KEY(session_id, seq)
+    );
+  `);
+  legacy.close();
+
+  const store = new SessionStore(file);
+  try {
+    const eventColumns = store.db.prepare("PRAGMA table_info(session_events)").all().map((column) => column.name);
+    const migrationVersions = store.db.prepare(
+      "SELECT version FROM schema_migrations ORDER BY version",
+    ).all().map((row) => row.version);
+    assert.ok(eventColumns.includes("schema_version"));
+    assert.deepEqual(migrationVersions, [1, 2]);
+    assert.ok(store.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_checkpoints'",
+    ).get());
+  } finally {
+    store.close();
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("schema v2 会话状态加载时迁移到当前版本", () => {
+  const fixture = createFixture();
+  try {
+    const state = createSession({ provider: "demo", workspace: fixture.workspace });
+    const legacy = { ...state, schemaVersion: 2 };
+    delete legacy.lineage;
+    fixture.store.save(legacy);
+
+    const restored = fixture.store.load(state.id);
+    assert.equal(restored.schemaVersion, 3);
+    assert.equal(restored.lineage, null);
   } finally {
     fixture.close();
   }

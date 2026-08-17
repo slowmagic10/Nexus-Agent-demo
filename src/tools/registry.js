@@ -109,7 +109,7 @@ export function createToolRegistry({ workspace, bundledSkills, memoryStore, extr
     approval: "never",
     parameters: objectSchema({ content: { type: "string" } }, ["content"]),
     execute: async ({ content }, context) => {
-      context.dispatch({ type: "MEMORY_ADDED", content });
+      await context.dispatch({ type: "MEMORY_ADDED", content });
       return `已加入短期记忆：${content}`;
     },
   });
@@ -142,7 +142,7 @@ export function createToolRegistry({ workspace, bundledSkills, memoryStore, extr
       const skill = (await discoverSkills(skillRoots)).find((item) => item.name === name);
       if (!skill) throw new Error(`未找到 Skill：${name}`);
       const content = await fs.readFile(skill.file, "utf8");
-      context.dispatch({ type: "SKILL_LOADED", skill: { name, content } });
+      await context.dispatch({ type: "SKILL_LOADED", skill: { name, content } });
       return `已加载 Skill：${name}\n${truncate(content, 6000)}`;
     },
   });

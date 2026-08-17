@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { AgentRuntime } from "../src/core/agent.js";
+import { AgentSession } from "../src/core/session.js";
 import { createSession, reduceSession } from "../src/core/state.js";
 import { redactSensitiveText } from "../src/security/redact.js";
 
 test("模型用量和耗时进入状态指标", async () => {
   const runtime = createRuntime({
-    complete: async () => ({ text: "完成", toolCalls: [], usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }),
+    provider: {
+      complete: async () => ({ text: "完成", toolCalls: [], usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }),
+    },
   });
   await runtime.runTurn("测试", async () => false);
   assert.equal(runtime.state.phase, "completed");
@@ -15,11 +18,62 @@ test("模型用量和耗时进入状态指标", async () => {
   assert.ok(runtime.state.events.some((event) => event.type === "model.completed"));
 });
 
+test("运行时按预算压缩历史 turn 并留下 durable audit event", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "H".repeat(1_200), at: "2026-08-17T01:00:00.000Z" });
+  state = reduceSession(state, {
+    type: "ASSISTANT_MESSAGE",
+    message: { role: "assistant", content: "旧回答" },
+    at: "2026-08-17T01:00:01.000Z",
+  });
+  let receivedMessages;
+  const runtime = createRuntime({
+    provider: {
+      complete: async ({ messages }) => {
+        receivedMessages = messages;
+        return { text: "完成", toolCalls: [], usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } };
+      },
+    },
+    state,
+    maxInputTokens: 120,
+  });
+
+  await runtime.runTurn("新任务", async () => false);
+
+  assert.deepEqual(receivedMessages, [{ role: "user", content: "新任务" }]);
+  const audit = runtime.state.events.find((event) => event.type === "model.context_compacted");
+  assert.equal(audit.compacted, true);
+  assert.equal(audit.omittedTurns, 1);
+  assert.equal(runtime.state.phase, "completed");
+});
+
+test("当前 turn 超预算时运行时 fail closed 且不调用模型", async () => {
+  let calls = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        calls += 1;
+        return { text: "不应调用", toolCalls: [] };
+      },
+    },
+    maxInputTokens: 60,
+  });
+
+  await runtime.runTurn("X".repeat(1_000), async () => false);
+
+  assert.equal(calls, 0);
+  assert.equal(runtime.state.phase, "failed");
+  assert.match(runtime.state.lastError, /当前 turn.*超过 Model Context 预算 60/);
+  assert.equal(runtime.state.metrics.modelCalls, 0);
+});
+
 test("取消会中止模型请求并进入 cancelled", async () => {
   const runtime = createRuntime({
-    complete: async ({ signal }) => new Promise((resolve, reject) => {
-      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
-    }),
+    provider: {
+      complete: async ({ signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    },
   });
   const turn = runtime.runTurn("等待", async () => false);
   await new Promise((resolve) => setTimeout(resolve, 5));
@@ -49,13 +103,16 @@ test("敏感凭据会从工具日志文本中脱敏", () => {
   assert.equal(redactSensitiveText("Authorization: Bearer secret-token"), "Authorization: Bearer [REDACTED]");
 });
 
-function createRuntime(provider) {
+function createRuntime({ provider, state, maxInputTokens } = {}) {
   const tools = { schemas: () => [], get: () => null };
   return new AgentRuntime({
-    state: createSession({ provider: "test", workspace: "/tmp" }),
-    reducer: reduceSession,
+    session: new AgentSession({
+      state: state || createSession({ provider: "test", workspace: "/tmp" }),
+      reducer: reduceSession,
+    }),
     provider: { name: "test", ...provider },
     tools,
     systemPrompt: () => "test",
+    maxInputTokens,
   });
 }

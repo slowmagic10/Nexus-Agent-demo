@@ -1,46 +1,63 @@
 import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
 
 export class AgentRuntime {
-  constructor({ state, reducer, provider, tools, systemPrompt, retrieveMemory = async () => [], maxSteps = 8, maxTokensPerTurn = 50_000, onState = () => {} }) {
-    this.state = state;
-    this.reducer = reducer;
+  constructor({
+    session,
+    provider,
+    tools,
+    systemPrompt,
+    retrieveMemory = async () => [],
+    maxSteps = 8,
+    maxTokensPerTurn = 50_000,
+    maxInputTokens = 32_000,
+  }) {
+    if (!session) throw new Error("AgentRuntime 需要 AgentSession");
+    this.session = session;
     this.provider = provider;
     this.tools = tools;
     this.systemPrompt = systemPrompt;
     this.retrieveMemory = retrieveMemory;
     this.maxSteps = maxSteps;
     this.maxTokensPerTurn = maxTokensPerTurn;
-    this.onState = onState;
+    this.maxInputTokens = maxInputTokens;
     this.abortController = null;
   }
 
+  get state() {
+    return this.session.state;
+  }
+
   dispatch(action) {
-    this.state = this.reducer(this.state, action);
-    this.onState(this.state);
+    return this.session.dispatch(action);
   }
 
   async runTurn(content, requestApproval) {
-    if (["completed", "failed", "cancelled"].includes(this.state.phase)) this.dispatch({ type: "READY" });
+    if (["completed", "failed", "cancelled"].includes(this.state.phase)) await this.dispatch({ type: "READY" });
     const abortController = new AbortController();
     this.abortController = abortController;
     const tokenBaseline = this.state.metrics.totalTokens || 0;
-    this.dispatch({ type: "USER_MESSAGE", content });
+    await this.dispatch({ type: "USER_MESSAGE", content });
 
     try {
       const memories = await this.retrieveMemory(content);
-      this.dispatch({ type: "MEMORY_CONTEXT_SET", query: content, memories });
+      await this.dispatch({ type: "MEMORY_CONTEXT_SET", query: content, memories });
       for (let index = 0; index < this.maxSteps; index += 1) {
         throwIfAborted(abortController.signal);
-        this.dispatch({ type: "MODEL_REQUESTED" });
+        const prepared = this.session.prepareModelRequest({
+          systemPrompt: this.systemPrompt,
+          tools: this.tools.schemas(),
+          maxInputTokens: this.maxInputTokens,
+        });
+        const { contextPlan, ...request } = prepared;
+        await this.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
+        await this.dispatch({ type: "MODEL_REQUESTED" });
         const modelStarted = performance.now();
         const response = await this.provider.complete({
-          systemPrompt: this.systemPrompt(this.state),
-          messages: this.state.messages,
-          tools: this.tools.schemas(),
+          ...request,
           signal: abortController.signal,
         });
-        const usage = normalizeUsage(response.usage, this.state.messages, response.text);
-        this.dispatch({ type: "MODEL_COMPLETED", usage, durationMs: Math.round(performance.now() - modelStarted) });
+        const usage = normalizeUsage(response.usage, request.messages, response.text);
+        await this.dispatch({ type: "MODEL_COMPLETED", usage, durationMs: Math.round(performance.now() - modelStarted) });
         if (this.state.metrics.totalTokens - tokenBaseline > this.maxTokensPerTurn) {
           throw new Error(`本轮 token 用量超过预算 ${this.maxTokensPerTurn}`);
         }
@@ -56,15 +73,15 @@ export class AgentRuntime {
             })),
           } : {}),
         };
-        this.dispatch({ type: "ASSISTANT_MESSAGE", message: assistantMessage });
+        await this.dispatch({ type: "ASSISTANT_MESSAGE", message: assistantMessage });
 
         if (!response.toolCalls.length) {
-          this.dispatch({ type: "COMPLETED" });
+          await this.dispatch({ type: "COMPLETED" });
           return this.state;
         }
 
         for (const call of response.toolCalls) {
-          this.dispatch({ type: "TOOL_REQUESTED", call });
+          await this.dispatch({ type: "TOOL_REQUESTED", call });
           const tool = this.tools.get(call.name);
           let result;
           let ok = true;
@@ -74,12 +91,12 @@ export class AgentRuntime {
             result = `未知工具：${call.name}`;
           } else {
             if (tool.approval === "always") {
-              this.dispatch({ type: "APPROVAL_REQUESTED", call });
+              await this.dispatch({ type: "APPROVAL_REQUESTED", call });
               const approved = await requestApproval(call, tool.description, abortController.signal);
               throwIfAborted(abortController.signal);
-              this.dispatch({ type: "APPROVAL_DECIDED", call, approved });
+              await this.dispatch({ type: "APPROVAL_DECIDED", call, approved });
               if (!approved) {
-                this.dispatch({ type: "TOOL_RESULT", call, ok: false, result: "用户拒绝了本次工具调用。" });
+                await this.dispatch({ type: "TOOL_RESULT", call, ok: false, result: "用户拒绝了本次工具调用。" });
                 continue;
               }
             }
@@ -91,7 +108,7 @@ export class AgentRuntime {
                 dispatch: (action) => this.dispatch(action),
                 signal: abortController.signal,
               });
-              this.dispatch({
+              await this.dispatch({
                 type: "TOOL_RESULT",
                 call,
                 ok,
@@ -105,15 +122,15 @@ export class AgentRuntime {
               result = `工具执行失败：${error.message}`;
             }
           }
-          this.dispatch({ type: "TOOL_RESULT", call, ok, result: redactSensitiveText(result), durationMs: 0 });
+          await this.dispatch({ type: "TOOL_RESULT", call, ok, result: redactSensitiveText(result), durationMs: 0 });
         }
       }
       throw new Error(`达到最大步骤数 ${this.maxSteps}，已停止本轮任务。`);
     } catch (error) {
       if (abortController.signal.aborted) {
-        this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务" });
+        await this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务" });
       } else {
-        this.dispatch({ type: "FAILED", error: redactSensitiveText(error.message) });
+        await this.dispatch({ type: "FAILED", error: redactSensitiveText(error.message) });
       }
       return this.state;
     } finally {

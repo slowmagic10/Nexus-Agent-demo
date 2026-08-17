@@ -2,11 +2,13 @@
 import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
 
-export function createSession({ provider, workspace }) {
-  const now = new Date().toISOString();
+export const SESSION_SCHEMA_VERSION = 3;
+
+export function createSession({ provider, workspace, id, createdAt }) {
+  const now = createdAt || new Date().toISOString();
   return {
-    schemaVersion: 2,
-    id: `session-${randomUUID().slice(0, 12)}`,
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    id: id || `session-${randomUUID().slice(0, 12)}`,
     createdAt: now,
     updatedAt: now,
     phase: "idle",
@@ -32,16 +34,18 @@ export function createSession({ provider, workspace }) {
     },
     turnStartedAt: null,
     lastError: null,
+    lineage: null,
   };
 }
 
 export function reduceSession(state, action) {
-  const next = structuredClone(state);
-  next.updatedAt = new Date().toISOString();
+  const next = structuredClone(migrateSessionState(state));
+  const at = action.at || new Date().toISOString();
+  next.updatedAt = at;
   const emit = (type, detail = {}) => {
     next.events.push({
       seq: next.events.length + 1,
-      at: new Date().toISOString(),
+      at,
       type,
       ...detail,
     });
@@ -50,7 +54,7 @@ export function reduceSession(state, action) {
   switch (action.type) {
     case "USER_MESSAGE":
       next.phase = "thinking";
-      next.turnStartedAt = new Date().toISOString();
+      next.turnStartedAt = at;
       next.messages.push({ role: "user", content: action.content });
       emit("message.user", { preview: action.content.slice(0, 120) });
       break;
@@ -59,6 +63,9 @@ export function reduceSession(state, action) {
       next.step += 1;
       next.metrics.modelCalls += 1;
       emit("model.requested", { step: next.step });
+      break;
+    case "MODEL_CONTEXT_PREPARED":
+      emit(action.plan.compacted ? "model.context_compacted" : "model.context_prepared", action.plan);
       break;
     case "MODEL_COMPLETED":
       next.metrics.inputTokens += action.usage.inputTokens;
@@ -94,7 +101,7 @@ export function reduceSession(state, action) {
       emit("tool.completed", { tool: action.call.name, ok: action.ok, durationMs: action.durationMs || 0, preview: action.result.slice(0, 160) });
       break;
     case "MEMORY_ADDED":
-      next.memory.push({ content: action.content, at: new Date().toISOString() });
+      next.memory.push({ content: action.content, at });
       emit("memory.added", { preview: action.content.slice(0, 120) });
       break;
     case "MEMORY_CONTEXT_SET":
@@ -109,14 +116,14 @@ export function reduceSession(state, action) {
       break;
     case "COMPLETED":
       next.phase = "completed";
-      next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt);
+      next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
       emit("session.turn_completed", { durationMs: next.metrics.lastTurnDurationMs });
       break;
     case "FAILED":
       next.phase = "failed";
       next.lastError = action.error;
-      next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt);
+      next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
       emit("session.failed", { error: action.error, durationMs: next.metrics.lastTurnDurationMs });
       break;
@@ -131,7 +138,7 @@ export function reduceSession(state, action) {
       next.phase = "cancelled";
       next.lastError = action.reason;
       next.pendingApproval = null;
-      next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt);
+      next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
       emit("session.cancelled", { reason: action.reason, durationMs: next.metrics.lastTurnDurationMs });
       break;
@@ -183,6 +190,66 @@ export function reduceSession(state, action) {
   return next;
 }
 
+export function migrateSessionState(state) {
+  if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
+  if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
+  if (state.schemaVersion === 2) {
+    return {
+      ...state,
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      lineage: state.lineage || null,
+    };
+  }
+  if (state.schemaVersion > SESSION_SCHEMA_VERSION) {
+    throw new Error(`会话 schema v${state.schemaVersion} 高于当前支持的 v${SESSION_SCHEMA_VERSION}`);
+  }
+  throw new Error(`不支持的会话 schema version：${state.schemaVersion}`);
+}
+
+export function createSessionBranch(parentState, {
+  id,
+  parentCursor,
+  provider,
+  workspace,
+  branchedAt = new Date().toISOString(),
+}) {
+  const parent = migrateSessionState(parentState);
+  const reconciled = reduceSession(parent, {
+    type: "RESUMED",
+    provider,
+    workspace,
+    at: branchedAt,
+  });
+  return {
+    ...reconciled,
+    schemaVersion: SESSION_SCHEMA_VERSION,
+    id,
+    createdAt: branchedAt,
+    updatedAt: branchedAt,
+    phase: "idle",
+    provider,
+    workspace,
+    events: [{
+      seq: 1,
+      at: branchedAt,
+      type: "session.branched",
+      parentSessionId: parent.id,
+      parentCursor,
+    }],
+    contextMemory: [],
+    pendingApproval: null,
+    step: 0,
+    metrics: emptyMetrics(),
+    turnStartedAt: null,
+    lastError: null,
+    lineage: {
+      parentSessionId: parent.id,
+      parentCursor,
+      branchedAt,
+    },
+  };
+}
+
 function findUnresolvedToolCalls(messages) {
   const completed = new Set(
     messages.filter((message) => message.role === "tool").map((message) => message.tool_call_id),
@@ -195,6 +262,20 @@ function findUnresolvedToolCalls(messages) {
   });
 }
 
-function elapsedSince(value) {
-  return value ? Math.max(0, Date.now() - new Date(value).getTime()) : 0;
+function elapsedSince(value, at) {
+  return value ? Math.max(0, new Date(at).getTime() - new Date(value).getTime()) : 0;
+}
+
+function emptyMetrics() {
+  return {
+    modelCalls: 0,
+    toolCalls: 0,
+    approvals: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    modelDurationMs: 0,
+    toolDurationMs: 0,
+    lastTurnDurationMs: 0,
+  };
 }
