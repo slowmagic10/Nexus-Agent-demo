@@ -17,7 +17,9 @@ test("会话状态可保存、列出并按 ID 恢复", () => {
 
     assert.deepEqual(fixture.store.load(state.id), state);
     assert.equal(fixture.store.latest(fixture.workspace).id, state.id);
-    assert.deepEqual(fixture.store.list(fixture.workspace).map((item) => item.id), [state.id]);
+    const [summary] = fixture.store.list(fixture.workspace);
+    assert.equal(summary.id, state.id);
+    assert.equal(summary.title, "记住我的偏好");
   } finally {
     fixture.close();
   }

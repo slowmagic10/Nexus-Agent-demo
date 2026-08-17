@@ -4,33 +4,86 @@ const $ = (selector) => document.querySelector(selector);
 const state = { sessionId: null, session: null, cursor: 0, source: null };
 
 const elements = {
-  sessionList: $("#session-list"), messages: $("#messages"), events: $("#events"),
-  title: $("#session-title"), meta: $("#session-meta"), approval: $("#approval"),
-  input: $("#message-input"), form: $("#message-form"), export: $("#export-session"),
-  cancel: $("#cancel-run"), metrics: $("#metrics"), memoryList: $("#memory-list"),
+  sessionList: $("#session-list"),
+  sessionCount: $("#session-count"),
+  messages: $("#messages"),
+  events: $("#events"),
+  title: $("#session-title"),
+  meta: $("#session-meta"),
+  phaseDot: $("#phase-dot"),
+  input: $("#message-input"),
+  form: $("#message-form"),
+  export: $("#export-session"),
+  cancel: $("#cancel-run"),
+  provider: $("#composer-provider"),
+  memoryList: $("#memory-list"),
+  inspector: $("#inspector"),
+  backdrop: $("#drawer-backdrop"),
+  debugToggle: $("#debug-toggle"),
+  themeToggle: $("#theme-toggle"),
 };
 
+applyTheme(savedTheme());
 $("#new-session").addEventListener("click", createSession);
 elements.form.addEventListener("submit", sendMessage);
 elements.input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); elements.form.requestSubmit(); }
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    elements.form.requestSubmit();
+  }
 });
+elements.messages.addEventListener("click", useStarter);
 elements.cancel.addEventListener("click", cancelRun);
 elements.export.addEventListener("click", exportSession);
+elements.themeToggle.addEventListener("click", toggleTheme);
+elements.debugToggle.addEventListener("click", openInspector);
+$("#debug-close").addEventListener("click", closeInspector);
+elements.backdrop.addEventListener("click", closeInspector);
 $("#memory-form").addEventListener("submit", addMemory);
-document.querySelectorAll(".tab").forEach((tab) => tab.addEventListener("click", () => selectTab(tab.dataset.tab)));
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape") closeInspector();
+});
+document.querySelectorAll(".tab").forEach((tab) => {
+  tab.addEventListener("click", () => selectTab(tab.dataset.tab));
+});
 
-await Promise.all([checkHealth(), loadSessions(), loadMemories()]);
+await Promise.allSettled([checkHealth(), loadSessions(), loadMemories()]);
+
+function savedTheme() {
+  try {
+    const saved = localStorage.getItem("nexus-theme");
+    if (["dark", "light"].includes(saved)) return saved;
+  } catch {}
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+function toggleTheme() {
+  const next = document.documentElement.dataset.theme === "light" ? "dark" : "light";
+  applyTheme(next);
+  try { localStorage.setItem("nexus-theme", next); } catch {}
+}
+
+function applyTheme(theme) {
+  const light = theme === "light";
+  document.documentElement.dataset.theme = light ? "light" : "dark";
+  elements.themeToggle.textContent = light ? "深色" : "浅色";
+  elements.themeToggle.setAttribute("aria-label", light ? "切换到深色主题" : "切换到浅色主题");
+  elements.themeToggle.setAttribute("aria-pressed", String(light));
+}
 
 async function checkHealth() {
   try {
-    await api("/health");
-    $("#health-dot").classList.add("online"); $("#health-text").textContent = "Gateway 在线";
-  } catch { $("#health-text").textContent = "Gateway 离线"; }
+    await api("/health", {}, { silent: true });
+    $("#health-dot").classList.add("online");
+    $("#health-text").textContent = "Gateway 在线";
+  } catch {
+    $("#health-text").textContent = "Gateway 离线";
+  }
 }
 
 async function loadSessions() {
   const { sessions } = await api("/sessions");
+  elements.sessionCount.textContent = sessions.length;
   elements.sessionList.replaceChildren(...sessions.map(sessionButton));
 }
 
@@ -38,22 +91,38 @@ function sessionButton(session) {
   const button = document.createElement("button");
   button.className = `session-item${session.id === state.sessionId ? " active" : ""}`;
   button.dataset.sessionId = session.id;
-  const name = document.createElement("strong"); name.textContent = session.id;
-  const detail = document.createElement("span"); detail.textContent = `${session.phase} · ${session.messageCount} 条消息`;
-  button.append(name, detail); button.addEventListener("click", () => selectSession(session.id));
+
+  const row = document.createElement("span");
+  row.className = "session-name-row";
+  const phase = document.createElement("i");
+  phase.className = `session-phase ${phaseClass(session.phase)}`;
+  const name = document.createElement("strong");
+  name.textContent = session.title || "新任务";
+  row.append(phase, name);
+
+  const detail = document.createElement("span");
+  detail.className = "session-detail";
+  detail.textContent = `${phaseLabel(session.phase)} · ${relativeTime(session.updatedAt)}`;
+  button.append(row, detail);
+  button.addEventListener("click", () => selectSession(session.id));
   return button;
 }
 
 async function createSession() {
   const { session } = await api("/sessions", { method: "POST", body: {} });
-  await loadSessions(); await selectSession(session.id);
+  await loadSessions();
+  await selectSession(session.id);
+  elements.input.focus();
+  return session;
 }
 
 async function selectSession(id) {
   state.sessionId = id;
   const { session, cursor } = await api(`/sessions/${encodeURIComponent(id)}`);
   state.cursor = cursor;
-  renderSession(session); connectEvents(); await loadSessions();
+  renderSession(session);
+  connectEvents();
+  await loadSessions();
 }
 
 function connectEvents() {
@@ -83,66 +152,242 @@ async function handleSessionEvent(message) {
 
 function renderSession(session) {
   state.session = session;
-  elements.title.textContent = session.id;
-  elements.meta.textContent = `${session.provider} · ${session.workspace}`;
+  const title = sessionTitle(session);
+  elements.title.textContent = title;
+  document.title = `${title} · Nexus`;
+  elements.phaseDot.className = `phase-dot ${phaseClass(session.phase)}`;
+  renderStatus(session);
+
   const busy = ["thinking", "executing", "awaiting_approval"].includes(session.phase);
-  elements.input.disabled = busy; elements.form.querySelector("button").disabled = busy;
-  elements.cancel.disabled = !busy; elements.export.disabled = false;
-  elements.metrics.replaceChildren(...[
-    ["阶段", session.phase], ["模型调用", session.metrics.modelCalls], ["工具调用", session.metrics.toolCalls],
-    ["Token", session.metrics.totalTokens || 0], ["本轮耗时", `${session.metrics.lastTurnDurationMs || 0}ms`],
-  ].map(metric));
-  renderMessages(session.messages); renderEvents(session.events); renderApproval(session.pendingApproval);
-  const sidebarItem = elements.sessionList.querySelector(`[data-session-id="${CSS.escape(session.id)}"] span`);
-  if (sidebarItem) sidebarItem.textContent = `${session.phase} · ${session.messages.length} 条消息`;
+  elements.input.disabled = busy;
+  elements.form.querySelector("button[type=submit]").disabled = busy;
+  elements.cancel.disabled = !busy;
+  elements.export.disabled = false;
+  elements.provider.textContent = session.provider || "本地模型";
+
+  renderMessages(session.messages, session.pendingApproval);
+  renderEvents(session.events);
+  updateSelectedSession(session, title);
 }
 
-function metric([label, value]) {
-  const box = document.createElement("div"), span = document.createElement("span"), strong = document.createElement("strong");
-  span.textContent = label; strong.textContent = value; box.append(span, strong); return box;
-}
-
-function renderMessages(messages) {
-  if (!messages.length) { elements.messages.innerHTML = '<div class="empty">发送第一条消息开始任务。</div>'; return; }
-  elements.messages.replaceChildren(...messages.map((message) => {
-    const box = document.createElement("div"); box.className = `message ${message.role}`;
-    const role = document.createElement("span"); role.className = "role"; role.textContent = message.role;
-    const content = document.createElement("div");
-    content.textContent = message.content || message.tool_calls?.map((call) => `调用 ${call.function.name}\n${call.function.arguments}`).join("\n") || "";
-    box.append(role, content); return box;
+function renderStatus(session) {
+  const metrics = session.metrics || {};
+  const parts = [
+    [phaseLabel(session.phase), `status-chip phase ${phaseClass(session.phase)}`],
+    [session.provider || "本地模型", "status-chip"],
+    [formatTokens(metrics.totalTokens || 0), "status-chip"],
+  ];
+  if (metrics.lastTurnDurationMs) parts.push([formatDuration(metrics.lastTurnDurationMs), "status-chip"]);
+  elements.meta.replaceChildren(...parts.map(([text, className]) => {
+    const chip = document.createElement("span");
+    chip.className = className;
+    chip.textContent = text;
+    if (text === session.provider) chip.title = session.workspace;
+    return chip;
   }));
-  elements.messages.scrollTop = elements.messages.scrollHeight;
+}
+
+function updateSelectedSession(session, title) {
+  const item = elements.sessionList.querySelector(`[data-session-id="${CSS.escape(session.id)}"]`);
+  if (!item) return;
+  item.querySelector("strong").textContent = title;
+  item.querySelector(".session-phase").className = `session-phase ${phaseClass(session.phase)}`;
+  item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
+}
+
+function renderMessages(messages, pendingApproval) {
+  if (!messages.length) {
+    elements.messages.replaceChildren(createWelcome());
+    return;
+  }
+
+  const toolResults = new Map(
+    messages
+      .filter((message) => message.role === "tool" && message.tool_call_id)
+      .map((message) => [message.tool_call_id, message]),
+  );
+  const rendered = [];
+  let approvalRendered = false;
+
+  for (const message of messages) {
+    if (message.role === "tool") continue;
+    const row = document.createElement("article");
+    row.className = `message-row ${message.role}`;
+
+    if (message.role === "assistant") {
+      const avatar = document.createElement("div");
+      avatar.className = "avatar";
+      avatar.textContent = "N";
+      const body = document.createElement("div");
+      body.className = "message-body";
+      if (message.content) body.append(renderMarkdown(message.content));
+      for (const call of message.tool_calls || []) {
+        const normalized = normalizeToolCall(call);
+        const pending = pendingApproval?.id === normalized.id ? pendingApproval : null;
+        body.append(toolCard(normalized, toolResults.get(normalized.id), pending));
+        approvalRendered ||= Boolean(pending);
+      }
+      row.append(avatar, body);
+    } else {
+      const bubble = document.createElement("div");
+      bubble.className = "user-bubble";
+      bubble.textContent = message.content || "";
+      row.append(bubble);
+    }
+    rendered.push(row);
+  }
+
+  if (pendingApproval && !approvalRendered) {
+    const row = document.createElement("article");
+    row.className = "message-row assistant";
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.textContent = "N";
+    const body = document.createElement("div");
+    body.className = "message-body";
+    body.append(toolCard(pendingApproval, null, pendingApproval));
+    row.append(avatar, body);
+    rendered.push(row);
+  }
+
+  if (["thinking", "executing"].includes(state.session?.phase)) rendered.push(thinkingIndicator());
+  elements.messages.replaceChildren(...rendered);
+  requestAnimationFrame(() => { elements.messages.scrollTop = elements.messages.scrollHeight; });
+}
+
+function toolCard(call, result, pending) {
+  const details = document.createElement("details");
+  details.className = `tool-card ${pending ? "approval-needed" : result ? toolResultClass(result.content) : "running"}`;
+  details.open = Boolean(pending);
+
+  const summary = document.createElement("summary");
+  const icon = document.createElement("span");
+  icon.className = "tool-icon";
+  icon.textContent = pending ? "!" : result ? (toolResultClass(result.content) === "failed" ? "×" : "✓") : "·";
+  const name = document.createElement("span");
+  name.className = "tool-name";
+  name.textContent = toolLabel(call.name);
+  const status = document.createElement("span");
+  status.className = "tool-status";
+  status.textContent = pending ? "等待批准" : result ? (toolResultClass(result.content) === "failed" ? "未完成" : "已完成") : "运行中";
+  const chevron = document.createElement("span");
+  chevron.className = "chevron";
+  chevron.textContent = "⌄";
+  summary.append(icon, name, status, chevron);
+
+  const content = document.createElement("div");
+  content.className = "tool-content";
+  const args = document.createElement("pre");
+  args.textContent = formatToolArguments(call.arguments);
+  content.append(args);
+  if (result) {
+    const outputLabel = document.createElement("span");
+    outputLabel.className = "tool-output-label";
+    outputLabel.textContent = "输出";
+    const output = document.createElement("pre");
+    output.textContent = result.content || "工具没有返回内容";
+    content.append(outputLabel, output);
+  }
+  if (pending) content.append(approvalActions(pending));
+  details.append(summary, content);
+  return details;
+}
+
+function approvalActions(call) {
+  const notice = document.createElement("p");
+  notice.className = "approval-copy";
+  notice.textContent = "此操作需要你的确认后才会在本地执行。";
+  const row = document.createElement("div");
+  row.className = "approval-actions";
+  const approve = document.createElement("button");
+  approve.className = "approve-button";
+  approve.textContent = "批准一次";
+  const deny = document.createElement("button");
+  deny.className = "deny-button";
+  deny.textContent = "拒绝";
+  approve.addEventListener("click", () => decide(call.id, true, [approve, deny]));
+  deny.addEventListener("click", () => decide(call.id, false, [approve, deny]));
+  row.append(approve, deny);
+  const fragment = document.createDocumentFragment();
+  fragment.append(notice, row);
+  return fragment;
+}
+
+function thinkingIndicator() {
+  const row = document.createElement("div");
+  row.className = "message-row assistant thinking-row";
+  const avatar = document.createElement("div");
+  avatar.className = "avatar";
+  avatar.textContent = "N";
+  const dots = document.createElement("div");
+  dots.className = "thinking-dots";
+  dots.innerHTML = "<i></i><i></i><i></i>";
+  row.append(avatar, dots);
+  return row;
 }
 
 function renderEvents(events) {
-  elements.events.replaceChildren(...events.slice(-80).reverse().map((event) => {
-    const box = document.createElement("div"); box.className = "event";
-    const title = document.createElement("strong"); title.textContent = `${event.seq}. ${event.type}`;
-    const detail = document.createElement("span"); detail.textContent = `${event.tool || ""} ${new Date(event.at).toLocaleTimeString()}`;
-    box.append(title, detail); return box;
+  if (!events.length) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "任务开始后，运行事件会显示在这里。";
+    elements.events.replaceChildren(empty);
+    return;
+  }
+  elements.events.replaceChildren(...events.slice(-100).reverse().map((event) => {
+    const box = document.createElement("div");
+    box.className = "event";
+    const dot = document.createElement("i");
+    const body = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = eventLabel(event.type);
+    const detail = document.createElement("span");
+    detail.textContent = [event.tool, new Date(event.at).toLocaleTimeString()].filter(Boolean).join(" · ");
+    const raw = document.createElement("code");
+    raw.textContent = event.type;
+    body.append(title, detail, raw);
+    box.append(dot, body);
+    return box;
   }));
 }
 
-function renderApproval(call) {
-  if (!call) { elements.approval.classList.add("hidden"); elements.approval.replaceChildren(); return; }
-  elements.approval.classList.remove("hidden");
-  const title = document.createElement("strong"); title.textContent = `需要审批：${call.name}`;
-  const code = document.createElement("code"); code.textContent = JSON.stringify(call.arguments, null, 2);
-  const row = document.createElement("div"); row.className = "row";
-  const approve = document.createElement("button"); approve.className = "primary"; approve.textContent = "批准一次";
-  const deny = document.createElement("button"); deny.textContent = "拒绝";
-  approve.onclick = () => decide(call.id, true); deny.onclick = () => decide(call.id, false);
-  row.append(approve, deny); elements.approval.replaceChildren(title, code, row);
+async function useStarter(event) {
+  const button = event.target.closest("[data-prompt]");
+  if (!button) return;
+  if (!state.sessionId) await createSession();
+  elements.input.value = button.dataset.prompt;
+  elements.input.focus();
 }
 
 async function sendMessage(event) {
-  event.preventDefault(); const content = elements.input.value.trim(); if (!content || !state.sessionId) return;
+  event.preventDefault();
+  const content = elements.input.value.trim();
+  if (!content || !state.sessionId) return;
   elements.input.value = "";
-  await api(`/sessions/${encodeURIComponent(state.sessionId)}/messages`, { method: "POST", body: { content } });
+  elements.input.disabled = true;
+  elements.form.querySelector("button[type=submit]").disabled = true;
+  try {
+    await api(`/sessions/${encodeURIComponent(state.sessionId)}/messages`, {
+      method: "POST",
+      body: { content },
+    });
+  } catch {
+    elements.input.value = content;
+    elements.input.disabled = false;
+    elements.form.querySelector("button[type=submit]").disabled = false;
+  }
 }
 
-async function decide(callId, approved) {
-  await api(`/sessions/${encodeURIComponent(state.sessionId)}/approvals/${encodeURIComponent(callId)}`, { method: "POST", body: { approved } });
+async function decide(callId, approved, buttons) {
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    await api(`/sessions/${encodeURIComponent(state.sessionId)}/approvals/${encodeURIComponent(callId)}`, {
+      method: "POST",
+      body: { approved },
+    });
+  } catch {
+    buttons.forEach((button) => { button.disabled = false; });
+  }
 }
 
 async function cancelRun() {
@@ -152,41 +397,335 @@ async function cancelRun() {
 async function exportSession() {
   const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/export`);
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-  const link = document.createElement("a"); link.href = URL.createObjectURL(blob); link.download = `${state.sessionId}.journal.json`; link.click();
+  const link = document.createElement("a");
+  link.href = URL.createObjectURL(blob);
+  link.download = `${state.sessionId}.journal.json`;
+  link.click();
   URL.revokeObjectURL(link.href);
 }
 
 async function loadMemories() {
   const { memories } = await api("/memories");
+  if (!memories.length) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "还没有长期记忆。";
+    elements.memoryList.replaceChildren(empty);
+    return;
+  }
   elements.memoryList.replaceChildren(...memories.map((memory) => {
-    const box = document.createElement("div"); box.className = "memory";
-    const text = document.createElement("p"); text.textContent = memory.content;
-    const remove = document.createElement("button"); remove.textContent = "删除";
-    remove.onclick = async () => { await api(`/memories/${encodeURIComponent(memory.id)}`, { method: "DELETE" }); await loadMemories(); };
-    box.append(text, remove); return box;
+    const box = document.createElement("div");
+    box.className = "memory";
+    const text = document.createElement("p");
+    text.textContent = memory.content;
+    const remove = document.createElement("button");
+    remove.textContent = "删除";
+    remove.addEventListener("click", async () => {
+      await api(`/memories/${encodeURIComponent(memory.id)}`, { method: "DELETE" });
+      await loadMemories();
+    });
+    box.append(text, remove);
+    return box;
   }));
 }
 
 async function addMemory(event) {
-  event.preventDefault(); const input = $("#memory-input"); const content = input.value.trim(); if (!content) return;
-  await api("/memories", { method: "POST", body: { content, tags: [] } }); input.value = ""; await loadMemories();
+  event.preventDefault();
+  const input = $("#memory-input");
+  const content = input.value.trim();
+  if (!content) return;
+  await api("/memories", { method: "POST", body: { content, tags: [] } });
+  input.value = "";
+  await loadMemories();
+}
+
+function openInspector() {
+  elements.inspector.classList.add("open");
+  elements.inspector.setAttribute("aria-hidden", "false");
+  elements.debugToggle.setAttribute("aria-expanded", "true");
+  elements.backdrop.classList.remove("hidden");
+}
+
+function closeInspector() {
+  elements.inspector.classList.remove("open");
+  elements.inspector.setAttribute("aria-hidden", "true");
+  elements.debugToggle.setAttribute("aria-expanded", "false");
+  elements.backdrop.classList.add("hidden");
 }
 
 function selectTab(name) {
-  document.querySelectorAll(".tab").forEach((tab) => tab.classList.toggle("active", tab.dataset.tab === name));
-  $("#events-view").classList.toggle("hidden", name !== "events"); $("#memory-view").classList.toggle("hidden", name !== "memory");
+  document.querySelectorAll(".tab").forEach((tab) => {
+    const active = tab.dataset.tab === name;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+  });
+  $("#events-view").classList.toggle("hidden", name !== "events");
+  $("#memory-view").classList.toggle("hidden", name !== "memory");
 }
 
-async function api(url, options = {}) {
+function renderMarkdown(source) {
+  const root = document.createElement("div");
+  root.className = "markdown";
+  const lines = String(source || "").replace(/\r\n/g, "\n").split("\n");
+  let index = 0;
+  while (index < lines.length) {
+    const line = lines[index];
+    if (!line.trim()) { index += 1; continue; }
+
+    if (/^```/.test(line.trim())) {
+      const language = line.trim().slice(3).trim();
+      const codeLines = [];
+      index += 1;
+      while (index < lines.length && !/^```/.test(lines[index].trim())) codeLines.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      const pre = document.createElement("pre");
+      const code = document.createElement("code");
+      if (language) code.dataset.language = language;
+      code.textContent = codeLines.join("\n");
+      pre.append(code);
+      root.append(pre);
+      continue;
+    }
+
+    const heading = line.match(/^(#{1,4})\s+(.+)$/);
+    if (heading) {
+      const node = document.createElement(`h${heading[1].length + 1}`);
+      appendInline(node, heading[2]);
+      root.append(node);
+      index += 1;
+      continue;
+    }
+
+    if (/^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line)) {
+      const ordered = /^\s*\d+[.)]\s+/.test(line);
+      const list = document.createElement(ordered ? "ol" : "ul");
+      const matcher = ordered ? /^\s*\d+[.)]\s+(.+)$/ : /^\s*[-*+]\s+(.+)$/;
+      while (index < lines.length) {
+        const match = lines[index].match(matcher);
+        if (!match) break;
+        const item = document.createElement("li");
+        appendInline(item, match[1]);
+        list.append(item);
+        index += 1;
+      }
+      root.append(list);
+      continue;
+    }
+
+    if (/^>\s?/.test(line)) {
+      const quote = document.createElement("blockquote");
+      const quoteLines = [];
+      while (index < lines.length && /^>\s?/.test(lines[index])) quoteLines.push(lines[index++].replace(/^>\s?/, ""));
+      appendInline(quote, quoteLines.join(" "));
+      root.append(quote);
+      continue;
+    }
+
+    const paragraph = [];
+    while (index < lines.length && lines[index].trim() && !isBlockStart(lines[index])) paragraph.push(lines[index++].trim());
+    if (!paragraph.length) paragraph.push(lines[index++]);
+    const node = document.createElement("p");
+    appendInline(node, paragraph.join(" "));
+    root.append(node);
+  }
+  return root;
+}
+
+function appendInline(parent, source) {
+  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_([^_]+)_|\[[^\]]+\]\([^)]+\))/g;
+  let cursor = 0;
+  for (const match of source.matchAll(pattern)) {
+    if (match.index > cursor) parent.append(document.createTextNode(source.slice(cursor, match.index)));
+    const token = match[0];
+    if (token.startsWith("`")) {
+      const code = document.createElement("code");
+      code.textContent = token.slice(1, -1);
+      parent.append(code);
+    } else if (token.startsWith("**") || token.startsWith("__")) {
+      const strong = document.createElement("strong");
+      strong.textContent = token.slice(2, -2);
+      parent.append(strong);
+    } else if (token.startsWith("*") || token.startsWith("_")) {
+      const em = document.createElement("em");
+      em.textContent = token.slice(1, -1);
+      parent.append(em);
+    } else {
+      const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
+      const link = document.createElement("a");
+      link.textContent = parts[1];
+      if (safeLink(parts[2])) {
+        link.href = parts[2];
+        link.target = "_blank";
+        link.rel = "noreferrer";
+      }
+      parent.append(link);
+    }
+    cursor = match.index + token.length;
+  }
+  if (cursor < source.length) parent.append(document.createTextNode(source.slice(cursor)));
+}
+
+function isBlockStart(line) {
+  const value = line.trim();
+  return /^```/.test(value) || /^#{1,4}\s+/.test(value) || /^>\s?/.test(value)
+    || /^[-*+]\s+/.test(value) || /^\d+[.)]\s+/.test(value);
+}
+
+function safeLink(value) {
+  try {
+    return ["http:", "https:"].includes(new URL(value, location.href).protocol);
+  } catch {
+    return false;
+  }
+}
+
+function createWelcome() {
+  const box = document.createElement("div");
+  box.className = "welcome";
+  const mark = document.createElement("div");
+  mark.className = "welcome-mark";
+  mark.textContent = "N";
+  const title = document.createElement("h2");
+  title.textContent = "开始一个新任务";
+  const copy = document.createElement("p");
+  copy.textContent = "Nexus 会在本地工作区中读取文件、运行命令并请求必要审批。";
+  const starters = document.createElement("div");
+  starters.className = "starters";
+  [
+    ["理解项目", "梳理架构与关键模块", "分析这个项目的结构，并告诉我应该从哪里开始。"],
+    ["检查问题", "定位错误与风险", "检查当前项目，找出最值得修复的问题。"],
+    ["继续开发", "推进优先级最高的功能", "根据当前项目目标，实现下一个优先级最高的功能。"],
+  ].forEach(([label, description, prompt]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.dataset.prompt = prompt;
+    const strong = document.createElement("strong");
+    strong.textContent = label;
+    const span = document.createElement("span");
+    span.textContent = description;
+    button.append(strong, span);
+    starters.append(button);
+  });
+  box.append(mark, title, copy, starters);
+  return box;
+}
+
+function normalizeToolCall(call) {
+  return {
+    id: call.id,
+    name: call.name || call.function?.name || "unknown",
+    arguments: call.arguments ?? call.function?.arguments ?? {},
+  };
+}
+
+function formatToolArguments(value) {
+  if (typeof value === "string") {
+    try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; }
+  }
+  return JSON.stringify(value ?? {}, null, 2);
+}
+
+function toolResultClass(content) {
+  return /失败|拒绝|未知工具|取消|error/i.test(content || "") ? "failed" : "completed";
+}
+
+function toolLabel(name) {
+  const labels = {
+    run_shell: "运行终端命令",
+    read_file: "读取文件",
+    write_file: "修改文件",
+    list_files: "查看文件",
+    search_files: "搜索文件",
+    memory_save: "保存长期记忆",
+    memory_search: "搜索长期记忆",
+    remember: "保存会话记忆",
+  };
+  return labels[name] || name || "工具调用";
+}
+
+function sessionTitle(session) {
+  const content = session.messages?.find((message) => message.role === "user")?.content?.trim();
+  if (!content) return "新任务";
+  const compact = content.replace(/\s+/g, " ");
+  return compact.length > 42 ? `${compact.slice(0, 42).trimEnd()}…` : compact;
+}
+
+function phaseLabel(phase) {
+  return ({ idle: "就绪", thinking: "思考中", executing: "执行中", awaiting_approval: "等待批准", completed: "已完成", failed: "失败", cancelled: "已取消" })[phase] || phase;
+}
+
+function phaseClass(phase) {
+  if (["thinking", "executing"].includes(phase)) return "running";
+  if (phase === "awaiting_approval") return "attention";
+  if (phase === "completed") return "completed";
+  if (["failed", "cancelled"].includes(phase)) return "failed";
+  return "idle";
+}
+
+function eventLabel(type) {
+  return ({
+    "message.user": "收到任务",
+    "message.assistant": "Agent 回复",
+    "model.requested": "请求模型",
+    "model.completed": "模型返回",
+    "model.context_prepared": "准备上下文",
+    "model.context_compacted": "压缩上下文",
+    "memory.context_loaded": "加载相关记忆",
+    "memory.added": "保存会话记忆",
+    "tool.requested": "请求工具",
+    "tool.completed": "工具完成",
+    "approval.requested": "等待审批",
+    "approval.granted": "审批通过",
+    "approval.denied": "审批拒绝",
+    "session.turn_completed": "任务完成",
+    "session.failed": "任务失败",
+    "session.cancelled": "任务取消",
+    "session.resumed": "恢复任务",
+  })[type] || type;
+}
+
+function relativeTime(value) {
+  const elapsed = Math.max(0, Date.now() - new Date(value).getTime());
+  if (elapsed < 60_000) return "刚刚";
+  if (elapsed < 3_600_000) return `${Math.floor(elapsed / 60_000)} 分钟前`;
+  if (elapsed < 86_400_000) return `${Math.floor(elapsed / 3_600_000)} 小时前`;
+  return new Date(value).toLocaleDateString();
+}
+
+function formatTokens(value) {
+  return value >= 1000 ? `${(value / 1000).toFixed(value >= 10_000 ? 0 : 1)}k tokens` : `${value} tokens`;
+}
+
+function formatDuration(value) {
+  return value >= 1000 ? `${(value / 1000).toFixed(1)}s` : `${value}ms`;
+}
+
+async function api(url, options = {}, { silent = false } = {}) {
   const init = { ...options, headers: { ...(options.headers || {}) } };
-  if (options.body !== undefined) { init.headers["content-type"] = "application/json"; init.body = JSON.stringify(options.body); }
-  const response = await fetch(url, init); const payload = await response.json();
-  if (!response.ok) { toast(payload.error || `请求失败 ${response.status}`); throw new Error(payload.error); }
+  if (options.body !== undefined) {
+    init.headers["content-type"] = "application/json";
+    init.body = JSON.stringify(options.body);
+  }
+  let response;
+  try {
+    response = await fetch(url, init);
+  } catch (error) {
+    if (!silent) toast("无法连接本地 Gateway");
+    throw error;
+  }
+  const payload = await response.json();
+  if (!response.ok) {
+    if (!silent) toast(payload.error || `请求失败 ${response.status}`);
+    throw new Error(payload.error);
+  }
   return payload;
 }
 
 let toastTimer;
 function toast(message) {
-  const box = $("#toast"); box.textContent = message; box.classList.remove("hidden"); clearTimeout(toastTimer);
+  const box = $("#toast");
+  box.textContent = message;
+  box.classList.remove("hidden");
+  clearTimeout(toastTimer);
   toastTimer = setTimeout(() => box.classList.add("hidden"), 3000);
 }

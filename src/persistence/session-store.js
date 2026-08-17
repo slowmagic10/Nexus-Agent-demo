@@ -292,12 +292,15 @@ export class SessionStore {
   list(workspace, limit = 20) {
     return this.db.prepare(`
       SELECT id, created_at AS createdAt, updated_at AS updatedAt,
-             provider, phase, message_count AS messageCount
+             provider, phase, message_count AS messageCount, state_json AS stateJson
       FROM sessions
       WHERE workspace = ?
       ORDER BY updated_at DESC
       LIMIT ?
-    `).all(workspace, limit).map((row) => ({ ...row }));
+    `).all(workspace, limit).map(({ stateJson, ...row }) => ({
+      ...row,
+      title: sessionTitle(parseState(stateJson, row.id)),
+    }));
   }
 
   addMemory(content, { tags = [], sourceSession = null } = {}) {
@@ -371,6 +374,13 @@ export class SessionStore {
     }
     return null;
   }
+}
+
+function sessionTitle(state) {
+  const firstRequest = state.messages?.find((message) => message.role === "user")?.content?.trim();
+  if (!firstRequest) return "新任务";
+  const title = firstRequest.replace(/\s+/g, " ");
+  return title.length > 36 ? `${title.slice(0, 36).trimEnd()}…` : title;
 }
 
 function parseMemoryRow(row) {
