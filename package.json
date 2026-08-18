@@ -8,11 +8,13 @@
   },
   "scripts": {
     "start": "node src/cli.js",
-    "deepseek": "node --env-file=.env.deepseek.local src/cli.js",
+    "local": "node src/cli.js",
+    "deepseek": "npm run local",
     "demo": "node src/cli.js --demo",
     "demo:mcp": "node src/cli.js --demo --mcp=mcp.example.json",
     "gateway": "node src/gateway.js --demo",
-    "gateway:deepseek": "node --env-file=.env.deepseek.local src/gateway.js",
+    "gateway:local": "node src/gateway.js",
+    "gateway:deepseek": "npm run gateway:local",
     "gateway:mcp": "node src/gateway.js --demo --mcp=mcp.example.json",
     "test": "node --test"
   }

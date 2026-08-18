@@ -12,8 +12,10 @@ import { createGatewayServer } from "./gateway/server.js";
 import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { formatMaxSteps, readRuntimeOptions } from "./runtime-options.js";
+import { loadLocalEnvironment } from "./local-environment.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+loadLocalEnvironment(path.resolve(here, ".."));
 const args = process.argv.slice(2);
 const workspaceArg = valueArg(args, "workspace");
 const portArg = valueArg(args, "port");

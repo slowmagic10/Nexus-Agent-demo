@@ -29,37 +29,32 @@ npm start
 
 通过 `--workspace=/绝对路径` 可切换工作区；默认使用本仓库根目录。
 
-## 固定使用本地 DeepSeek 配置
+## 本地模型 API 配置
 
-仓库提供 `.env.deepseek.example`，本机实际配置使用 `.env.deepseek.local`。后者已被 Git 忽略，API Key 不会进入提交。
+Nexus 不绑定特定模型厂商。仓库提供通用的 `.env.local.example`，本机实际配置使用 `.env.local`；该文件已被 Git 忽略，API Key 不会进入提交。
 
-首次使用时，打开 `.env.deepseek.local`，只替换这一行：
-
-```dotenv
-OPENAI_API_KEY=你的DeepSeek密钥
-```
-
-模型和接口已经固定为：
+当前只有 DeepSeek Key 时，可以使用下面的配置；以后切换其他 OpenAI-compatible 服务，只需替换接口和模型，不需要修改 Nexus 代码：
 
 ```dotenv
+OPENAI_API_KEY=你的API密钥
 OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_MODEL=deepseek-v4-flash
 NEXUS_MAX_STEPS=unlimited
 ```
 
-启动 DeepSeek CLI：
+启动本地模型 CLI：
 
 ```bash
-npm run deepseek
+npm run local
 ```
 
-启动 DeepSeek Web 控制台：
+启动本地模型 Web 控制台：
 
 ```bash
-npm run gateway:deepseek
+npm run gateway:local
 ```
 
-然后打开 `http://127.0.0.1:4317`。需要临时切换到 `deepseek-v4-pro` 时，只修改本地配置文件中的 `OPENAI_MODEL`。
+然后打开 `http://127.0.0.1:4317`。旧的 `.env.deepseek.local` 和 `deepseek` 启动命令会继续作为兼容入口工作，因此现有私密 Key 不需要重新填写；新配置统一使用 `.env.local`。
 
 `NEXUS_MAX_STEPS` 控制一次用户任务内部最多可以进行多少次模型/工具循环。正整数表示明确上限，`unlimited` 或 `0` 表示不限制步骤数。也可以临时使用 `--max-steps=20` 或 `--max-steps=unlimited` 覆盖环境变量。无限步骤仍会受到单轮 Token 预算、工具超时、人工审批和“停止”操作保护；会话中的用户消息轮次本身一直没有总数限制。
 

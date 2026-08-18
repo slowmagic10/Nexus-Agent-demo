@@ -15,8 +15,10 @@ import { SessionStore } from "./persistence/session-store.js";
 import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { readRuntimeOptions } from "./runtime-options.js";
+import { loadLocalEnvironment } from "./local-environment.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
+loadLocalEnvironment(path.resolve(here, ".."));
 const args = process.argv.slice(2);
 const workspaceArg = args.find((arg) => arg.startsWith("--workspace="))?.split("=").slice(1).join("=");
 const mcpConfigArg = args.find((arg) => arg.startsWith("--mcp="))?.slice("--mcp=".length);
