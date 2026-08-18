@@ -44,6 +44,7 @@ OPENAI_API_KEY=你的DeepSeek密钥
 ```dotenv
 OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_MODEL=deepseek-v4-flash
+NEXUS_MAX_STEPS=unlimited
 ```
 
 启动 DeepSeek CLI：
@@ -60,9 +61,11 @@ npm run gateway:deepseek
 
 然后打开 `http://127.0.0.1:4317`。需要临时切换到 `deepseek-v4-pro` 时，只修改本地配置文件中的 `OPENAI_MODEL`。
 
+`NEXUS_MAX_STEPS` 控制一次用户任务内部最多可以进行多少次模型/工具循环。正整数表示明确上限，`unlimited` 或 `0` 表示不限制步骤数。也可以临时使用 `--max-steps=20` 或 `--max-steps=unlimited` 覆盖环境变量。无限步骤仍会受到单轮 Token 预算、工具超时、人工审批和“停止”操作保护；会话中的用户消息轮次本身一直没有总数限制。
+
 ## 基础能力
 
-- Agent Loop：模型、工具、Observation 循环，默认最多 8 步，并有单轮 Token 预算。
+- Agent Loop：模型、工具、Observation 循环，默认最多 8 步，可通过 `NEXUS_MAX_STEPS` 调整或设为无限，并保留单轮 Token 预算。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
 - 模型上下文：只从 durable event 投影消息、记忆与 Skills；默认按 32,000 estimated input tokens 规划窗口，超限时只保留连续的最近完整 turn，运行指标、审批和 UI 状态不会进入模型输入。
 - 工具安全：路径锁定工作区；读操作自动执行；写文件、Shell、长期记忆修改及 MCP 操作逐次审批；危险 Shell 模式硬拒绝；工具有超时与取消信号。

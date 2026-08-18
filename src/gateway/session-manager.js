@@ -4,12 +4,13 @@ import { AgentRuntime } from "../core/agent.js";
 import { AgentSession } from "../core/session.js";
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, tools, systemPrompt, store }) {
+  constructor({ workspace, provider, tools, systemPrompt, store, maxSteps }) {
     this.workspace = workspace;
     this.provider = provider;
     this.tools = tools;
     this.systemPrompt = systemPrompt;
     this.store = store;
+    this.maxSteps = maxSteps;
     this.sessions = new Map();
   }
 
@@ -45,6 +46,7 @@ export class GatewaySessionManager {
       tools: this.tools,
       systemPrompt: this.systemPrompt,
       retrieveMemory: (query) => this.store.searchMemories(query, 5),
+      maxSteps: this.maxSteps,
     });
     session.subscribe((next) => this.update(entry, next));
     this.sessions.set(state.id, entry);

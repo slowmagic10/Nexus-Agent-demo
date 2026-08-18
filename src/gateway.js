@@ -11,6 +11,7 @@ import { GatewaySessionManager } from "./gateway/session-manager.js";
 import { createGatewayServer } from "./gateway/server.js";
 import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
+import { formatMaxSteps, readRuntimeOptions } from "./runtime-options.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -19,6 +20,7 @@ const portArg = valueArg(args, "port");
 const mcpConfigArg = valueArg(args, "mcp");
 const workspace = path.resolve(workspaceArg || path.resolve(here, ".."));
 const port = portArg ? Number(portArg) : 4317;
+const runtimeOptions = readRuntimeOptions(args, process.env);
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port 必须是 0 到 65535 的整数");
 
 const provider = !args.includes("--demo") && process.env.OPENAI_API_KEY
@@ -43,6 +45,7 @@ const manager = new GatewaySessionManager({
   tools,
   systemPrompt: buildSystemPrompt(context),
   store,
+  maxSteps: runtimeOptions.maxSteps,
 });
 const gateway = createGatewayServer({ manager, port, staticRoot: path.resolve(here, "web") });
 let address;
@@ -58,6 +61,7 @@ try {
 console.log(`Nexus Gateway (${provider.name}) 正在监听 ${address.url}`);
 if (mcp.servers.length) console.log(`已连接 MCP：${mcp.servers.join(", ")}（${mcp.tools.length} 个工具）`);
 console.log(`Web 控制台：${address.url}/`);
+console.log(`单次任务步骤上限：${formatMaxSteps(runtimeOptions.maxSteps)}（仍受单轮 Token 预算约束）`);
 console.log("仅允许本机连接。按 Ctrl+C 安全退出。");
 
 let closing = false;

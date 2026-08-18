@@ -103,8 +103,36 @@ test("敏感凭据会从工具日志文本中脱敏", () => {
   assert.equal(redactSensitiveText("Authorization: Bearer secret-token"), "Authorization: Bearer [REDACTED]");
 });
 
-function createRuntime({ provider, state, maxInputTokens } = {}) {
-  const tools = { schemas: () => [], get: () => null };
+test("无限步骤模式允许单次任务执行超过默认八步", async () => {
+  let calls = 0;
+  const tools = {
+    schemas: () => [],
+    get: () => ({
+      approval: "never",
+      execute: async () => "继续",
+    }),
+  };
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        calls += 1;
+        return calls <= 10
+          ? { text: "", toolCalls: [{ id: `call-${calls}`, name: "noop", arguments: {} }] }
+          : { text: "完成", toolCalls: [] };
+      },
+    },
+    tools,
+    maxSteps: Infinity,
+  });
+
+  await runtime.runTurn("执行长任务", async () => false);
+
+  assert.equal(calls, 11);
+  assert.equal(runtime.state.phase, "completed");
+});
+
+function createRuntime({ provider, state, maxInputTokens, maxSteps, tools } = {}) {
+  tools ||= { schemas: () => [], get: () => null };
   return new AgentRuntime({
     session: new AgentSession({
       state: state || createSession({ provider: "test", workspace: "/tmp" }),
@@ -114,5 +142,6 @@ function createRuntime({ provider, state, maxInputTokens } = {}) {
     tools,
     systemPrompt: () => "test",
     maxInputTokens,
+    maxSteps,
   });
 }

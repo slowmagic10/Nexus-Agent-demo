@@ -14,6 +14,7 @@ import { TerminalUI, helpText } from "./ui.js";
 import { SessionStore } from "./persistence/session-store.js";
 import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
+import { readRuntimeOptions } from "./runtime-options.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const args = process.argv.slice(2);
@@ -26,6 +27,7 @@ const resumeTarget = resumeArg === "--resume" ? "latest" : resumeArg?.slice("--r
 const importFile = args.find((arg) => arg.startsWith("--import="))?.slice("--import=".length);
 const importAs = args.find((arg) => arg.startsWith("--import-as="))?.slice("--import-as=".length);
 const listOnly = args.includes("--sessions");
+const runtimeOptions = readRuntimeOptions(args, process.env);
 const provider = !forceDemo && process.env.OPENAI_API_KEY
   ? new OpenAICompatibleProvider({
       apiKey: process.env.OPENAI_API_KEY,
@@ -99,6 +101,7 @@ const runtime = new AgentRuntime({
   tools,
   systemPrompt: buildSystemPrompt(context),
   retrieveMemory: (query) => store.searchMemories(query, 5),
+  maxSteps: runtimeOptions.maxSteps,
 });
 
 ui.render(runtime.state);

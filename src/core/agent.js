@@ -12,6 +12,9 @@ export class AgentRuntime {
     maxInputTokens = 32_000,
   }) {
     if (!session) throw new Error("AgentRuntime 需要 AgentSession");
+    if (maxSteps !== Infinity && (!Number.isSafeInteger(maxSteps) || maxSteps < 1)) {
+      throw new Error("AgentRuntime maxSteps 必须是正整数或 Infinity");
+    }
     this.session = session;
     this.provider = provider;
     this.tools = tools;
