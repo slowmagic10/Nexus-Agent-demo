@@ -56,6 +56,7 @@ test("超预算时只保留连续的最近完整 turn，不拆散工具协议", 
     omittedTurns: 1,
     compacted: true,
     strategy: "recent-complete-turns-v1",
+    memoryHits: [],
   });
   assert.ok(request.contextPlan.estimatedInputTokens <= 180);
 });
@@ -84,6 +85,41 @@ test("system prompt 与工具 schema 固定成本超过预算时明确失败", (
     }),
     /固定上下文.*超过 Model Context 预算 100/,
   );
+});
+
+test("Context Window Plan 记录长期记忆命中来源但不复制正文", () => {
+  const context = createContext([{ role: "user", content: "继续本地模型工作" }]);
+  context.contextMemory = [{
+    id: "memory-1",
+    content: "用户偏好本地模型",
+    adapter: "sqlite-lexical",
+    score: 0.8,
+    confidence: 0.95,
+    scope: { workspace: "/repo", agentId: "default", userId: "local" },
+    sourceSession: "session-source",
+    sourceCursor: 12,
+    sourceToolCall: "call-memory",
+    version: 2,
+  }];
+
+  const request = prepareModelRequest(context, {
+    systemPrompt: () => "系统提示",
+    tools: [],
+    maxInputTokens: 1_000,
+  });
+
+  assert.deepEqual(request.contextPlan.memoryHits, [{
+    id: "memory-1",
+    adapter: "sqlite-lexical",
+    score: 0.8,
+    confidence: 0.95,
+    scope: { workspace: "/repo", agentId: "default", userId: "local" },
+    sourceSession: "session-source",
+    sourceCursor: 12,
+    sourceToolCall: "call-memory",
+    version: 2,
+  }]);
+  assert.equal("content" in request.contextPlan.memoryHits[0], false);
 });
 
 function createContext(messages) {

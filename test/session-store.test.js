@@ -71,20 +71,20 @@ test("恢复会话不会重复补全已有工具结果", () => {
   assert.deepEqual(resumed.events.at(-1).reconciledToolCalls, []);
 });
 
-test("长期记忆支持保存、搜索和删除", () => {
+test("长期记忆支持保存、搜索和删除", async () => {
   const fixture = createFixture();
   try {
-    const memory = fixture.store.addMemory("偏好本地模型", { tags: ["preference", "local"] });
-    assert.equal(fixture.store.searchMemories("本地")[0].id, memory.id);
-    assert.equal(fixture.store.searchMemories("preference")[0].content, "偏好本地模型");
-    assert.equal(fixture.store.deleteMemory(memory.id), true);
-    assert.deepEqual(fixture.store.searchMemories("本地"), []);
+    const memory = await fixture.store.addMemory("偏好本地模型", { tags: ["preference", "local"] });
+    assert.equal((await fixture.store.searchMemories("本地"))[0].id, memory.id);
+    assert.equal((await fixture.store.searchMemories("preference"))[0].content, "偏好本地模型");
+    assert.equal(await fixture.store.deleteMemory(memory.id), true);
+    assert.deepEqual(await fixture.store.searchMemories("本地"), []);
   } finally {
     fixture.close();
   }
 });
 
-test("旧数据库会按顺序执行显式 schema migration", () => {
+test("旧数据库会按顺序执行显式 schema migration", async () => {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "nexus-migration-test-"));
   const file = path.join(workspace, "nexus.db");
   const legacy = new DatabaseSync(file);
@@ -107,20 +107,41 @@ test("旧数据库会按顺序执行显式 schema migration", () => {
       event_json TEXT NOT NULL,
       PRIMARY KEY(session_id, seq)
     );
+    CREATE TABLE memories (
+      id TEXT PRIMARY KEY,
+      content TEXT NOT NULL,
+      tags_json TEXT NOT NULL,
+      source_session TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+    INSERT INTO memories (id, content, tags_json, source_session, created_at, updated_at)
+    VALUES ('memory-legacy', '旧版长期记忆', '["legacy"]', 'session-old',
+      '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z');
   `);
   legacy.close();
 
-  const store = new SessionStore(file);
+  const store = new SessionStore(file, { workspace });
   try {
     const eventColumns = store.db.prepare("PRAGMA table_info(session_events)").all().map((column) => column.name);
+    const memoryEventColumns = store.db.prepare("PRAGMA table_info(memory_events)").all().map((column) => column.name);
+    const mutationColumns = store.db.prepare("PRAGMA table_info(memory_mutations)").all().map((column) => column.name);
     const migrationVersions = store.db.prepare(
       "SELECT version FROM schema_migrations ORDER BY version",
     ).all().map((row) => row.version);
     assert.ok(eventColumns.includes("schema_version"));
-    assert.deepEqual(migrationVersions, [1, 2]);
+    assert.ok(memoryEventColumns.includes("schema_version"));
+    assert.ok(mutationColumns.includes("request_hash"));
+    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5]);
     assert.ok(store.db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_checkpoints'",
     ).get());
+    const [migratedMemory] = await store.searchMemories("旧版");
+    assert.equal(migratedMemory.id, "memory-legacy");
+    assert.equal(migratedMemory.scope.workspace, workspace);
+    const [migrationEvent] = (await store.verifyMemory(migratedMemory.id)).events;
+    assert.equal(migrationEvent.type, "memory.migrated");
+    assert.equal(migrationEvent.schemaVersion, 1);
   } finally {
     store.close();
     rmSync(workspace, { recursive: true, force: true });
@@ -136,16 +157,28 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 3);
+    assert.equal(restored.schemaVersion, 6);
     assert.equal(restored.lineage, null);
   } finally {
     fixture.close();
   }
 });
 
+test("SessionStore 不再从数据库路径猜测 workspace", () => {
+  const workspace = mkdtempSync(path.join(os.tmpdir(), "nexus-explicit-workspace-test-"));
+  try {
+    assert.throws(
+      () => new SessionStore(path.join(workspace, "nexus.db")),
+      /必须显式提供 workspace/,
+    );
+  } finally {
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
 function createFixture() {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "nexus-session-test-"));
-  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
   return {
     workspace,
     store,

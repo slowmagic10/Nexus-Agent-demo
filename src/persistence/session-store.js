@@ -1,4 +1,4 @@
-// FOUNDATION — SQLite session snapshots and long-term memory.
+// FOUNDATION — SQLite Session Journal plus a compatibility facade for Memory Interface.
 import { mkdirSync } from "node:fs";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -7,16 +7,21 @@ import { createSessionBranch, migrateSessionState, reduceSession } from "../core
 import { redactSensitiveValue } from "../security/redact.js";
 import { createStatePatch } from "../state-patch.js";
 import { EVENT_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
+import { SQLiteMemoryAdapter } from "../memory/sqlite-adapter.js";
+import { createMemoryScope } from "../memory/scope.js";
 
 const JOURNAL_FORMAT = "nexus.session-journal";
 const JOURNAL_FORMAT_VERSION = 1;
 
 export class SessionStore {
-  constructor(file, { checkpointInterval = 100 } = {}) {
+  constructor(file, { checkpointInterval = 100, workspace, memoryScope } = {}) {
     if (!Number.isInteger(checkpointInterval) || checkpointInterval < 1) {
       throw new Error("checkpointInterval 必须是正整数");
     }
     this.file = path.resolve(file);
+    if (typeof workspace !== "string" || !workspace.trim()) throw new Error("SessionStore 必须显式提供 workspace");
+    this.workspace = path.resolve(workspace);
+    this.memoryScope = createMemoryScope(memoryScope || { workspace: this.workspace });
     this.checkpointInterval = checkpointInterval;
     mkdirSync(path.dirname(this.file), { recursive: true });
     this.db = new DatabaseSync(this.file);
@@ -26,6 +31,15 @@ export class SessionStore {
       this.db.close();
       throw error;
     }
+    this.db.prepare(`
+      UPDATE memories SET scope_workspace = ?, scope_agent = ?, scope_user = ?
+      WHERE scope_workspace IS NULL AND scope_agent IS NULL AND scope_user IS NULL
+        AND provenance_json = '{"origin":"legacy"}'
+    `).run(this.memoryScope.workspace, this.memoryScope.agentId, this.memoryScope.userId);
+    this.memory = new SQLiteMemoryAdapter({
+      db: this.db,
+      defaultScope: this.memoryScope,
+    });
     this.upsert = this.db.prepare(`
       INSERT INTO sessions (
         id, created_at, updated_at, provider, workspace, phase, message_count, state_json
@@ -303,38 +317,35 @@ export class SessionStore {
     }));
   }
 
-  addMemory(content, { tags = [], sourceSession = null } = {}) {
-    const now = new Date().toISOString();
-    const memory = {
-      id: `memory-${randomUUID().slice(0, 12)}`,
-      content: typeof content === "string" ? content.trim() : "",
-      tags: [...new Set(tags.map((tag) => String(tag).trim()).filter(Boolean))].slice(0, 20),
-      sourceSession,
-      createdAt: now,
-      updatedAt: now,
-    };
-    if (!memory.content) throw new Error("长期记忆内容不能为空");
-    this.db.prepare(`
-      INSERT INTO memories (id, content, tags_json, source_session, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?)
-    `).run(memory.id, memory.content, JSON.stringify(memory.tags), sourceSession, now, now);
-    return memory;
+  async addMemory(content, {
+    tags = [], sourceSession = null, sourceCursor = null, toolCallId = null, scope, kind = "fact", confidence = 1,
+    origin = sourceSession ? "tool" : "user_explicit",
+  } = {}) {
+    return await this.memory.add({ content, tags, kind, confidence }, {
+      scope: scope || this.memoryScope,
+      provenance: {
+        origin,
+        sessionId: sourceSession,
+        sourceCursor,
+        toolCallId,
+        actor: sourceSession ? "agent" : "local-user",
+      },
+    });
   }
 
-  searchMemories(query = "", limit = 20) {
-    const needle = String(query).trim();
-    const rows = needle
-      ? this.db.prepare(`
-          SELECT * FROM memories
-          WHERE instr(lower(content), lower(?)) > 0 OR instr(lower(tags_json), lower(?)) > 0
-          ORDER BY updated_at DESC LIMIT ?
-        `).all(needle, needle, limit)
-      : this.db.prepare("SELECT * FROM memories ORDER BY updated_at DESC LIMIT ?").all(limit);
-    return rows.map(parseMemoryRow);
+  async searchMemories(query = "", limit = 20, scope = this.memoryScope) {
+    return await this.memory.search(query, { scope }, { limit });
   }
 
-  deleteMemory(id) {
-    return this.db.prepare("DELETE FROM memories WHERE id = ?").run(id).changes > 0;
+  async deleteMemory(id, reason = "用户请求删除", provenance = {}, scope = this.memoryScope) {
+    return await this.memory.delete(id, reason, {
+      scope,
+      provenance: { origin: "user_explicit", actor: "local-user", ...provenance },
+    });
+  }
+
+  async verifyMemory(id, scope = this.memoryScope) {
+    return await this.memory.verify(id, { scope });
   }
 
   close() {
@@ -381,17 +392,6 @@ function sessionTitle(state) {
   if (!firstRequest) return "新任务";
   const title = firstRequest.replace(/\s+/g, " ");
   return title.length > 36 ? `${title.slice(0, 36).trimEnd()}…` : title;
-}
-
-function parseMemoryRow(row) {
-  return {
-    id: row.id,
-    content: row.content,
-    tags: JSON.parse(row.tags_json),
-    sourceSession: row.source_session,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-  };
 }
 
 function parseState(value, label) {
@@ -474,6 +474,7 @@ function validateJournalArchive(archive) {
 
   const sourceId = validateImportTarget(archive.session.id, "archive session ID");
   let state = null;
+  let sourceStateSchemaVersion = null;
   const events = archive.events.map((sourceEvent, index) => {
     const event = structuredClone(sourceEvent);
     const cursor = index + 1;
@@ -491,6 +492,10 @@ function validateJournalArchive(archive) {
     if (cursor === 1) {
       if (event.type !== "SESSION_BASELINE" || !event.baseline) {
         throw new Error("portable journal 第一个事件必须是 SESSION_BASELINE");
+      }
+      sourceStateSchemaVersion = event.baseline.schemaVersion;
+      if (archive.session.stateSchemaVersion !== sourceStateSchemaVersion) {
+        throw new Error("portable journal session.stateSchemaVersion 与 baseline 不一致");
       }
       state = validateArchiveState(event.baseline, sourceId, "baseline");
       if (event.at !== state.createdAt) {
@@ -518,16 +523,26 @@ function validateJournalArchive(archive) {
   if (!Number.isInteger(archive.session.cursor) || archive.session.cursor !== events.length) {
     throw new Error("portable journal session cursor 与 events 数量不一致");
   }
-  validateArchiveMetadata(archive.session, state);
+  validateArchiveMetadata(archive.session, state, sourceStateSchemaVersion);
   return { events, state };
 }
 
 function adaptJournal(events, { id, workspace }) {
   const adaptedEvents = [];
+  const sourceId = events[0].baseline.id;
+  const sourceBaseline = migrateSessionState(structuredClone(events[0].baseline));
   const baseline = redactSensitiveValue({
-    ...migrateSessionState(structuredClone(events[0].baseline)),
+    ...sourceBaseline,
     id,
     workspace,
+    memoryScope: createMemoryScope({ ...sourceBaseline.memoryScope, workspace }),
+    pendingMemoryMutations: sourceBaseline.pendingMemoryMutations.map((mutation) => (
+      adaptMemoryMutation(mutation, { sourceId, id, workspace })
+    )),
+    memoryMutationIssues: sourceBaseline.memoryMutationIssues.map((issue) => ({
+      ...issue,
+      mutation: adaptMemoryMutation(issue.mutation, { sourceId, id, workspace }),
+    })),
   });
   let state = baseline;
   adaptedEvents.push({
@@ -542,6 +557,18 @@ function adaptJournal(events, { id, workspace }) {
   for (const event of events.slice(1)) {
     const action = redactSensitiveValue(structuredClone(event.action));
     if (action.type === "RESUMED") action.workspace = workspace;
+    if (action.type === "MEMORY_MUTATION_REQUESTED") {
+      action.mutation = adaptMemoryMutation(action.mutation, { sourceId, id, workspace });
+    }
+    if ([
+      "MEMORY_MUTATION_APPLIED",
+      "MEMORY_MUTATION_FAILED",
+      "MEMORY_MUTATION_OUTCOME_UNKNOWN",
+      "MEMORY_MUTATION_MANUAL_REQUIRED",
+      "MEMORY_MUTATION_DISCARDED",
+    ].includes(action.type)) {
+      action.mutationId = adaptMutationId(action.mutationId, sourceId, id);
+    }
     const next = redactSensitiveValue(reduceSession(state, action));
     adaptedEvents.push({
       cursor: event.cursor,
@@ -557,6 +584,21 @@ function adaptJournal(events, { id, workspace }) {
   return { events: adaptedEvents, state };
 }
 
+function adaptMemoryMutation(mutation, { sourceId, id, workspace }) {
+  const adapted = structuredClone(mutation);
+  adapted.id = adaptMutationId(adapted.id, sourceId, id);
+  adapted.scope = createMemoryScope({ ...adapted.scope, workspace });
+  if (adapted.provenance?.sessionId === sourceId) adapted.provenance.sessionId = id;
+  adapted.reconcilePolicy = "manual";
+  return adapted;
+}
+
+function adaptMutationId(value, sourceId, id) {
+  return typeof value === "string" && value.startsWith(`${sourceId}:`)
+    ? `${id}:${value.slice(sourceId.length + 1)}`
+    : value;
+}
+
 function validateArchiveState(value, sourceId, label) {
   let state;
   try {
@@ -570,14 +612,14 @@ function validateArchiveState(value, sourceId, label) {
   return state;
 }
 
-function validateArchiveMetadata(metadata, state) {
+function validateArchiveMetadata(metadata, state, sourceStateSchemaVersion) {
   const fields = ["id", "createdAt", "updatedAt", "provider", "workspace"];
   for (const field of fields) {
     if (metadata[field] !== state[field]) {
       throw new Error(`portable journal session.${field} 与重放状态不一致`);
     }
   }
-  if (metadata.stateSchemaVersion !== state.schemaVersion) {
+  if (metadata.stateSchemaVersion !== sourceStateSchemaVersion) {
     throw new Error("portable journal state schema version 与重放状态不一致");
   }
   if (stableStringify(metadata.lineage || null) !== stableStringify(state.lineage || null)) {

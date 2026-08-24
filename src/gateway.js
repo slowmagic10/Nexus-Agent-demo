@@ -13,6 +13,7 @@ import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { formatMaxSteps, readRuntimeOptions } from "./runtime-options.js";
 import { loadLocalEnvironment } from "./local-environment.js";
+import { createLocalMemoryScope } from "./memory/scope.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 loadLocalEnvironment(path.resolve(here, ".."));
@@ -21,6 +22,7 @@ const workspaceArg = valueArg(args, "workspace");
 const portArg = valueArg(args, "port");
 const mcpConfigArg = valueArg(args, "mcp");
 const workspace = path.resolve(workspaceArg || path.resolve(here, ".."));
+const memoryScope = createLocalMemoryScope(workspace);
 const port = portArg ? Number(portArg) : 4317;
 const runtimeOptions = readRuntimeOptions(args, process.env);
 if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("--port 必须是 0 到 65535 的整数");
@@ -34,12 +36,13 @@ const provider = !args.includes("--demo") && process.env.OPENAI_API_KEY
   : new DemoProvider();
 const context = await loadWorkspaceContext(workspace);
 const mcp = await connectMcpTools(await loadMcpConfig(mcpConfigArg, workspace));
-const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"));
+const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace, memoryScope });
 const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
   extraTools: mcp.tools,
-  memoryStore: store,
+  memory: store.memory,
+  memoryScope,
 });
 const manager = new GatewaySessionManager({
   workspace,
@@ -47,6 +50,7 @@ const manager = new GatewaySessionManager({
   tools,
   systemPrompt: buildSystemPrompt(context),
   store,
+  memory: store.memory,
   maxSteps: runtimeOptions.maxSteps,
 });
 const gateway = createGatewayServer({ manager, port, staticRoot: path.resolve(here, "web") });

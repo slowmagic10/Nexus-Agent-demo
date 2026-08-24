@@ -2,14 +2,25 @@
 import { createSession, reduceSession } from "../core/state.js";
 import { AgentRuntime } from "../core/agent.js";
 import { AgentSession } from "../core/session.js";
+import { assertMemoryInspection, assertMemoryInterface } from "../memory/interface.js";
+import { createMemoryScope } from "../memory/scope.js";
+import {
+  discardMemoryMutation,
+  reconcileMemoryOutbox,
+  resolveMemoryMutation,
+  retryMemoryMutation,
+} from "../memory/outbox.js";
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, tools, systemPrompt, store, maxSteps }) {
+  constructor({ workspace, provider, tools, systemPrompt, store, memory = store?.memory, memoryScope, maxSteps }) {
     this.workspace = workspace;
     this.provider = provider;
     this.tools = tools;
     this.systemPrompt = systemPrompt;
     this.store = store;
+    this.memory = assertMemoryInterface(memory);
+    assertMemoryInspection(this.memory);
+    this.defaultMemoryScope = createMemoryScope(memoryScope || { workspace });
     this.maxSteps = maxSteps;
     this.sessions = new Map();
   }
@@ -29,7 +40,7 @@ export class GatewaySessionManager {
     if (existing) return existing.state;
 
     const resumed = Boolean(state);
-    state ||= createSession({ provider: this.provider.name, workspace: this.workspace });
+    state ||= createSession({ provider: this.provider.name, workspace: this.workspace, memoryScope: this.defaultMemoryScope });
     const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
 
     const entry = {
@@ -45,12 +56,17 @@ export class GatewaySessionManager {
       provider: this.provider,
       tools: this.tools,
       systemPrompt: this.systemPrompt,
-      retrieveMemory: (query) => this.store.searchMemories(query, 5),
+      retrieveMemory: (query, { signal } = {}) => this.memory.search(query, {
+        scope: session.state.memoryScope,
+        signal,
+      }, { limit: 5 }),
+      reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
       maxSteps: this.maxSteps,
     });
     session.subscribe((next) => this.update(entry, next));
     this.sessions.set(state.id, entry);
     if (resumed) {
+      await reconcileMemoryOutbox({ session, memory: this.memory });
       await session.dispatch({ type: "RESUMED", provider: this.provider.name, workspace: this.workspace });
     }
     return session.state;
@@ -139,18 +155,65 @@ export class GatewaySessionManager {
     return entry.state;
   }
 
-  listMemories(query = "") {
-    return this.store.searchMemories(query, 100);
+  async retryMemoryMutation(id, mutationId) {
+    const entry = await this.ensureLoaded(id);
+    this.#assertMutationIdle(entry);
+    try {
+      await retryMemoryMutation({ session: entry.session, memory: this.memory, mutationId });
+      return entry.state;
+    } catch (error) {
+      throw this.#mutationError(error);
+    }
   }
 
-  addMemory(content, tags = []) {
+  async discardMemoryMutation(id, mutationId, reason) {
+    const entry = await this.ensureLoaded(id);
+    this.#assertMutationIdle(entry);
+    try {
+      await discardMemoryMutation({ session: entry.session, mutationId, reason });
+      return entry.state;
+    } catch (error) {
+      throw this.#mutationError(error);
+    }
+  }
+
+  async resolveMemoryMutation(id, mutationId, memoryId = null) {
+    const entry = await this.ensureLoaded(id);
+    this.#assertMutationIdle(entry);
+    try {
+      await resolveMemoryMutation({ session: entry.session, mutationId, memoryId });
+      return entry.state;
+    } catch (error) {
+      throw this.#mutationError(error);
+    }
+  }
+
+  async listMemories(query = "") {
+    return await this.memory.search(query, { scope: this.defaultMemoryScope }, { limit: 100 });
+  }
+
+  async addMemory(content, tags = []) {
     if (typeof content !== "string" || !content.trim()) throw new GatewayError(400, "content 必须是非空字符串");
     if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === "string")) throw new GatewayError(400, "tags 必须是字符串数组");
-    return this.store.addMemory(content, { tags });
+    return await this.memory.add({ content, tags, kind: "fact", confidence: 1 }, {
+      scope: this.defaultMemoryScope,
+      provenance: { origin: "user_explicit", actor: this.defaultMemoryScope.userId },
+    });
   }
 
-  deleteMemory(id) {
-    if (!this.store.deleteMemory(id)) throw new GatewayError(404, `未找到长期记忆：${id}`);
+  async deleteMemory(id, reason = "用户通过 Gateway 请求删除") {
+    if (!await this.memory.delete(id, reason, {
+      scope: this.defaultMemoryScope,
+      provenance: { origin: "user_explicit", actor: this.defaultMemoryScope.userId },
+    })) {
+      throw new GatewayError(404, `未找到长期记忆：${id}`);
+    }
+  }
+
+  async verifyMemory(id) {
+    const verification = await this.memory.verify(id, { scope: this.defaultMemoryScope });
+    if (!verification) throw new GatewayError(404, `未找到长期记忆：${id}`);
+    return verification;
   }
 
   async subscribe(id, listener) {
@@ -198,6 +261,15 @@ export class GatewaySessionManager {
   update(entry, state) {
     entry.state = state;
     for (const listener of entry.subscribers) listener(state);
+  }
+
+  #assertMutationIdle(entry) {
+    if (entry.run) throw new GatewayError(409, "会话运行期间不能处理 Memory mutation");
+  }
+
+  #mutationError(error) {
+    if (/未找到.*Memory mutation/.test(error.message)) return new GatewayError(404, error.message);
+    return error instanceof GatewayError ? error : new GatewayError(400, error.message);
   }
 }
 

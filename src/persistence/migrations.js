@@ -1,5 +1,6 @@
 // FOUNDATION — ordered, transactional SQLite schema evolution.
 export const EVENT_SCHEMA_VERSION = 1;
+export const MEMORY_EVENT_SCHEMA_VERSION = 1;
 
 const migrations = [
   {
@@ -65,6 +66,74 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 3,
+    up(db) {
+      addColumn(db, "memories", "scope_workspace", "TEXT");
+      addColumn(db, "memories", "scope_agent", "TEXT");
+      addColumn(db, "memories", "scope_user", "TEXT");
+      addColumn(db, "memories", "kind", "TEXT NOT NULL DEFAULT 'fact'");
+      addColumn(db, "memories", "status", "TEXT NOT NULL DEFAULT 'active'");
+      addColumn(db, "memories", "confidence", "REAL NOT NULL DEFAULT 1");
+      addColumn(db, "memories", "source_event", "INTEGER");
+      addColumn(db, "memories", "provenance_json", "TEXT NOT NULL DEFAULT '{\"origin\":\"legacy\"}'");
+      addColumn(db, "memories", "observed_at", "TEXT");
+      addColumn(db, "memories", "expires_at", "TEXT");
+      addColumn(db, "memories", "version", "INTEGER NOT NULL DEFAULT 1");
+      addColumn(db, "memories", "replacement_id", "TEXT");
+      addColumn(db, "memories", "deleted_reason", "TEXT");
+      db.exec(`
+        UPDATE memories SET observed_at = created_at WHERE observed_at IS NULL;
+        CREATE INDEX IF NOT EXISTS memories_scope_status_updated
+          ON memories(scope_workspace, scope_agent, scope_user, status, updated_at DESC);
+        CREATE TABLE IF NOT EXISTS memory_events (
+          memory_id TEXT NOT NULL,
+          seq INTEGER NOT NULL,
+          at TEXT NOT NULL,
+          type TEXT NOT NULL,
+          provenance_json TEXT NOT NULL,
+          detail_json TEXT NOT NULL,
+          PRIMARY KEY(memory_id, seq),
+          FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS memory_events_memory_seq
+          ON memory_events(memory_id, seq);
+        INSERT INTO memory_events (memory_id, seq, at, type, provenance_json, detail_json)
+        SELECT id, 1, created_at, 'memory.migrated', provenance_json, '{"legacy":true}'
+        FROM memories
+        WHERE NOT EXISTS (
+          SELECT 1 FROM memory_events WHERE memory_events.memory_id = memories.id
+        );
+      `);
+    },
+  },
+  {
+    version: 4,
+    up(db) {
+      addColumn(db, "memories", "source_cursor", "INTEGER");
+      addColumn(db, "memories", "source_tool_call", "TEXT");
+      addColumn(db, "memories", "provenance_validated", "INTEGER NOT NULL DEFAULT 0");
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS memory_mutations (
+          mutation_id TEXT PRIMARY KEY,
+          memory_id TEXT,
+          operation TEXT NOT NULL,
+          result_json TEXT NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE RESTRICT
+        );
+        CREATE INDEX IF NOT EXISTS memory_mutations_memory
+          ON memory_mutations(memory_id, created_at DESC);
+      `);
+    },
+  },
+  {
+    version: 5,
+    up(db) {
+      addColumn(db, "memory_events", "schema_version", "INTEGER NOT NULL DEFAULT 1");
+      addColumn(db, "memory_mutations", "request_hash", "TEXT");
+    },
+  },
 ];
 
 export function migrateDatabase(db) {
@@ -97,4 +166,8 @@ export function migrateDatabase(db) {
 
 function hasColumn(db, table, column) {
   return db.prepare(`PRAGMA table_info(${table})`).all().some((item) => item.name === column);
+}
+
+function addColumn(db, table, column, definition) {
+  if (!hasColumn(db, table, column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
 }

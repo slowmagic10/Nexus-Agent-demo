@@ -16,6 +16,13 @@ import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { readRuntimeOptions } from "./runtime-options.js";
 import { loadLocalEnvironment } from "./local-environment.js";
+import { createLocalMemoryScope } from "./memory/scope.js";
+import {
+  discardMemoryMutation,
+  reconcileMemoryOutbox,
+  resolveMemoryMutation,
+  retryMemoryMutation,
+} from "./memory/outbox.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 loadLocalEnvironment(path.resolve(here, ".."));
@@ -23,6 +30,7 @@ const args = process.argv.slice(2);
 const workspaceArg = args.find((arg) => arg.startsWith("--workspace="))?.split("=").slice(1).join("=");
 const mcpConfigArg = args.find((arg) => arg.startsWith("--mcp="))?.slice("--mcp=".length);
 const workspace = path.resolve(workspaceArg || path.resolve(here, ".."));
+const memoryScope = createLocalMemoryScope(workspace);
 const forceDemo = args.includes("--demo");
 const resumeArg = args.find((arg) => arg === "--resume" || arg.startsWith("--resume="));
 const resumeTarget = resumeArg === "--resume" ? "latest" : resumeArg?.slice("--resume=".length);
@@ -38,7 +46,7 @@ const provider = !forceDemo && process.env.OPENAI_API_KEY
     })
   : new DemoProvider();
 
-const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"));
+const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace, memoryScope });
 
 if (listOnly) {
   printSessions(store.list(workspace));
@@ -73,7 +81,7 @@ const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
   extraTools: mcp.tools,
-  memoryStore: store,
+  memory: store.memory,
 });
 const ui = new TerminalUI();
 let initialState = resumeTarget === "latest"
@@ -91,10 +99,11 @@ if (resumeTarget && !initialState) {
 }
 
 const resumed = Boolean(initialState);
-initialState ||= createSession({ provider: provider.name, workspace });
+initialState ||= createSession({ provider: provider.name, workspace, memoryScope });
 const session = new AgentSession({ state: initialState, reducer: reduceSession, journal: store });
 session.subscribe((state) => ui.render(state));
 if (resumed) {
+  await reconcileMemoryOutbox({ session, memory: store.memory });
   await session.dispatch({ type: "RESUMED", provider: provider.name, workspace });
 }
 const runtime = new AgentRuntime({
@@ -102,7 +111,11 @@ const runtime = new AgentRuntime({
   provider,
   tools,
   systemPrompt: buildSystemPrompt(context),
-  retrieveMemory: (query) => store.searchMemories(query, 5),
+  retrieveMemory: (query, { signal } = {}) => store.memory.search(query, {
+    scope: session.state.memoryScope,
+    signal,
+  }, { limit: 5 }),
+  reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: store.memory, signal }),
   maxSteps: runtimeOptions.maxSteps,
 });
 
@@ -134,7 +147,64 @@ while (true) {
     continue;
   }
   if (input === "/long-memory") {
-    ui.lastAnswer = formatMemories(store.searchMemories("", 50));
+    ui.lastAnswer = formatMemories(await store.memory.search("", { scope: runtime.state.memoryScope }, { limit: 50 }));
+    ui.render(runtime.state);
+    continue;
+  }
+  if (input.startsWith("/memory-info=")) {
+    const id = input.slice("/memory-info=".length).trim();
+    ui.lastAnswer = id ? formatMemoryVerification(await store.memory.verify(id, { scope: runtime.state.memoryScope })) : "请提供 Memory ID。";
+    ui.render(runtime.state);
+    continue;
+  }
+  if (input.startsWith("/forget=")) {
+    const id = input.slice("/forget=".length).trim();
+    ui.lastAnswer = !id
+      ? "请提供 Memory ID。"
+      : await store.memory.delete(id, "用户通过 CLI 请求删除", {
+          scope: runtime.state.memoryScope,
+          provenance: { origin: "user_explicit", actor: runtime.state.memoryScope.userId },
+        })
+        ? `已软删除长期记忆：${id}`
+        : `未找到可删除的长期记忆：${id}`;
+    ui.render(runtime.state);
+    continue;
+  }
+  if (input === "/memory-issues") {
+    ui.lastAnswer = formatMemoryIssues(runtime.state.memoryMutationIssues);
+    ui.render(runtime.state);
+    continue;
+  }
+  if (input.startsWith("/memory-retry=")) {
+    const mutationId = input.slice("/memory-retry=".length).trim();
+    try {
+      const result = await retryMemoryMutation({ session, memory: store.memory, mutationId });
+      ui.lastAnswer = `Memory mutation 已重试成功：${mutationId}${result?.id ? ` → ${result.id}` : ""}`;
+    } catch (error) {
+      ui.lastAnswer = `Memory mutation 重试失败：${error.message}`;
+    }
+    ui.render(runtime.state);
+    continue;
+  }
+  if (input.startsWith("/memory-discard=")) {
+    const mutationId = input.slice("/memory-discard=".length).trim();
+    try {
+      await discardMemoryMutation({ session, mutationId, reason: "用户通过 CLI 放弃" });
+      ui.lastAnswer = `Memory mutation 已放弃：${mutationId}`;
+    } catch (error) {
+      ui.lastAnswer = `Memory mutation 放弃失败：${error.message}`;
+    }
+    ui.render(runtime.state);
+    continue;
+  }
+  if (input.startsWith("/memory-resolve=")) {
+    const [mutationId, memoryId] = input.slice("/memory-resolve=".length).split(",").map((value) => value.trim());
+    try {
+      await resolveMemoryMutation({ session, mutationId, memoryId: memoryId || null });
+      ui.lastAnswer = `Memory mutation 已人工确认完成：${mutationId}`;
+    } catch (error) {
+      ui.lastAnswer = `Memory mutation 处理失败：${error.message}`;
+    }
     ui.render(runtime.state);
     continue;
   }
@@ -175,5 +245,31 @@ function formatSessions(sessions) {
 }
 
 function formatMemories(memories) {
-  return memories.map((item) => `${item.id}\t${item.tags.join(",")}\t${item.content}`).join("\n") || "长期记忆为空。";
+  return memories.map((item) => {
+    const source = item.sourceSession
+      ? `${item.sourceSession}${item.sourceCursor ? `#${item.sourceCursor}` : ""}`
+      : item.provenance?.origin || "unknown";
+    return `${item.id}\t${item.kind}/${item.status}\t${source}\t${item.tags.join(",")}\t${item.content}`;
+  }).join("\n") || "长期记忆为空。";
+}
+
+function formatMemoryVerification(verification) {
+  if (!verification) return "未找到该长期记忆。";
+  const { record, events } = verification;
+  return [
+    `ID：${record.id}`,
+    `状态：${record.status} · 类型：${record.kind} · 版本：${record.version}`,
+    `作用域：${JSON.stringify(record.scope)}`,
+    `来源：${record.sourceSession || record.provenance.origin}${record.sourceCursor ? `#${record.sourceCursor}` : ""}`,
+    `可信度：${record.confidence}`,
+    `内容：${record.content}`,
+    "审计：",
+    ...events.map((event) => `- ${event.seq} ${event.at} ${event.type} ${JSON.stringify(event.detail)}`),
+  ].join("\n");
+}
+
+function formatMemoryIssues(issues) {
+  return issues.map((issue) => (
+    `${issue.mutation.id}\t${issue.status}/${issue.outcome || "unknown"}\t${issue.mutation.operation}\t${issue.retryPolicy}\t${issue.error || ""}`
+  )).join("\n") || "没有待处理的 Memory mutation。";
 }

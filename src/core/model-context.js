@@ -31,6 +31,7 @@ export function prepareModelRequest(context, {
     throw new Error("Model Context maxInputTokens 必须是正整数");
   }
   const promptContext = structuredClone(context);
+  const memoryHits = summarizeMemoryHits(promptContext.contextMemory);
   const baseSystemPrompt = typeof systemPrompt === "function"
     ? String(systemPrompt(promptContext) || "")
     : String(systemPrompt || "");
@@ -51,6 +52,7 @@ export function prepareModelRequest(context, {
       omittedTurns: 0,
       compacted: false,
       strategy: CONTEXT_STRATEGY,
+      memoryHits,
     });
   }
 
@@ -86,6 +88,7 @@ export function prepareModelRequest(context, {
     omittedTurns: Math.max(0, firstIncludedTurn),
     compacted: true,
     strategy: CONTEXT_STRATEGY,
+    memoryHits,
   });
 }
 
@@ -119,8 +122,23 @@ function buildRequest(systemPrompt, messages, tools, contextPlan) {
       omittedTurns: contextPlan.omittedTurns,
       compacted: contextPlan.compacted,
       strategy: contextPlan.strategy,
+      memoryHits: contextPlan.memoryHits || [],
     },
   };
+}
+
+function summarizeMemoryHits(memories = []) {
+  return memories.map((memory) => ({
+    id: memory.id,
+    adapter: memory.adapter || "unknown",
+    score: memory.score ?? null,
+    confidence: memory.confidence ?? null,
+    scope: structuredClone(memory.scope || null),
+    sourceSession: memory.sourceSession || null,
+    sourceCursor: memory.sourceCursor ?? null,
+    sourceToolCall: memory.sourceToolCall || null,
+    version: memory.version ?? null,
+  }));
 }
 
 function groupCompleteTurns(messages) {

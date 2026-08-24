@@ -39,3 +39,23 @@ _Avoid_: State dump, snapshot export
 **Journal Import**:
 先验证 Journal Archive 的内容身份和重放一致性，再在单一事务中把 durable event 重定位到目标 workspace；可显式重映射 Session ID，失败时不产生部分 Session。
 _Avoid_: JSON restore, snapshot upload
+
+**Memory Scope**:
+由 workspace、agentId、userId 组成并保存在 Agent Session 中的长期记忆授权边界；caller scope 必须参与每一次检索、读取、审计和 mutation，Memory ID 本身不是权限。
+_Avoid_: Default global memory, ID-only access
+
+**Memory Provenance**:
+长期记忆的来源身份。工具写入必须引用真实存在且 callId 匹配的 Durable Session Event cursor，并且来源 Agent Session 的 Memory Scope 必须与 caller scope 完全一致；外部来源使用 externalRef，不能冒充本地 cursor。
+_Avoid_: Projection event seq, unverified sourceEvent
+
+**Memory Mutation Outbox**:
+先由 Session Journal 持久化 mutation request，再以绑定规范化请求摘要的稳定 mutationId 写 Memory Adapter，最后持久化 applied event 的恢复协议。是否允许重放由 failure outcome 与 Adapter 明示的 mutationIdempotency 共同决定；恢复不能让单个坏 mutation 阻断新 turn，也不能把不确定副作用当成普通失败重复执行。
+_Avoid_: Memory-first write, implicit side-effect replay
+
+**Memory Mutation Issue**:
+未能自动闭合的 Memory mutation 终态投影，保存原 mutation、错误、尝试次数、failure outcome 和处理策略；它不参与自动 reconcile。只有 retryable issue 可以 retry，所有 issue 可以 discard 或 resolve，pending 不能直接 resolve。
+_Avoid_: Permanent pending, infinite automatic retry
+
+**Memory Mutation Outcome**:
+Adapter mutation 失败后的副作用确定性分类：safe_to_retry 表示确认未生效，outcome_unknown 表示可能已生效，non_retryable 表示确定不应重试。未类型化错误和 deadline 默认是 outcome_unknown；只有声明 mutation-key 幂等的 Adapter 才能安全重放这类 issue。
+_Avoid_: Every error is retryable, timeout means no side effect

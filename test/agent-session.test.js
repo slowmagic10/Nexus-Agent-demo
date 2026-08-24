@@ -8,6 +8,7 @@ import { AgentSession } from "../src/core/session.js";
 import { createSession, reduceSession } from "../src/core/state.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 import { applyStatePatch } from "../src/state-patch.js";
+import { reconcileMemoryOutbox } from "../src/memory/outbox.js";
 
 test("会话可从事件日志重放，快照不是事实来源", async () => {
   const fixture = createFixture();
@@ -290,6 +291,7 @@ test("portable journal 可重定位 workspace、重映射 ID 并完整重放", a
       state: createSession({
         provider: "demo",
         workspace: source.workspace,
+        memoryScope: { workspace: source.workspace, agentId: "coding-agent", userId: "nick" },
         id: "session-import-source",
         createdAt: "2026-08-17T01:00:00.000Z",
       }),
@@ -324,6 +326,9 @@ test("portable journal 可重定位 workspace、重映射 ID 并完整重放", a
 
     assert.equal(imported.id, "session-imported");
     assert.equal(imported.workspace, destination.workspace);
+    assert.equal(imported.memoryScope.workspace, destination.workspace);
+    assert.equal(imported.memoryScope.agentId, session.state.memoryScope.agentId);
+    assert.equal(imported.memoryScope.userId, session.state.memoryScope.userId);
     assert.deepEqual(imported.messages, session.state.messages);
     assert.deepEqual(imported.memory, session.state.memory);
     assert.deepEqual(destination.store.load(imported.id), imported);
@@ -349,6 +354,65 @@ test("portable journal 可重定位 workspace、重映射 ID 并完整重放", a
       id: "session-imported-legacy-checksum",
       workspace: destination.workspace,
     }).id, "session-imported-legacy-checksum");
+  } finally {
+    source.close();
+    destination.close();
+  }
+});
+
+test("导入的未完成 Memory outbox 不会自动执行副作用", async () => {
+  const source = createFixture();
+  const destination = createFixture();
+  try {
+    const session = new AgentSession({
+      state: createSession({ provider: "demo", workspace: source.workspace, id: "session-pending-memory" }),
+      reducer: reduceSession,
+      journal: source.store,
+    });
+    const call = { id: "call-pending-memory", name: "memory_save", arguments: { content: "不要自动导入" } };
+    await session.dispatch({
+      type: "ASSISTANT_MESSAGE",
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [{ id: call.id, type: "function", function: { name: call.name, arguments: "{}" } }],
+      },
+    });
+    await session.dispatch({ type: "TOOL_REQUESTED", call });
+    const sourceCursor = session.cursor;
+    await session.dispatch({
+      type: "MEMORY_MUTATION_REQUESTED",
+      mutation: {
+        id: `${session.id}:${call.id}:memory.add`,
+        operation: "add",
+        reconcilePolicy: "automatic",
+        candidate: { content: "不要自动导入", kind: "fact", confidence: 1 },
+        scope: session.state.memoryScope,
+        provenance: {
+          origin: "tool",
+          sessionId: session.id,
+          sourceCursor,
+          toolCallId: call.id,
+          actor: session.state.memoryScope.agentId,
+        },
+      },
+    });
+    const archive = source.store.exportJournal(session.id);
+    const imported = destination.store.importJournal(archive, {
+      id: "session-pending-memory-imported",
+      workspace: destination.workspace,
+    });
+    const importedSession = new AgentSession({ state: imported, reducer: reduceSession, journal: destination.store });
+
+    const result = await reconcileMemoryOutbox({ session: importedSession, memory: destination.store.memory });
+
+    assert.equal(result[0].status, "manual_required");
+    assert.deepEqual(importedSession.state.pendingMemoryMutations, []);
+    assert.equal(importedSession.state.memoryMutationIssues[0].status, "manual_required");
+    assert.equal(importedSession.state.memoryMutationIssues[0].mutation.reconcilePolicy, "manual");
+    assert.deepEqual(await destination.store.memory.search("不要自动导入", {
+      scope: importedSession.state.memoryScope,
+    }), []);
   } finally {
     source.close();
     destination.close();
@@ -447,6 +511,8 @@ test("Session Branch 从指定 cursor 建立独立 lineage 并闭合未决工具
     assert.equal(branch.id, "session-child");
     assert.equal(branch.phase, "idle");
     assert.equal(branch.pendingApproval, null);
+    assert.equal(branch.memoryScope.workspace, fixture.workspace);
+    assert.deepEqual(branch.pendingMemoryMutations, []);
     assert.deepEqual(branch.lineage, {
       parentSessionId: source.id,
       parentCursor: 4,
@@ -466,7 +532,7 @@ test("Session Branch 从指定 cursor 建立独立 lineage 并闭合未决工具
 
 function createFixture(options) {
   const workspace = mkdtempSync(path.join(os.tmpdir(), "nexus-agent-session-test-"));
-  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), options);
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { ...options, workspace });
   return {
     workspace,
     store,

@@ -64,18 +64,23 @@ async function route(request, response, manager, staticRoot) {
   }
 
   if (request.method === "GET" && url.pathname === "/memories") {
-    sendJson(response, 200, { memories: manager.listMemories(url.searchParams.get("query") || "") });
+    sendJson(response, 200, { memories: await manager.listMemories(url.searchParams.get("query") || "") });
     return;
   }
 
   if (request.method === "POST" && url.pathname === "/memories") {
     const body = await readJson(request);
-    sendJson(response, 201, { memory: manager.addMemory(body.content, body.tags || []) });
+    sendJson(response, 201, { memory: await manager.addMemory(body.content, body.tags || []) });
+    return;
+  }
+
+  if (request.method === "GET" && parts[0] === "memories" && parts[1] && parts.length === 2) {
+    sendJson(response, 200, { memory: await manager.verifyMemory(parts[1]) });
     return;
   }
 
   if (request.method === "DELETE" && parts[0] === "memories" && parts[1] && parts.length === 2) {
-    manager.deleteMemory(parts[1]);
+    await manager.deleteMemory(parts[1], url.searchParams.get("reason") || "用户通过 Gateway 请求删除");
     sendJson(response, 200, { deleted: true });
     return;
   }
@@ -111,6 +116,18 @@ async function route(request, response, manager, staticRoot) {
     }
     if (request.method === "GET" && parts[2] === "events" && parts.length === 3) {
       await openEventStream(request, response, manager, id, eventCursor(url, request));
+      return;
+    }
+    if (request.method === "POST" && parts[2] === "memory-mutations" && parts[3] && parts.length === 5) {
+      const mutationId = parts[3];
+      const action = parts[4];
+      const body = await readJson(request);
+      let state;
+      if (action === "retry") state = await manager.retryMemoryMutation(id, mutationId);
+      else if (action === "discard") state = await manager.discardMemoryMutation(id, mutationId, body.reason);
+      else if (action === "resolve") state = await manager.resolveMemoryMutation(id, mutationId, body.memoryId || null);
+      else throw new GatewayError(404, "未知 Memory mutation 操作");
+      sendJson(response, 200, { session: state });
       return;
     }
     if (request.method === "POST" && parts[2] === "messages" && parts.length === 3) {

@@ -2,9 +2,13 @@ import { promises as fs } from "node:fs";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { assertMemoryInterface } from "../memory/interface.js";
+import { executeMemoryMutation } from "../memory/outbox.js";
 
-export function createToolRegistry({ workspace, bundledSkills, memoryStore, extraTools = [] }) {
+export function createToolRegistry({ workspace, bundledSkills, memory, memoryStore, extraTools = [] }) {
   const root = realpathSync(path.resolve(workspace));
+  const configuredMemory = memory || memoryStore?.memory || memoryStore || null;
+  const memoryAdapter = configuredMemory ? assertMemoryInterface(configuredMemory) : null;
   const skillRoots = [path.join(root, ".nexus", "skills"), bundledSkills];
   const tools = new Map();
   const define = (tool) => tools.set(tool.name, tool);
@@ -21,7 +25,7 @@ export function createToolRegistry({ workspace, bundledSkills, memoryStore, extr
     },
   });
 
-  if (memoryStore) {
+  if (memoryAdapter) {
     define({
       name: "memory_save",
       description: "保存一条跨会话长期记忆。属于持久化写入，每次要求审批。",
@@ -31,8 +35,27 @@ export function createToolRegistry({ workspace, bundledSkills, memoryStore, extr
         tags: { type: "array", items: { type: "string" } },
       }, ["content"]),
       execute: async ({ content, tags = [] }, context) => {
-        const memory = memoryStore.addMemory(content, { tags, sourceSession: context.state.id });
-        return `已保存长期记忆 ${memory.id}：${memory.content}`;
+        const provenance = {
+          origin: "tool",
+          sessionId: context.state.id,
+          sourceCursor: context.sourceCursor,
+          toolCallId: context.callId,
+          actor: context.state.memoryScope.agentId,
+        };
+        const record = await executeMemoryMutation({
+          memory: memoryAdapter,
+          dispatch: context.dispatch,
+          signal: context.signal,
+          mutation: {
+            id: `${context.state.id}:${context.callId}:memory.add`,
+            operation: "add",
+            reconcilePolicy: "automatic",
+            candidate: { content, tags, kind: "fact", confidence: 1 },
+            scope: context.state.memoryScope,
+            provenance,
+          },
+        });
+        return `已保存长期记忆 ${record.id}：${record.content}`;
       },
     });
     define({
@@ -40,14 +63,42 @@ export function createToolRegistry({ workspace, bundledSkills, memoryStore, extr
       description: "搜索跨会话长期记忆。只读，自动执行。",
       approval: "never",
       parameters: objectSchema({ query: { type: "string" } }),
-      execute: async ({ query = "" }) => formatMemories(memoryStore.searchMemories(query, 20)),
+      execute: async ({ query = "" }, context) => formatMemories(await memoryAdapter.search(query, {
+        scope: context.state.memoryScope,
+        signal: context.signal,
+      }, { limit: 20 })),
     });
     define({
       name: "memory_delete",
       description: "按 ID 删除长期记忆。属于持久化删除，每次要求审批。",
       approval: "always",
-      parameters: objectSchema({ id: { type: "string" } }, ["id"]),
-      execute: async ({ id }) => memoryStore.deleteMemory(id) ? `已删除长期记忆：${id}` : `未找到长期记忆：${id}`,
+      parameters: objectSchema({
+        id: { type: "string" },
+        reason: { type: "string", description: "删除原因" },
+      }, ["id"]),
+      execute: async ({ id, reason = "Agent 应用户要求删除" }, context) => {
+        const deleted = await executeMemoryMutation({
+          memory: memoryAdapter,
+          dispatch: context.dispatch,
+          signal: context.signal,
+          mutation: {
+            id: `${context.state.id}:${context.callId}:memory.delete`,
+            operation: "delete",
+            reconcilePolicy: "automatic",
+            memoryId: id,
+            reason,
+            scope: context.state.memoryScope,
+            provenance: {
+              origin: "tool",
+              sessionId: context.state.id,
+              sourceCursor: context.sourceCursor,
+              toolCallId: context.callId,
+              actor: context.state.memoryScope.agentId,
+            },
+          },
+        });
+        return deleted ? `已删除长期记忆：${id}` : `未找到长期记忆：${id}`;
+      },
     });
   }
 

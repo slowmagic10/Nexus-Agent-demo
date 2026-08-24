@@ -1,10 +1,11 @@
 // FOUNDATION: portable state machine for an executable Agent session.
 import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
+import { createMemoryScope } from "../memory/scope.js";
 
-export const SESSION_SCHEMA_VERSION = 3;
+export const SESSION_SCHEMA_VERSION = 6;
 
-export function createSession({ provider, workspace, id, createdAt }) {
+export function createSession({ provider, workspace, memoryScope, id, createdAt }) {
   const now = createdAt || new Date().toISOString();
   return {
     schemaVersion: SESSION_SCHEMA_VERSION,
@@ -14,10 +15,13 @@ export function createSession({ provider, workspace, id, createdAt }) {
     phase: "idle",
     provider,
     workspace,
+    memoryScope: createMemoryScope(memoryScope || { workspace }),
     messages: [],
     events: [],
     memory: [],
     contextMemory: [],
+    pendingMemoryMutations: [],
+    memoryMutationIssues: [],
     loadedSkills: [],
     pendingApproval: null,
     step: 0,
@@ -106,7 +110,87 @@ export function reduceSession(state, action) {
       break;
     case "MEMORY_CONTEXT_SET":
       next.contextMemory = action.memories;
-      emit("memory.context_loaded", { count: action.memories.length, query: action.query.slice(0, 120) });
+      emit("memory.context_loaded", {
+        count: action.memories.length,
+        query: action.query.slice(0, 120),
+        status: action.retrieval?.status || "ok",
+        memoryIds: action.memories.map((memory) => memory.id).filter(Boolean),
+        ...(action.retrieval?.error ? { error: action.retrieval.error } : {}),
+      });
+      break;
+    case "MEMORY_MUTATION_REQUESTED":
+      if (!next.pendingMemoryMutations.some((mutation) => mutation.id === action.mutation.id)) {
+        next.pendingMemoryMutations.push(redactSensitiveValue(action.mutation));
+      }
+      emit("memory.mutation_requested", {
+        mutationId: action.mutation.id,
+        operation: action.mutation.operation,
+        toolCallId: action.mutation.provenance?.toolCallId || null,
+        reconcilePolicy: action.mutation.reconcilePolicy || "automatic",
+      });
+      break;
+    case "MEMORY_MUTATION_APPLIED":
+      next.pendingMemoryMutations = next.pendingMemoryMutations.filter((mutation) => mutation.id !== action.mutationId);
+      next.memoryMutationIssues = next.memoryMutationIssues.filter((issue) => issue.mutation.id !== action.mutationId);
+      emit("memory.mutation_applied", {
+        mutationId: action.mutationId,
+        operation: action.operation,
+        memoryId: action.memoryId || null,
+      });
+      break;
+    case "MEMORY_MUTATION_FAILED":
+    case "MEMORY_MUTATION_OUTCOME_UNKNOWN":
+    case "MEMORY_MUTATION_MANUAL_REQUIRED": {
+      const previousIssue = next.memoryMutationIssues.find((issue) => issue.mutation.id === action.mutationId);
+      const mutation = next.pendingMemoryMutations.find((item) => item.id === action.mutationId)
+        || previousIssue?.mutation;
+      if (!mutation) throw new Error(`未找到 Memory mutation：${action.mutationId}`);
+      const status = action.type === "MEMORY_MUTATION_OUTCOME_UNKNOWN"
+        ? "outcome_unknown"
+        : action.type === "MEMORY_MUTATION_FAILED"
+          ? "failed"
+          : "manual_required";
+      const outcome = action.outcome || (status === "outcome_unknown"
+        ? "outcome_unknown"
+        : status === "manual_required"
+          ? "safe_to_retry"
+          : action.retryable === false
+            ? "non_retryable"
+            : "safe_to_retry");
+      const retryable = typeof action.retryable === "boolean" ? action.retryable : outcome === "safe_to_retry";
+      next.pendingMemoryMutations = next.pendingMemoryMutations.filter((item) => item.id !== action.mutationId);
+      next.memoryMutationIssues = next.memoryMutationIssues.filter((issue) => issue.mutation.id !== action.mutationId);
+      next.memoryMutationIssues.push({
+        mutation: redactSensitiveValue(mutation),
+        status,
+        error: action.error || null,
+        outcome,
+        retryable,
+        retryPolicy: retryable ? "manual" : "resolve_or_discard",
+        attempts: ["failed", "outcome_unknown"].includes(status)
+          ? (previousIssue?.attempts || 0) + 1
+          : (previousIssue?.attempts || 0),
+        at,
+      });
+      emit(`memory.mutation_${status}`, {
+        mutationId: action.mutationId,
+        operation: mutation.operation,
+        error: action.error || null,
+        outcome,
+        retryable,
+      });
+      break;
+    }
+    case "MEMORY_MUTATION_DISCARDED":
+      next.pendingMemoryMutations = next.pendingMemoryMutations.filter((mutation) => mutation.id !== action.mutationId);
+      next.memoryMutationIssues = next.memoryMutationIssues.filter((issue) => issue.mutation.id !== action.mutationId);
+      emit("memory.mutation_discarded", {
+        mutationId: action.mutationId,
+        reason: action.reason,
+      });
+      break;
+    case "MEMORY_RECONCILIATION_DEGRADED":
+      emit("memory.reconciliation_degraded", { error: action.error });
       break;
     case "SKILL_LOADED":
       if (!next.loadedSkills.some((skill) => skill.name === action.skill.name)) {
@@ -148,6 +232,8 @@ export function reduceSession(state, action) {
       break;
     case "RESUMED": {
       next.contextMemory ||= [];
+      next.pendingMemoryMutations ||= [];
+      next.memoryMutationIssues ||= [];
       next.metrics = {
         inputTokens: 0,
         outputTokens: 0,
@@ -174,12 +260,14 @@ export function reduceSession(state, action) {
       next.phase = "idle";
       next.provider = action.provider;
       next.workspace = action.workspace;
+      next.memoryScope = createMemoryScope({ ...next.memoryScope, workspace: action.workspace });
       next.pendingApproval = null;
       next.lastError = null;
       emit("session.resumed", {
         previousPhase,
         discardedApproval,
         reconciledToolCalls: unresolvedCalls.map((call) => call.name),
+        pendingMemoryMutations: next.pendingMemoryMutations.length,
       });
       break;
     }
@@ -193,11 +281,14 @@ export function reduceSession(state, action) {
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
   if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
-  if (state.schemaVersion === 2) {
+  if ([2, 3, 4, 5].includes(state.schemaVersion)) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
       lineage: state.lineage || null,
+      memoryScope: createMemoryScope(state.memoryScope || { workspace: state.workspace }),
+      pendingMemoryMutations: state.pendingMemoryMutations || [],
+      memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
     };
   }
   if (state.schemaVersion > SESSION_SCHEMA_VERSION) {
@@ -237,6 +328,9 @@ export function createSessionBranch(parentState, {
       parentCursor,
     }],
     contextMemory: [],
+    memoryScope: createMemoryScope({ ...parent.memoryScope, workspace }),
+    pendingMemoryMutations: [],
+    memoryMutationIssues: [],
     pendingApproval: null,
     step: 0,
     metrics: emptyMetrics(),
@@ -278,4 +372,21 @@ function emptyMetrics() {
     toolDurationMs: 0,
     lastTurnDurationMs: 0,
   };
+}
+
+function migrateMemoryMutationIssues(issues) {
+  return issues.map((issue) => {
+    const outcome = issue.outcome || (issue.status === "outcome_unknown"
+      ? "outcome_unknown"
+      : issue.status === "manual_required"
+        ? "safe_to_retry"
+        : issue.retryable === false
+          ? "non_retryable"
+          : "safe_to_retry");
+    return {
+      ...issue,
+      outcome,
+      retryPolicy: issue.retryable === false ? "resolve_or_discard" : (issue.retryPolicy || "manual"),
+    };
+  });
 }

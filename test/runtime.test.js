@@ -131,7 +131,77 @@ test("无限步骤模式允许单次任务执行超过默认八步", async () =>
   assert.equal(runtime.state.phase, "completed");
 });
 
-function createRuntime({ provider, state, maxInputTokens, maxSteps, tools } = {}) {
+test("长期记忆检索失败时降级为空并继续 Agent Loop", async () => {
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => ({ text: "仍然完成", toolCalls: [] }),
+    },
+    retrieveMemory: async () => {
+      throw new Error("semantic memory unavailable");
+    },
+  });
+
+  await runtime.runTurn("继续执行", async () => false);
+
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(runtime.state.messages.at(-1).content, "仍然完成");
+  const audit = runtime.state.events.find((event) => event.type === "memory.context_loaded");
+  assert.equal(audit.status, "degraded");
+  assert.equal(audit.count, 0);
+  assert.match(audit.error, /semantic memory unavailable/);
+});
+
+test("长期记忆检索超时后降级并继续模型请求", async () => {
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => ({ text: "超时后完成", toolCalls: [] }),
+    },
+    retrieveMemory: async (_query, { signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
+    memorySearchTimeoutMs: 5,
+  });
+
+  await runtime.runTurn("继续执行", async () => false);
+
+  assert.equal(runtime.state.phase, "completed");
+  const audit = runtime.state.events.find((event) => event.type === "memory.context_loaded");
+  assert.equal(audit.status, "degraded");
+  assert.match(audit.error, /timeout|timed out/i);
+});
+
+test("Memory reconcile 超时后留下审计并继续 turn", async () => {
+  let providerCalls = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        providerCalls += 1;
+        return { text: "reconcile 超时后完成", toolCalls: [] };
+      },
+    },
+    reconcile: async () => new Promise(() => {}),
+    memoryReconcileTimeoutMs: 5,
+  });
+
+  await runtime.runTurn("继续", async () => false);
+
+  assert.equal(providerCalls, 1);
+  assert.equal(runtime.state.phase, "completed");
+  const audit = runtime.state.events.find((event) => event.type === "memory.reconciliation_degraded");
+  assert.match(audit.error, /timeout|timed out/i);
+});
+
+function createRuntime({
+  provider,
+  state,
+  maxInputTokens,
+  maxSteps,
+  tools,
+  retrieveMemory,
+  reconcile,
+  memorySearchTimeoutMs,
+  memoryReconcileTimeoutMs,
+} = {}) {
   tools ||= { schemas: () => [], get: () => null };
   return new AgentRuntime({
     session: new AgentSession({
@@ -141,6 +211,10 @@ function createRuntime({ provider, state, maxInputTokens, maxSteps, tools } = {}
     provider: { name: "test", ...provider },
     tools,
     systemPrompt: () => "test",
+    retrieveMemory,
+    reconcile,
+    memorySearchTimeoutMs,
+    memoryReconcileTimeoutMs,
     maxInputTokens,
     maxSteps,
   });
