@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import { DemoProvider } from "./providers/demo.js";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 import { createToolRegistry } from "./tools/registry.js";
+import { loadWorkspacePolicy } from "./tools/authorization.js";
 import { loadWorkspaceContext, buildSystemPrompt } from "./workspace.js";
 import { SessionStore } from "./persistence/session-store.js";
 import { GatewaySessionManager } from "./gateway/session-manager.js";
@@ -48,6 +49,7 @@ const manager = new GatewaySessionManager({
   workspace,
   provider,
   tools,
+  workspacePolicy: await loadWorkspacePolicy(workspace),
   systemPrompt: buildSystemPrompt(context),
   store,
   memory: store.memory,

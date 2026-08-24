@@ -10,6 +10,7 @@ import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 import { DemoProvider } from "./providers/demo.js";
 import { createToolRegistry } from "./tools/registry.js";
 import { ToolHost } from "./tools/host.js";
+import { loadWorkspacePolicy } from "./tools/authorization.js";
 import { loadWorkspaceContext, buildSystemPrompt } from "./workspace.js";
 import { TerminalUI, helpText } from "./ui.js";
 import { SessionStore } from "./persistence/session-store.js";
@@ -85,7 +86,7 @@ const tools = createToolRegistry({
   extraTools: mcp.tools,
   memory: store.memory,
 });
-const toolHost = new ToolHost({ registry: tools });
+const toolHost = new ToolHost({ registry: tools, policy: await loadWorkspacePolicy(workspace) });
 const ui = new TerminalUI();
 let initialState = resumeTarget === "latest"
   ? store.latest(workspace)

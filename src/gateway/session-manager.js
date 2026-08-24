@@ -15,7 +15,7 @@ import {
 import { ToolHost } from "../tools/host.js";
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, tools, toolHost, systemPrompt, store, memory = store?.memory, memoryScope, maxSteps, memoryFlushPolicy }) {
+  constructor({ workspace, provider, tools, toolHost, workspacePolicy, systemPrompt, store, memory = store?.memory, memoryScope, maxSteps, memoryFlushPolicy }) {
     this.workspace = workspace;
     this.provider = provider;
     this.systemPrompt = systemPrompt;
@@ -27,7 +27,7 @@ export class GatewaySessionManager {
       memory: this.memory,
       extractCandidates: createModelMemoryExtractor(provider),
     });
-    this.toolHost = toolHost || new ToolHost({ registry: tools });
+    this.toolHost = toolHost || new ToolHost({ registry: tools, policy: workspacePolicy });
     this.maxSteps = maxSteps;
     this.sessions = new Map();
   }

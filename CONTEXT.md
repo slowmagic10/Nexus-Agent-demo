@@ -73,8 +73,20 @@ _Avoid_: Injecting unreviewed candidate into model context
 _Avoid_: AgentRuntime reading tool approval or execute implementation
 
 **Tool Authorization Decision**:
-Tool Host 在执行前根据 Tool Definition 产生的可审计决定，绑定 callId、argsHash、toolVersion、effects、idempotency、Adapter 和 risk。当前首版从 never/always 兼容字段得到 allowed/approval_required，未来由 Capability Scope 与 Workspace Policy 深化。
+Tool Host 在执行前根据 Capability Scope、Workspace Policy 和 Session Grant 产生的可审计决定，绑定 callId、argsHash、toolVersion、policyVersion、capabilityHash、resources、Adapter、risk 与命中规则。旧 never/always 字段不再决定权限。
 _Avoid_: Prompt-only permission, approval without args identity
+
+**Capability Scope**:
+Tool Definition 对副作用、risk、readOnly 与 typed resources 的声明边界。workspace_path 在 Adapter 启动前解析并校验；Capability 内容进入 capabilityHash 和 toolVersion。
+_Avoid_: Inferring permissions only from tool name or description
+
+**Workspace Policy**:
+工作区 `.nexus/tool-policy.json` 中的简单三态授权规则。显式 deny 优先，默认允许安全只读，写入/执行/网络要求 Approval 或 Grant，credential/R3 默认拒绝；每个决定必须给出 policyVersion、ruleId 和 reason。
+_Avoid_: Prompt-only policy, grant overriding deny
+
+**Session Grant**:
+绑定 sessionId、workspace、tool、capabilityHash、policyVersion 与资源范围的 durable 授权。Grant 可过期或撤销，不能跨 Session/workspace 使用；普通 Approval 只签发当前 callId/argsHash 的短期 Grant。
+_Avoid_: Global reusable approval, grant without policy identity
 
 **Tool Execution Unknown**:
 有副作用且非 safe 的工具在 timeout、cancel 或进程中断时无法证明是否生效的终态。它写入 durable audit，补全工具协议，并禁止自动重放。

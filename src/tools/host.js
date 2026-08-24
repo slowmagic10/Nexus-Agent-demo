@@ -1,12 +1,18 @@
 import { createHash } from "node:crypto";
 import { redactSensitiveText } from "../security/redact.js";
+import {
+  createSessionGrant,
+  issueSessionGrant,
+  normalizeCapability,
+  WorkspacePolicy,
+} from "./authorization.js";
 
 const APPROVAL_MODES = new Set(["never", "always"]);
 const IDEMPOTENCY_MODES = new Set(["safe", "keyed", "unknown"]);
 const EFFECTS = new Set(["read", "write", "execute", "network", "memory", "credential"]);
 
 export class ToolHost {
-  constructor({ registry, defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
+  constructor({ registry, policy = new WorkspacePolicy(), defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
     if (!registry || typeof registry.get !== "function" || typeof registry.schemas !== "function") {
       throw new Error("Tool Host 需要 Tool Registry");
     }
@@ -14,12 +20,18 @@ export class ToolHost {
       throw new Error("Tool Host defaultTimeoutMs 必须是正整数");
     }
     this.registry = registry;
+    this.policy = policy;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.maxResultChars = maxResultChars;
   }
 
   schemas() {
-    return this.registry.schemas();
+    return this.registry.schemas().filter((schema) => {
+      const name = schema.function?.name;
+      const tool = name ? this.registry.get(name) : null;
+      if (!tool) return false;
+      return this.policy.canExpose(normalizeDefinition(tool, this.defaultTimeoutMs));
+    });
   }
 
   async execute(call, { session, signal, requestApproval } = {}) {
@@ -64,7 +76,12 @@ export class ToolHost {
     }
 
     const toolVersion = definitionVersion(definition);
-    const risk = riskLevel(definition.effects);
+    const authorization = this.policy.authorize({
+      definition,
+      call,
+      state: session.state,
+      argsHash,
+    });
     await session.dispatch({
       type: "TOOL_AUTHORIZATION_DECIDED",
       call,
@@ -73,18 +90,60 @@ export class ToolHost {
       effects: definition.effects,
       idempotency: definition.idempotency,
       adapter: definition.adapter,
-      risk,
-      decision: definition.approval === "always" ? "approval_required" : "allowed",
+      ...authorization,
     });
+
+    if (authorization.decision === "deny") {
+      return await complete(session, call, {
+        ok: false,
+        status: "policy_denied",
+        result: `Workspace Policy 拒绝工具调用：${authorization.reason}`,
+        durationMs: 0,
+      });
+    }
 
     if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
 
-    if (definition.approval === "always") {
+    let executionGrantId = authorization.grantId;
+    if (authorization.decision === "approval_required") {
       if (typeof requestApproval !== "function") throw new Error(`工具 ${call.name} 需要 Approval callback`);
-      await session.dispatch({ type: "APPROVAL_REQUESTED", call, argsHash, toolVersion, risk });
+      await session.dispatch({
+        type: "APPROVAL_REQUESTED",
+        call,
+        argsHash,
+        toolVersion,
+        risk: authorization.risk,
+        policyVersion: authorization.policyVersion,
+        capabilityHash: authorization.capabilityHash,
+        resources: authorization.resources,
+        ruleId: authorization.ruleId,
+      });
       const approved = await requestApproval(call, definition.description, signal);
       if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
-      await session.dispatch({ type: "APPROVAL_DECIDED", call, approved, argsHash, toolVersion });
+      const currentTool = this.registry.get(call.name);
+      const currentDefinition = currentTool ? normalizeDefinition(currentTool, this.defaultTimeoutMs) : null;
+      const currentArgsHash = hashValue(call.arguments);
+      const currentAuthorization = currentDefinition ? this.policy.authorize({
+        definition: currentDefinition,
+        call,
+        state: session.state,
+        argsHash: currentArgsHash,
+      }) : null;
+      const stale = !currentDefinition
+        || currentArgsHash !== argsHash
+        || definitionVersion(currentDefinition) !== toolVersion
+        || currentAuthorization.policyVersion !== authorization.policyVersion
+        || currentAuthorization.capabilityHash !== authorization.capabilityHash
+        || hashValue(currentAuthorization.resources) !== hashValue(authorization.resources);
+      await session.dispatch({
+        type: "APPROVAL_DECIDED",
+        call,
+        approved,
+        argsHash,
+        toolVersion,
+        policyVersion: authorization.policyVersion,
+        capabilityHash: authorization.capabilityHash,
+      });
       if (!approved) {
         return await complete(session, call, {
           ok: false,
@@ -93,16 +152,15 @@ export class ToolHost {
           durationMs: 0,
         });
       }
-      const currentTool = this.registry.get(call.name);
-      const currentDefinition = currentTool ? normalizeDefinition(currentTool, this.defaultTimeoutMs) : null;
-      const currentArgsHash = hashValue(call.arguments);
-      if (!currentDefinition || currentArgsHash !== argsHash || definitionVersion(currentDefinition) !== toolVersion) {
+      if (stale) {
         await session.dispatch({
           type: "TOOL_APPROVAL_STALE",
           call,
           argsHash,
           currentArgsHash,
           toolVersion,
+          policyVersion: authorization.policyVersion,
+          currentPolicyVersion: currentAuthorization?.policyVersion || null,
         });
         return await complete(session, call, {
           ok: false,
@@ -111,6 +169,21 @@ export class ToolHost {
           durationMs: 0,
         });
       }
+      const issuedAt = new Date().toISOString();
+      const grant = createSessionGrant({
+        sessionId: session.id,
+        workspace: session.state.workspace,
+        tool: call.name,
+        capabilityHash: authorization.capabilityHash,
+        policyVersion: authorization.policyVersion,
+        resources: authorization.resources,
+        callId: call.id,
+        argsHash,
+        issuedAt,
+        expiresAt: new Date(new Date(issuedAt).getTime() + 5 * 60_000).toISOString(),
+      });
+      await issueSessionGrant(session, grant);
+      executionGrantId = grant.id;
     }
 
     if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
@@ -124,6 +197,9 @@ export class ToolHost {
       effects: definition.effects,
       idempotency: definition.idempotency,
       adapter: definition.adapter,
+      policyVersion: authorization.policyVersion,
+      capabilityHash: authorization.capabilityHash,
+      grantId: executionGrantId,
     });
     const started = performance.now();
     let implementationStarted = false;
@@ -222,13 +298,14 @@ function normalizeDefinition(tool, defaultTimeoutMs) {
   if (typeof tool.execute !== "function") throw new Error(`工具 ${tool.name} 缺少 execute implementation`);
   const approval = tool.approval || "always";
   if (!APPROVAL_MODES.has(approval)) throw new Error(`工具 ${tool.name} approval 无效`);
-  const effects = tool.effects?.length ? [...new Set(tool.effects)] : (approval === "always" ? ["write"] : ["read"]);
+  if (!Array.isArray(tool.effects) || !tool.effects.length) throw new Error(`工具 ${tool.name} 必须声明 effects`);
+  const effects = [...new Set(tool.effects)];
   if (effects.some((effect) => !EFFECTS.has(effect))) throw new Error(`工具 ${tool.name} effects 无效`);
   const idempotency = tool.idempotency || "unknown";
   if (!IDEMPOTENCY_MODES.has(idempotency)) throw new Error(`工具 ${tool.name} idempotency 无效`);
   const timeoutMs = tool.timeoutMs ?? defaultTimeoutMs;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error(`工具 ${tool.name} timeoutMs 无效`);
-  return {
+  const definition = {
     ...tool,
     adapter: tool.adapter || "native",
     parameters: tool.parameters || { type: "object" },
@@ -237,6 +314,8 @@ function normalizeDefinition(tool, defaultTimeoutMs) {
     idempotency,
     timeoutMs,
   };
+  definition.capability = normalizeCapability(definition);
+  return definition;
 }
 
 function definitionVersion(definition) {
@@ -245,8 +324,9 @@ function definitionVersion(definition) {
     parameters: definition.parameters,
     effects: definition.effects,
     idempotency: definition.idempotency,
-    approval: definition.approval,
     adapter: definition.adapter,
+    timeoutMs: definition.timeoutMs,
+    capability: definition.capability,
   });
 }
 
@@ -307,13 +387,6 @@ function matchesType(value, type) {
 function typeLabel(type) {
   if (Array.isArray(type)) return type.join(" 或 ");
   return ({ object: "对象", array: "数组", string: "字符串", number: "数字", integer: "整数", boolean: "布尔值", null: "null" })[type] || type;
-}
-
-function riskLevel(effects) {
-  if (effects.includes("credential")) return "R3";
-  if (effects.some((effect) => ["execute", "network"].includes(effect))) return "R2";
-  if (effects.some((effect) => ["write", "memory"].includes(effect))) return "R1";
-  return "R0";
 }
 
 function outcomeMayBeUnknown(definition) {

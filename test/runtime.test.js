@@ -109,6 +109,8 @@ test("无限步骤模式允许单次任务执行超过默认八步", async () =>
     schemas: () => [],
     get: () => ({
       approval: "never",
+      effects: ["read"],
+      idempotency: "safe",
       execute: async () => "继续",
     }),
   };

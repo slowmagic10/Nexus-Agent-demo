@@ -102,7 +102,7 @@ export class AgentRuntime {
         throwIfAborted(abortController.signal);
         const prepared = this.session.prepareModelRequest({
           systemPrompt: this.systemPrompt,
-          tools: this.toolHost.schemas(),
+          tools: this.toolHost.schemas({ session: this.session }),
           maxInputTokens: this.maxInputTokens,
         });
         const { contextPlan, ...request } = prepared;

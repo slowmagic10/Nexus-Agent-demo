@@ -19,6 +19,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
+    capability: workspacePathCapability("path", "read", "R0", true, "."),
     parameters: objectSchema({ path: { type: "string", description: "相对工作区路径" } }),
     execute: async ({ path: requested = "." }) => {
       const target = safePath(root, requested);
@@ -30,10 +31,11 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
   if (memoryAdapter) {
     define({
       name: "memory_save",
-      description: "保存一条跨会话长期记忆。属于持久化写入，每次要求审批。",
+      description: "保存一条跨会话长期记忆。属于持久化写入，按 Workspace Policy 与 Session Grant 授权。",
       approval: "always",
       effects: ["memory", "write"],
       idempotency: "keyed",
+      capability: scopedCapability("memory_scope", "write", "R1", false),
       parameters: objectSchema({
         content: { type: "string" },
         tags: { type: "array", items: { type: "string" } },
@@ -68,6 +70,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
       approval: "never",
       effects: ["read", "memory"],
       idempotency: "safe",
+      capability: scopedCapability("memory_scope", "read", "R0", true),
       parameters: objectSchema({ query: { type: "string" } }),
       execute: async ({ query = "" }, context) => formatMemories(await memoryAdapter.search(query, {
         scope: context.state.memoryScope,
@@ -76,10 +79,11 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     });
     define({
       name: "memory_delete",
-      description: "按 ID 删除长期记忆。属于持久化删除，每次要求审批。",
+      description: "按 ID 删除长期记忆。属于持久化删除，按 Workspace Policy 与 Session Grant 授权。",
       approval: "always",
       effects: ["memory", "write"],
       idempotency: "keyed",
+      capability: scopedCapability("memory_scope", "write", "R1", false),
       parameters: objectSchema({
         id: { type: "string" },
         reason: { type: "string", description: "删除原因" },
@@ -116,6 +120,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
+    capability: workspacePathCapability("path", "read", "R0", true),
     parameters: objectSchema({ path: { type: "string" } }, ["path"]),
     execute: async ({ path: requested }) => truncate(await fs.readFile(safePath(root, requested), "utf8"), 12_000),
   });
@@ -126,6 +131,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
+    capability: workspacePathCapability("path", "read", "R0", true, "."),
     parameters: objectSchema({ query: { type: "string" }, path: { type: "string" } }, ["query"]),
     execute: async ({ query, path: requested = "." }) => {
       const base = safePath(root, requested);
@@ -147,10 +153,11 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
 
   define({
     name: "write_file",
-    description: "写入工作区文件。属于有副作用操作，每次都要求人工审批。",
+    description: "写入工作区文件。属于有副作用操作，未获 Session Grant 时要求审批。",
     approval: "always",
     effects: ["write"],
     idempotency: "unknown",
+    capability: workspacePathCapability("path", "write", "R1", false),
     parameters: objectSchema({ path: { type: "string" }, content: { type: "string" } }, ["path", "content"]),
     execute: async ({ path: requested, content }) => {
       const target = safePath(root, requested);
@@ -162,11 +169,12 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
 
   define({
     name: "run_shell",
-    description: "在工作区执行 Shell 命令。高风险，每次都要求人工审批，危险命令会被策略层拒绝。",
+    description: "在工作区执行 Shell 命令。高风险，必须通过 Workspace Policy 与 Session Grant/审批，危险命令会被策略层拒绝。",
     approval: "always",
     effects: ["execute"],
     idempotency: "unknown",
     timeoutMs: 15_000,
+    capability: scopedCapability("workspace", "execute", "R2", false),
     parameters: objectSchema({ command: { type: "string" } }, ["command"]),
     execute: async ({ command }, context) => runShell(root, command, context.signal),
   });
@@ -177,6 +185,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["memory", "write"],
     idempotency: "unknown",
+    capability: scopedCapability("session", "write", "R1", false),
     parameters: objectSchema({ content: { type: "string" } }, ["content"]),
     execute: async ({ content }, context) => {
       await context.dispatch({ type: "MEMORY_ADDED", content });
@@ -190,6 +199,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["read", "memory"],
     idempotency: "safe",
+    capability: scopedCapability("session", "read", "R0", true),
     parameters: objectSchema({ query: { type: "string" } }),
     execute: async ({ query = "" }, context) => {
       const matches = context.state.memory.filter((item) => item.content.toLowerCase().includes(query.toLowerCase()));
@@ -203,6 +213,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
+    capability: scopedCapability("external", "read", "R0", true, "skill_catalog"),
     parameters: objectSchema({}),
     execute: async () => (await discoverSkills(skillRoots)).map((skill) => `${skill.name}\t${skill.description}`).join("\n") || "没有发现 Skill。",
   });
@@ -213,6 +224,7 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     approval: "never",
     effects: ["read", "memory"],
     idempotency: "safe",
+    capability: scopedCapability("session", "read", "R0", true),
     parameters: objectSchema({ name: { type: "string" } }, ["name"]),
     execute: async ({ name }, context) => {
       const skill = (await discoverSkills(skillRoots)).find((item) => item.name === name);
@@ -239,6 +251,27 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
 
 function objectSchema(properties, required = []) {
   return { type: "object", properties, required, additionalProperties: false };
+}
+
+function workspacePathCapability(argument, access, risk, readOnly, defaultValue) {
+  return {
+    risk,
+    readOnly,
+    resources: [{
+      kind: "workspace_path",
+      argument,
+      access,
+      ...(defaultValue !== undefined ? { default: defaultValue } : {}),
+    }],
+  };
+}
+
+function scopedCapability(kind, access, risk, readOnly, value) {
+  return {
+    risk,
+    readOnly,
+    resources: [{ kind, access, ...(value ? { value } : {}) }],
+  };
 }
 
 function safePath(root, requested) {

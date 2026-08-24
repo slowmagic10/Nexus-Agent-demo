@@ -18,11 +18,12 @@ export async function connectMcpTools(configs) {
         names.add(exposedName);
         tools.push({
           name: exposedName,
-          description: `[MCP: ${initialized.serverInfo.name}] ${tool.description || tool.title || tool.name}。外部工具，每次调用都需要审批。`,
+          description: `[MCP: ${initialized.serverInfo.name}] ${tool.description || tool.title || tool.name}。外部工具，按 Workspace Policy 与 Session Grant 授权。`,
           approval: "always",
           effects: ["network"],
           idempotency: "unknown",
           adapter: "mcp",
+          capability: mcpCapability(config.name, false),
           parameters: tool.inputSchema,
           execute: async (args, context) => formatToolResult(await client.callTool(tool.name, args, context.signal)),
         });
@@ -30,11 +31,12 @@ export async function connectMcpTools(configs) {
       if (initialized.capabilities?.resources) {
         addTool(tools, names, {
           name: exposeName(config.name, "resources_list"),
-          description: `[MCP: ${initialized.serverInfo.name}] 列出服务器公开的 Resources 与 Resource Templates。外部读取，每次需要审批。`,
+          description: `[MCP: ${initialized.serverInfo.name}] 列出服务器公开的 Resources 与 Resource Templates。外部网络读取，未获 Session Grant 时需要审批。`,
           approval: "always",
           effects: ["read", "network"],
           idempotency: "safe",
           adapter: "mcp",
+          capability: mcpCapability(config.name, true),
           parameters: objectSchema({}),
           execute: async () => JSON.stringify({
             resources: await client.listResources(),
@@ -43,11 +45,12 @@ export async function connectMcpTools(configs) {
         });
         addTool(tools, names, {
           name: exposeName(config.name, "resource_read"),
-          description: `[MCP: ${initialized.serverInfo.name}] 按 URI 读取 Resource。外部读取，每次需要审批。`,
+          description: `[MCP: ${initialized.serverInfo.name}] 按 URI 读取 Resource。外部网络读取，未获 Session Grant 时需要审批。`,
           approval: "always",
           effects: ["read", "network"],
           idempotency: "safe",
           adapter: "mcp",
+          capability: mcpCapability(config.name, true),
           parameters: objectSchema({ uri: { type: "string" } }, ["uri"]),
           execute: async ({ uri }, context) => formatResourceResult(await client.readResource(uri, context.signal)),
         });
@@ -55,21 +58,23 @@ export async function connectMcpTools(configs) {
       if (initialized.capabilities?.prompts) {
         addTool(tools, names, {
           name: exposeName(config.name, "prompts_list"),
-          description: `[MCP: ${initialized.serverInfo.name}] 列出服务器公开的 Prompts。外部读取，每次需要审批。`,
+          description: `[MCP: ${initialized.serverInfo.name}] 列出服务器公开的 Prompts。外部网络读取，未获 Session Grant 时需要审批。`,
           approval: "always",
           effects: ["read", "network"],
           idempotency: "safe",
           adapter: "mcp",
+          capability: mcpCapability(config.name, true),
           parameters: objectSchema({}),
           execute: async () => JSON.stringify(await client.listPrompts(), null, 2),
         });
         addTool(tools, names, {
           name: exposeName(config.name, "prompt_get"),
-          description: `[MCP: ${initialized.serverInfo.name}] 获取一个 Prompt 及其消息。外部读取，每次需要审批。`,
+          description: `[MCP: ${initialized.serverInfo.name}] 获取一个 Prompt 及其消息。外部网络读取，未获 Session Grant 时需要审批。`,
           approval: "always",
           effects: ["read", "network"],
           idempotency: "safe",
           adapter: "mcp",
+          capability: mcpCapability(config.name, true),
           parameters: objectSchema({
             name: { type: "string" },
             arguments: { type: "object", additionalProperties: { type: "string" } },
@@ -111,6 +116,14 @@ function addTool(tools, names, tool) {
 
 function objectSchema(properties, required = []) {
   return { type: "object", properties, required, additionalProperties: false };
+}
+
+function mcpCapability(server, readOnly) {
+  return {
+    risk: "R2",
+    readOnly,
+    resources: [{ kind: "mcp_server", value: server, access: readOnly ? "read" : "write" }],
+  };
 }
 
 function formatToolResult(result) {

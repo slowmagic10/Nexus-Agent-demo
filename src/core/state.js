@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createMemoryScope } from "../memory/scope.js";
 
-export const SESSION_SCHEMA_VERSION = 6;
+export const SESSION_SCHEMA_VERSION = 7;
 
 export function createSession({ provider, workspace, memoryScope, id, createdAt }) {
   const now = createdAt || new Date().toISOString();
@@ -23,6 +23,7 @@ export function createSession({ provider, workspace, memoryScope, id, createdAt 
     pendingMemoryMutations: [],
     memoryMutationIssues: [],
     loadedSkills: [],
+    toolGrants: [],
     pendingApproval: null,
     step: 0,
     metrics: {
@@ -114,6 +115,14 @@ export function reduceSession(state, action) {
         adapter: action.adapter,
         risk: action.risk,
         decision: action.decision,
+        policyVersion: action.policyVersion,
+        ruleId: action.ruleId,
+        reason: action.reason,
+        capabilityHash: action.capabilityHash,
+        readOnly: action.readOnly,
+        resources: action.resources || [],
+        grantId: action.grantId || null,
+        baseDecision: action.baseDecision || null,
       });
       break;
     case "TOOL_EXECUTION_STARTED":
@@ -125,6 +134,9 @@ export function reduceSession(state, action) {
         effects: action.effects,
         idempotency: action.idempotency,
         adapter: action.adapter,
+        policyVersion: action.policyVersion || null,
+        capabilityHash: action.capabilityHash || null,
+        grantId: action.grantId || null,
       });
       break;
     case "TOOL_APPROVAL_STALE":
@@ -134,6 +146,8 @@ export function reduceSession(state, action) {
         argsHash: action.argsHash,
         currentArgsHash: action.currentArgsHash,
         toolVersion: action.toolVersion,
+        policyVersion: action.policyVersion || null,
+        currentPolicyVersion: action.currentPolicyVersion || null,
       });
       break;
     case "TOOL_EXECUTION_UNKNOWN":
@@ -155,6 +169,10 @@ export function reduceSession(state, action) {
         argsHash: action.argsHash || null,
         toolVersion: action.toolVersion || null,
         risk: action.risk || null,
+        policyVersion: action.policyVersion || null,
+        capabilityHash: action.capabilityHash || null,
+        resources: action.resources || [],
+        ruleId: action.ruleId || null,
       };
       emit("approval.requested", {
         callId: action.call.id,
@@ -163,6 +181,10 @@ export function reduceSession(state, action) {
         argsHash: action.argsHash || null,
         toolVersion: action.toolVersion || null,
         risk: action.risk || null,
+        policyVersion: action.policyVersion || null,
+        capabilityHash: action.capabilityHash || null,
+        resources: action.resources || [],
+        ruleId: action.ruleId || null,
       });
       break;
     case "APPROVAL_DECIDED":
@@ -174,8 +196,30 @@ export function reduceSession(state, action) {
         tool: action.call.name,
         argsHash: action.argsHash || null,
         toolVersion: action.toolVersion || null,
+        policyVersion: action.policyVersion || null,
+        capabilityHash: action.capabilityHash || null,
       });
       break;
+    case "TOOL_GRANT_ISSUED":
+      next.toolGrants = (next.toolGrants || []).filter((grant) => grant.id !== action.grant.id);
+      next.toolGrants.push(redactSensitiveValue(action.grant));
+      emit("tool.grant_issued", {
+        grantId: action.grant.id,
+        tool: action.grant.tool,
+        capabilityHash: action.grant.capabilityHash,
+        policyVersion: action.grant.policyVersion,
+        resources: action.grant.resources,
+        expiresAt: action.grant.expiresAt,
+        callId: action.grant.callId || null,
+      });
+      break;
+    case "TOOL_GRANT_REVOKED": {
+      const grant = (next.toolGrants || []).find((candidate) => candidate.id === action.grantId);
+      if (!grant) throw new Error(`未找到 Session Grant：${action.grantId}`);
+      grant.revokedAt = at;
+      emit("tool.grant_revoked", { grantId: grant.id, tool: grant.tool, reason: action.reason || null });
+      break;
+    }
     case "TOOL_RESULT":
       next.messages.push({ role: "tool", tool_call_id: action.call.id, content: action.result });
       next.phase = "thinking";
@@ -349,6 +393,7 @@ export function reduceSession(state, action) {
       next.contextMemory ||= [];
       next.pendingMemoryMutations ||= [];
       next.memoryMutationIssues ||= [];
+      next.toolGrants ||= [];
       next.metrics = {
         inputTokens: 0,
         outputTokens: 0,
@@ -403,7 +448,7 @@ export function reduceSession(state, action) {
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
   if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
-  if ([2, 3, 4, 5].includes(state.schemaVersion)) {
+  if ([2, 3, 4, 5, 6].includes(state.schemaVersion)) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
@@ -411,6 +456,7 @@ export function migrateSessionState(state) {
       memoryScope: createMemoryScope(state.memoryScope || { workspace: state.workspace }),
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
+      toolGrants: state.toolGrants || [],
     };
   }
   if (state.schemaVersion > SESSION_SCHEMA_VERSION) {
@@ -453,6 +499,7 @@ export function createSessionBranch(parentState, {
     memoryScope: createMemoryScope({ ...parent.memoryScope, workspace }),
     pendingMemoryMutations: [],
     memoryMutationIssues: [],
+    toolGrants: [],
     pendingApproval: null,
     step: 0,
     metrics: emptyMetrics(),

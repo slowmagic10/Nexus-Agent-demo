@@ -187,8 +187,9 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 6);
+    assert.equal(restored.schemaVersion, 7);
     assert.equal(restored.lineage, null);
+    assert.deepEqual(restored.toolGrants, []);
   } finally {
     fixture.close();
   }
