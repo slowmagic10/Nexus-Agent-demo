@@ -17,6 +17,7 @@ const elements = {
   cancel: $("#cancel-run"),
   provider: $("#composer-provider"),
   memoryList: $("#memory-list"),
+  candidateList: $("#candidate-list"),
   inspector: $("#inspector"),
   backdrop: $("#drawer-backdrop"),
   debugToggle: $("#debug-toggle"),
@@ -47,7 +48,7 @@ document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => selectTab(tab.dataset.tab));
 });
 
-await Promise.allSettled([checkHealth(), loadSessions(), loadMemories()]);
+await Promise.allSettled([checkHealth(), loadSessions(), loadMemories(), loadCandidates()]);
 
 function savedTheme() {
   try {
@@ -148,6 +149,9 @@ async function handleSessionEvent(message) {
   }
   state.cursor = event.cursor;
   renderSession(state.session);
+  if (["MEMORY_CANDIDATE_CREATED", "MEMORY_CANDIDATE_APPROVED", "MEMORY_CANDIDATE_REJECTED"].includes(event.type)) {
+    await Promise.allSettled([loadCandidates(), loadMemories()]);
+  }
 }
 
 function renderSession(session) {
@@ -429,6 +433,56 @@ async function loadMemories() {
   }));
 }
 
+async function loadCandidates() {
+  const { candidates } = await api("/memory-candidates");
+  if (!candidates.length) {
+    const empty = document.createElement("div");
+    empty.className = "candidate-empty";
+    empty.textContent = "暂无待确认候选。";
+    elements.candidateList.replaceChildren(empty);
+    return;
+  }
+  elements.candidateList.replaceChildren(...candidates.map((candidate) => {
+    const box = document.createElement("div");
+    box.className = "memory candidate";
+    const text = document.createElement("p");
+    text.textContent = candidate.content;
+    const meta = document.createElement("span");
+    meta.className = "candidate-meta";
+    meta.textContent = `${candidate.kind} · 置信度 ${Math.round((candidate.confidence ?? 0) * 100)}%`;
+    const actions = document.createElement("div");
+    actions.className = "candidate-actions";
+    const approve = document.createElement("button");
+    approve.className = "candidate-approve";
+    approve.textContent = "保留";
+    const reject = document.createElement("button");
+    reject.textContent = "忽略";
+    const decideCandidate = async (action) => {
+      if (!state.sessionId) {
+        toast("请先选择一个任务再处理候选记忆");
+        return;
+      }
+      approve.disabled = true;
+      reject.disabled = true;
+      try {
+        await api(`/sessions/${encodeURIComponent(state.sessionId)}/memory-candidates/${encodeURIComponent(candidate.id)}/${action}`, {
+          method: "POST",
+          body: action === "reject" ? { reason: "用户在 Web UI 中忽略候选" } : {},
+        });
+        await Promise.all([loadCandidates(), loadMemories()]);
+      } catch {
+        approve.disabled = false;
+        reject.disabled = false;
+      }
+    };
+    approve.addEventListener("click", () => decideCandidate("approve"));
+    reject.addEventListener("click", () => decideCandidate("reject"));
+    actions.append(approve, reject);
+    box.append(text, meta, actions);
+    return box;
+  }));
+}
+
 async function addMemory(event) {
   event.preventDefault();
   const input = $("#memory-input");
@@ -672,11 +726,22 @@ function eventLabel(type) {
     "model.context_compacted": "压缩上下文",
     "memory.context_loaded": "加载相关记忆",
     "memory.added": "保存会话记忆",
+    "memory.flush_requested": "提取记忆候选",
+    "memory.flush_completed": "候选提取完成",
+    "memory.flush_degraded": "候选提取降级",
+    "memory.candidate_created": "创建记忆候选",
+    "memory.candidate_approved": "保留记忆候选",
+    "memory.candidate_rejected": "忽略记忆候选",
     "tool.requested": "请求工具",
+    "tool.validation_failed": "工具参数无效",
+    "tool.authorization_decided": "工具策略决策",
+    "tool.execution_started": "开始执行工具",
+    "tool.execution_unknown": "工具结果未知",
     "tool.completed": "工具完成",
     "approval.requested": "等待审批",
     "approval.granted": "审批通过",
     "approval.denied": "审批拒绝",
+    "approval.stale": "审批已失效",
     "session.turn_completed": "任务完成",
     "session.failed": "任务失败",
     "session.cancelled": "任务取消",

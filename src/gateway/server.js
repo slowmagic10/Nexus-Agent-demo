@@ -68,6 +68,11 @@ async function route(request, response, manager, staticRoot) {
     return;
   }
 
+  if (request.method === "GET" && url.pathname === "/memory-candidates") {
+    sendJson(response, 200, { candidates: await manager.listMemoryCandidates() });
+    return;
+  }
+
   if (request.method === "POST" && url.pathname === "/memories") {
     const body = await readJson(request);
     sendJson(response, 201, { memory: await manager.addMemory(body.content, body.tags || []) });
@@ -128,6 +133,20 @@ async function route(request, response, manager, staticRoot) {
       else if (action === "resolve") state = await manager.resolveMemoryMutation(id, mutationId, body.memoryId || null);
       else throw new GatewayError(404, "未知 Memory mutation 操作");
       sendJson(response, 200, { session: state });
+      return;
+    }
+    if (request.method === "POST" && parts[2] === "memory-candidates" && parts[3] && parts.length === 5) {
+      const memoryId = parts[3];
+      const action = parts[4];
+      const body = await readJson(request);
+      if (action === "approve") {
+        sendJson(response, 200, { memory: await manager.approveMemoryCandidate(id, memoryId) });
+      } else if (action === "reject") {
+        await manager.rejectMemoryCandidate(id, memoryId, body.reason || "用户拒绝候选记忆");
+        sendJson(response, 200, { rejected: true });
+      } else {
+        throw new GatewayError(404, "未知候选记忆操作");
+      }
       return;
     }
     if (request.method === "POST" && parts[2] === "messages" && parts.length === 3) {

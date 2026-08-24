@@ -10,6 +10,7 @@ export class OpenAICompatibleProvider {
   }
 
   async complete({ systemPrompt, messages, tools, signal }) {
+    const hasTools = Array.isArray(tools) && tools.length > 0;
     const response = await fetch(`${this.baseUrl}/chat/completions`, {
       method: "POST",
       headers: {
@@ -19,8 +20,7 @@ export class OpenAICompatibleProvider {
       body: JSON.stringify({
         model: this.model,
         messages: [{ role: "system", content: systemPrompt }, ...messages],
-        tools,
-        tool_choice: "auto",
+        ...(hasTools ? { tools, tool_choice: "auto" } : {}),
       }),
       signal,
     });

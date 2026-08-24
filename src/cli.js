@@ -9,6 +9,7 @@ import { AgentSession } from "./core/session.js";
 import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
 import { DemoProvider } from "./providers/demo.js";
 import { createToolRegistry } from "./tools/registry.js";
+import { ToolHost } from "./tools/host.js";
 import { loadWorkspaceContext, buildSystemPrompt } from "./workspace.js";
 import { TerminalUI, helpText } from "./ui.js";
 import { SessionStore } from "./persistence/session-store.js";
@@ -17,6 +18,7 @@ import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { readRuntimeOptions } from "./runtime-options.js";
 import { loadLocalEnvironment } from "./local-environment.js";
 import { createLocalMemoryScope } from "./memory/scope.js";
+import { createModelMemoryExtractor, MemoryFlushPolicy } from "./memory/flush-policy.js";
 import {
   discardMemoryMutation,
   reconcileMemoryOutbox,
@@ -83,6 +85,7 @@ const tools = createToolRegistry({
   extraTools: mcp.tools,
   memory: store.memory,
 });
+const toolHost = new ToolHost({ registry: tools });
 const ui = new TerminalUI();
 let initialState = resumeTarget === "latest"
   ? store.latest(workspace)
@@ -101,6 +104,10 @@ if (resumeTarget && !initialState) {
 const resumed = Boolean(initialState);
 initialState ||= createSession({ provider: provider.name, workspace, memoryScope });
 const session = new AgentSession({ state: initialState, reducer: reduceSession, journal: store });
+const memoryFlushPolicy = new MemoryFlushPolicy({
+  memory: store.memory,
+  extractCandidates: createModelMemoryExtractor(provider),
+});
 session.subscribe((state) => ui.render(state));
 if (resumed) {
   await reconcileMemoryOutbox({ session, memory: store.memory });
@@ -109,13 +116,14 @@ if (resumed) {
 const runtime = new AgentRuntime({
   session,
   provider,
-  tools,
+  toolHost,
   systemPrompt: buildSystemPrompt(context),
   retrieveMemory: (query, { signal } = {}) => store.memory.search(query, {
     scope: session.state.memoryScope,
     signal,
   }, { limit: 5 }),
   reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: store.memory, signal }),
+  flushMemory: (input) => memoryFlushPolicy.flush(input),
   maxSteps: runtimeOptions.maxSteps,
 });
 

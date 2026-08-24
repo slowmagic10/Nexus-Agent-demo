@@ -271,11 +271,6 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     return true;
   }
 
-  async flush(_input, accessInput) {
-    normalizeMemoryAccess(accessInput, this.defaultScope);
-    return [];
-  }
-
   async get(id, accessInput, { includeInactive = false } = {}) {
     const access = normalizeMemoryAccess(accessInput, this.defaultScope);
     return this.#getRecord(id, access.scope, { includeInactive });

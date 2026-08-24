@@ -217,6 +217,42 @@ test("Gateway 暴露 Memory mutation retry、discard 与 resolve API", async (t)
   )));
 });
 
+test("Gateway 可列出、批准和拒绝候选记忆", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-candidate-test-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: { name: "candidate-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const state = await manager.create();
+  const access = {
+    scope: state.memoryScope,
+    provenance: { origin: "auto_extract", sessionId: state.id, sourceCursor: 1, model: "candidate-provider" },
+  };
+  const approve = await store.memory.add({ content: "用户偏好精简界面", status: "candidate" }, access);
+  const reject = await store.memory.add({ content: "可能不准确的事实", status: "candidate" }, access);
+
+  assert.deepEqual((await manager.listMemoryCandidates()).map((item) => item.id).sort(), [approve.id, reject.id].sort());
+  await manager.approveMemoryCandidate(state.id, approve.id);
+  await manager.rejectMemoryCandidate(state.id, reject.id, "内容不准确");
+
+  assert.equal((await manager.listMemories("精简界面"))[0].status, "active");
+  assert.deepEqual(await manager.listMemoryCandidates(), []);
+  assert.equal((await manager.verifyMemory(reject.id)).record.status, "deleted");
+  const finalState = await manager.get(state.id);
+  assert.ok(finalState.events.some((event) => event.type === "memory.candidate_approved"));
+  assert.ok(finalState.events.some((event) => event.type === "memory.candidate_rejected"));
+});
+
 async function waitFor(predicate) {
   for (let index = 0; index < 50; index += 1) {
     if (predicate()) return;

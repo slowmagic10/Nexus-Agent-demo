@@ -85,24 +85,109 @@ export function reduceSession(state, action) {
     case "TOOL_REQUESTED":
       next.phase = "executing";
       next.metrics.toolCalls += 1;
-      emit("tool.requested", { tool: action.call.name, args: redactSensitiveValue(action.call.arguments) });
+      emit("tool.requested", {
+        callId: action.call.id,
+        tool: action.call.name,
+        args: redactSensitiveValue(action.call.arguments),
+        argsHash: action.argsHash || null,
+        effects: action.effects || [],
+        idempotency: action.idempotency || "unknown",
+        adapter: action.adapter || "unknown",
+      });
+      break;
+    case "TOOL_VALIDATION_FAILED":
+      emit("tool.validation_failed", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash,
+        error: action.error,
+      });
+      break;
+    case "TOOL_AUTHORIZATION_DECIDED":
+      emit("tool.authorization_decided", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash,
+        toolVersion: action.toolVersion,
+        effects: action.effects,
+        idempotency: action.idempotency,
+        adapter: action.adapter,
+        risk: action.risk,
+        decision: action.decision,
+      });
+      break;
+    case "TOOL_EXECUTION_STARTED":
+      emit("tool.execution_started", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash,
+        toolVersion: action.toolVersion,
+        effects: action.effects,
+        idempotency: action.idempotency,
+        adapter: action.adapter,
+      });
+      break;
+    case "TOOL_APPROVAL_STALE":
+      emit("approval.stale", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash,
+        currentArgsHash: action.currentArgsHash,
+        toolVersion: action.toolVersion,
+      });
+      break;
+    case "TOOL_EXECUTION_UNKNOWN":
+      emit("tool.execution_unknown", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash,
+        effects: action.effects,
+        idempotency: action.idempotency,
+        adapter: action.adapter,
+        reason: action.reason,
+      });
       break;
     case "APPROVAL_REQUESTED":
       next.phase = "awaiting_approval";
-      next.pendingApproval = { ...action.call, arguments: redactSensitiveValue(action.call.arguments) };
-      emit("approval.requested", { tool: action.call.name, args: redactSensitiveValue(action.call.arguments) });
+      next.pendingApproval = {
+        ...action.call,
+        arguments: redactSensitiveValue(action.call.arguments),
+        argsHash: action.argsHash || null,
+        toolVersion: action.toolVersion || null,
+        risk: action.risk || null,
+      };
+      emit("approval.requested", {
+        callId: action.call.id,
+        tool: action.call.name,
+        args: redactSensitiveValue(action.call.arguments),
+        argsHash: action.argsHash || null,
+        toolVersion: action.toolVersion || null,
+        risk: action.risk || null,
+      });
       break;
     case "APPROVAL_DECIDED":
       next.metrics.approvals += 1;
       next.pendingApproval = null;
       next.phase = action.approved ? "executing" : "thinking";
-      emit(action.approved ? "approval.granted" : "approval.denied", { tool: action.call.name });
+      emit(action.approved ? "approval.granted" : "approval.denied", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash || null,
+        toolVersion: action.toolVersion || null,
+      });
       break;
     case "TOOL_RESULT":
       next.messages.push({ role: "tool", tool_call_id: action.call.id, content: action.result });
       next.phase = "thinking";
       next.metrics.toolDurationMs += action.durationMs || 0;
-      emit("tool.completed", { tool: action.call.name, ok: action.ok, durationMs: action.durationMs || 0, preview: action.result.slice(0, 160) });
+      emit("tool.completed", {
+        callId: action.call.id,
+        tool: action.call.name,
+        ok: action.ok,
+        status: action.status || (action.ok ? "completed" : "failed"),
+        durationMs: action.durationMs || 0,
+        preview: action.result.slice(0, 160),
+      });
       break;
     case "MEMORY_ADDED":
       next.memory.push({ content: action.content, at });
@@ -117,6 +202,36 @@ export function reduceSession(state, action) {
         memoryIds: action.memories.map((memory) => memory.id).filter(Boolean),
         ...(action.retrieval?.error ? { error: action.retrieval.error } : {}),
       });
+      break;
+    case "MEMORY_FLUSH_REQUESTED":
+      emit("memory.flush_requested", { sourceCursor: action.sourceCursor });
+      break;
+    case "MEMORY_FLUSH_COMPLETED":
+      emit("memory.flush_completed", {
+        sourceCursor: action.sourceCursor,
+        extracted: action.extracted,
+        created: action.created,
+        skipped: action.skipped,
+      });
+      break;
+    case "MEMORY_FLUSH_DEGRADED":
+      emit("memory.flush_degraded", {
+        sourceCursor: action.sourceCursor || null,
+        error: action.error,
+      });
+      break;
+    case "MEMORY_CANDIDATE_CREATED":
+      emit("memory.candidate_created", {
+        memoryId: action.memoryId,
+        sourceCursor: action.sourceCursor,
+        preview: action.preview,
+      });
+      break;
+    case "MEMORY_CANDIDATE_APPROVED":
+      emit("memory.candidate_approved", { memoryId: action.memoryId });
+      break;
+    case "MEMORY_CANDIDATE_REJECTED":
+      emit("memory.candidate_rejected", { memoryId: action.memoryId, reason: action.reason });
       break;
     case "MEMORY_MUTATION_REQUESTED":
       if (!next.pendingMemoryMutations.some((mutation) => mutation.id === action.mutation.id)) {
@@ -249,6 +364,13 @@ export function reduceSession(state, action) {
       const unresolvedCalls = findUnresolvedToolCalls(next.messages);
       for (const call of unresolvedCalls) {
         const wasPending = call.id === next.pendingApproval?.id;
+        if (!wasPending) {
+          emit("tool.execution_unknown", {
+            callId: call.id,
+            tool: call.name,
+            reason: "process_interrupted",
+          });
+        }
         next.messages.push({
           role: "tool",
           tool_call_id: call.id,

@@ -71,6 +71,36 @@ test("恢复会话不会重复补全已有工具结果", () => {
   assert.deepEqual(resumed.events.at(-1).reconciledToolCalls, []);
 });
 
+test("恢复执行中的工具会记录 execution_unknown 且不自动重放", () => {
+  const call = { id: "call-interrupted", name: "run_shell", arguments: { command: "echo ok" } };
+  let state = createSession({ provider: "demo", workspace: "/workspace" });
+  state = reduceSession(state, {
+    type: "ASSISTANT_MESSAGE",
+    message: {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: call.id, type: "function", function: { name: call.name, arguments: "{}" } }],
+    },
+  });
+  state = reduceSession(state, { type: "TOOL_REQUESTED", call });
+  state = reduceSession(state, {
+    type: "TOOL_EXECUTION_STARTED",
+    call,
+    argsHash: "hash",
+    toolVersion: "version",
+    effects: ["execute"],
+    idempotency: "unknown",
+    adapter: "native",
+  });
+
+  const resumed = reduceSession(state, { type: "RESUMED", provider: "demo", workspace: "/workspace" });
+
+  assert.match(resumed.messages.at(-1).content, /执行状态未知.*不会自动重放/);
+  assert.ok(resumed.events.some((event) => (
+    event.type === "tool.execution_unknown" && event.callId === call.id && event.reason === "process_interrupted"
+  )));
+});
+
 test("长期记忆支持保存、搜索和删除", async () => {
   const fixture = createFixture();
   try {

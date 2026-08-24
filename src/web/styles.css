@@ -294,12 +294,22 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .event > div { padding-bottom: 14px; border-bottom: 1px solid #20242b; }
 .event strong, .event span, .event code { display: block; }.event strong { color: var(--text-soft); font-size: 11px; }.event span { margin-top: 3px; color: var(--muted); font-size: 9px; }.event code { margin-top: 5px; color: #626975; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
 .memory-form { display: flex; gap: 7px; margin-bottom: 13px; }
+.candidate-section { margin-bottom: 14px; }
+.memory-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
+.memory-section-heading strong { color: var(--text); font-size: 11px; }
+.memory-section-heading span, .candidate-empty, .candidate-meta { color: var(--muted); font-size: 9px; }
+.candidate-empty { padding: 10px 0; }
+.memory-divider { height: 1px; margin: 0 0 14px; background: var(--line); }
 .memory-form input { min-width: 0; flex: 1; padding: 9px 10px; color: var(--text); background: var(--surface); border: 1px solid var(--line); border-radius: 7px; outline: 0; font-size: 11px; }
 .memory-form button { padding: 7px 10px; color: #11160a; background: var(--accent); border: 0; border-radius: 7px; cursor: pointer; font-size: 10px; font-weight: 700; }
 .memory-list { display: flex; flex-direction: column; gap: 7px; }
 .memory { padding: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
 .memory p { margin: 0 0 9px; color: var(--text-soft); font-size: 11px; line-height: 1.5; }
 .memory button { padding: 0; color: var(--danger); background: transparent; border: 0; cursor: pointer; font-size: 9px; }
+.candidate-meta { display: block; margin: -4px 0 8px; }
+.candidate-actions { display: flex; gap: 12px; }
+.candidate-actions .candidate-approve { color: var(--accent); }
+.candidate-actions button:disabled { cursor: default; opacity: .45; }
 .drawer-empty { padding: 32px 12px; color: var(--muted); text-align: center; font-size: 11px; }
 
 .toast { position: fixed; z-index: 50; right: 20px; bottom: 20px; max-width: 360px; padding: 10px 13px; color: var(--text); background: #272c35; border: 1px solid #3a414d; border-radius: 8px; box-shadow: var(--shadow); font-size: 11px; }

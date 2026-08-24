@@ -59,3 +59,24 @@ _Avoid_: Permanent pending, infinite automatic retry
 **Memory Mutation Outcome**:
 Adapter mutation 失败后的副作用确定性分类：safe_to_retry 表示确认未生效，outcome_unknown 表示可能已生效，non_retryable 表示确定不应重试。未类型化错误和 deadline 默认是 outcome_unknown；只有声明 mutation-key 幂等的 Adapter 才能安全重放这类 issue。
 _Avoid_: Every error is retryable, timeout means no side effect
+
+**Memory Flush Policy**:
+在 turn 完成后从本轮对话提出长期记忆候选的独立 Policy。它调用模型提取、按 scope 检查重复事实，并通过现有 Memory mutation outbox 保存为 candidate；失败只写 degraded audit，不改变主 turn 的完成状态。SQLite Adapter 只负责存储，不承担会话理解或模型调用。
+_Avoid_: Model extraction inside storage Adapter, auto-write active memory
+
+**Candidate Memory**:
+尚未进入 active 检索的长期记忆记录。候选保留 auto_extract provenance，必须由用户在 Web UI 中明确保留或忽略；保留使用 outbox 更新为 active，忽略使用带原因的软删除。
+_Avoid_: Injecting unreviewed candidate into model context
+
+**Tool Host**:
+工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。
+_Avoid_: AgentRuntime reading tool approval or execute implementation
+
+**Tool Authorization Decision**:
+Tool Host 在执行前根据 Tool Definition 产生的可审计决定，绑定 callId、argsHash、toolVersion、effects、idempotency、Adapter 和 risk。当前首版从 never/always 兼容字段得到 allowed/approval_required，未来由 Capability Scope 与 Workspace Policy 深化。
+_Avoid_: Prompt-only permission, approval without args identity
+
+**Tool Execution Unknown**:
+有副作用且非 safe 的工具在 timeout、cancel 或进程中断时无法证明是否生效的终态。它写入 durable audit，补全工具协议，并禁止自动重放。
+只有 Adapter Implementation 已经启动且结果不可证明时才进入 unknown；启动前取消属于确定未执行，补全 cancelled result。
+_Avoid_: Timeout means no side effect, automatic replay after crash

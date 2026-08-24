@@ -20,6 +20,9 @@ export async function connectMcpTools(configs) {
           name: exposedName,
           description: `[MCP: ${initialized.serverInfo.name}] ${tool.description || tool.title || tool.name}。外部工具，每次调用都需要审批。`,
           approval: "always",
+          effects: ["network"],
+          idempotency: "unknown",
+          adapter: "mcp",
           parameters: tool.inputSchema,
           execute: async (args, context) => formatToolResult(await client.callTool(tool.name, args, context.signal)),
         });
@@ -29,6 +32,9 @@ export async function connectMcpTools(configs) {
           name: exposeName(config.name, "resources_list"),
           description: `[MCP: ${initialized.serverInfo.name}] 列出服务器公开的 Resources 与 Resource Templates。外部读取，每次需要审批。`,
           approval: "always",
+          effects: ["read", "network"],
+          idempotency: "safe",
+          adapter: "mcp",
           parameters: objectSchema({}),
           execute: async () => JSON.stringify({
             resources: await client.listResources(),
@@ -39,6 +45,9 @@ export async function connectMcpTools(configs) {
           name: exposeName(config.name, "resource_read"),
           description: `[MCP: ${initialized.serverInfo.name}] 按 URI 读取 Resource。外部读取，每次需要审批。`,
           approval: "always",
+          effects: ["read", "network"],
+          idempotency: "safe",
+          adapter: "mcp",
           parameters: objectSchema({ uri: { type: "string" } }, ["uri"]),
           execute: async ({ uri }, context) => formatResourceResult(await client.readResource(uri, context.signal)),
         });
@@ -48,6 +57,9 @@ export async function connectMcpTools(configs) {
           name: exposeName(config.name, "prompts_list"),
           description: `[MCP: ${initialized.serverInfo.name}] 列出服务器公开的 Prompts。外部读取，每次需要审批。`,
           approval: "always",
+          effects: ["read", "network"],
+          idempotency: "safe",
+          adapter: "mcp",
           parameters: objectSchema({}),
           execute: async () => JSON.stringify(await client.listPrompts(), null, 2),
         });
@@ -55,6 +67,9 @@ export async function connectMcpTools(configs) {
           name: exposeName(config.name, "prompt_get"),
           description: `[MCP: ${initialized.serverInfo.name}] 获取一个 Prompt 及其消息。外部读取，每次需要审批。`,
           approval: "always",
+          effects: ["read", "network"],
+          idempotency: "safe",
+          adapter: "mcp",
           parameters: objectSchema({
             name: { type: "string" },
             arguments: { type: "object", additionalProperties: { type: "string" } },

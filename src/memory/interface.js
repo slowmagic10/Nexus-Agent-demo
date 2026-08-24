@@ -31,11 +31,10 @@ export class MemoryInterface {
   async update(_id, _patch, _access) { throw new Error("MemoryInterface.update 尚未实现"); }
   async supersede(_id, _replacementId, _access) { throw new Error("MemoryInterface.supersede 尚未实现"); }
   async delete(_id, _reason, _access) { throw new Error("MemoryInterface.delete 尚未实现"); }
-  async flush(_input, _access) { throw new Error("MemoryInterface.flush 尚未实现"); }
 }
 
 export function assertMemoryInterface(value) {
-  const methods = ["search", "add", "update", "supersede", "delete", "flush"];
+  const methods = ["search", "add", "update", "supersede", "delete"];
   if (!value || methods.some((method) => typeof value[method] !== "function")) {
     throw new Error(`Memory Adapter 必须实现：${methods.join(", ")}`);
   }

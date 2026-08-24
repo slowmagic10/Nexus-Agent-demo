@@ -1,13 +1,16 @@
 import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
+import { ToolHost } from "../tools/host.js";
 
 export class AgentRuntime {
   constructor({
     session,
     provider,
     tools,
+    toolHost,
     systemPrompt,
     retrieveMemory = async () => [],
     reconcile = async () => [],
+    flushMemory = async () => [],
     maxSteps = 8,
     maxTokensPerTurn = 50_000,
     maxInputTokens = 32_000,
@@ -15,6 +18,7 @@ export class AgentRuntime {
     memoryReconcileTimeoutMs = 2_000,
   }) {
     if (!session) throw new Error("AgentRuntime 需要 AgentSession");
+    if (!toolHost && !tools) throw new Error("AgentRuntime 需要 Tool Host");
     if (maxSteps !== Infinity && (!Number.isSafeInteger(maxSteps) || maxSteps < 1)) {
       throw new Error("AgentRuntime maxSteps 必须是正整数或 Infinity");
     }
@@ -26,10 +30,19 @@ export class AgentRuntime {
     }
     this.session = session;
     this.provider = provider;
-    this.tools = tools;
+    this.toolHost = toolHost || new ToolHost({
+      registry: {
+        schemas: () => tools.schemas(),
+        get: (name) => tools.get?.(name) || null,
+      },
+    });
+    if (typeof this.toolHost.schemas !== "function" || typeof this.toolHost.execute !== "function") {
+      throw new Error("AgentRuntime Tool Host Interface 无效");
+    }
     this.systemPrompt = systemPrompt;
     this.retrieveMemory = retrieveMemory;
     this.reconcile = reconcile;
+    this.flushMemory = flushMemory;
     this.maxSteps = maxSteps;
     this.maxTokensPerTurn = maxTokensPerTurn;
     this.maxInputTokens = maxInputTokens;
@@ -69,6 +82,7 @@ export class AgentRuntime {
     if (["completed", "failed", "cancelled"].includes(this.state.phase)) await this.dispatch({ type: "READY" });
     const tokenBaseline = this.state.metrics.totalTokens || 0;
     await this.dispatch({ type: "USER_MESSAGE", content });
+    const turnSourceCursor = this.session.cursor;
 
     try {
       let memories = [];
@@ -88,7 +102,7 @@ export class AgentRuntime {
         throwIfAborted(abortController.signal);
         const prepared = this.session.prepareModelRequest({
           systemPrompt: this.systemPrompt,
-          tools: this.tools.schemas(),
+          tools: this.toolHost.schemas(),
           maxInputTokens: this.maxInputTokens,
         });
         const { contextPlan, ...request } = prepared;
@@ -120,55 +134,29 @@ export class AgentRuntime {
 
         if (!response.toolCalls.length) {
           await this.dispatch({ type: "COMPLETED" });
+          try {
+            await this.flushMemory({
+              session: this.session,
+              messages: currentTurnMessages(this.state.messages),
+              sourceCursor: turnSourceCursor,
+              signal: abortController.signal,
+            });
+          } catch (error) {
+            await this.dispatch({
+              type: "MEMORY_FLUSH_DEGRADED",
+              sourceCursor: turnSourceCursor,
+              error: redactSensitiveText(error.message),
+            });
+          }
           return this.state;
         }
 
         for (const call of response.toolCalls) {
-          await this.dispatch({ type: "TOOL_REQUESTED", call });
-          const sourceCursor = this.session.cursor;
-          const tool = this.tools.get(call.name);
-          let result;
-          let ok = true;
-
-          if (!tool) {
-            ok = false;
-            result = `未知工具：${call.name}`;
-          } else {
-            if (tool.approval === "always") {
-              await this.dispatch({ type: "APPROVAL_REQUESTED", call });
-              const approved = await requestApproval(call, tool.description, abortController.signal);
-              throwIfAborted(abortController.signal);
-              await this.dispatch({ type: "APPROVAL_DECIDED", call, approved });
-              if (!approved) {
-                await this.dispatch({ type: "TOOL_RESULT", call, ok: false, result: "用户拒绝了本次工具调用。" });
-                continue;
-              }
-            }
-
-            try {
-              const toolStarted = performance.now();
-              result = await tool.execute(call.arguments, {
-                state: this.state,
-                dispatch: (action) => this.dispatch(action),
-                signal: abortController.signal,
-                sourceCursor,
-                callId: call.id,
-              });
-              await this.dispatch({
-                type: "TOOL_RESULT",
-                call,
-                ok,
-                result: redactSensitiveText(result),
-                durationMs: Math.round(performance.now() - toolStarted),
-              });
-              continue;
-            } catch (error) {
-              if (abortController.signal.aborted) throw error;
-              ok = false;
-              result = `工具执行失败：${error.message}`;
-            }
-          }
-          await this.dispatch({ type: "TOOL_RESULT", call, ok, result: redactSensitiveText(result), durationMs: 0 });
+          await this.toolHost.execute(call, {
+            session: this.session,
+            signal: abortController.signal,
+            requestApproval,
+          });
         }
       }
       throw new Error(`达到最大步骤数 ${this.maxSteps}，已停止本轮任务。`);
@@ -213,4 +201,9 @@ function normalizeUsage(usage, messages, text) {
   const inputTokens = Math.ceil(JSON.stringify(messages).length / 4);
   const outputTokens = Math.ceil(String(text || "").length / 4);
   return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+}
+
+function currentTurnMessages(messages) {
+  const start = messages.findLastIndex((message) => message.role === "user");
+  return structuredClone(start < 0 ? messages : messages.slice(start));
 }

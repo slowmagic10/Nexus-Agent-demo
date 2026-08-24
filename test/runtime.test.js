@@ -191,6 +191,58 @@ test("Memory reconcile 超时后留下审计并继续 turn", async () => {
   assert.match(audit.error, /timeout|timed out/i);
 });
 
+test("turn 完成后触发 Memory flush，flush 失败不推翻完成状态", async () => {
+  let received;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => ({ text: "已完成", toolCalls: [] }),
+    },
+    flushMemory: async (input) => {
+      received = input;
+      throw new Error("flush unavailable");
+    },
+  });
+
+  await runtime.runTurn("请处理", async () => false);
+
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(received.messages.at(-2).content, "请处理");
+  assert.equal(received.messages.at(-1).content, "已完成");
+  assert.ok(Number.isSafeInteger(received.sourceCursor));
+  assert.match(runtime.state.events.find((event) => event.type === "memory.flush_degraded").error, /flush unavailable/);
+});
+
+test("AgentRuntime 只通过 Tool Host Interface 执行工具", async () => {
+  let modelCalls = 0;
+  let execution;
+  const toolHost = {
+    schemas: () => [{ type: "function", function: { name: "host_tool", description: "test", parameters: { type: "object" } } }],
+    execute: async (call, context) => {
+      execution = { call, hasSession: Boolean(context.session), hasApproval: typeof context.requestApproval === "function" };
+      await context.session.dispatch({ type: "TOOL_REQUESTED", call });
+      await context.session.dispatch({ type: "TOOL_RESULT", call, ok: true, result: "host result", durationMs: 1 });
+    },
+  };
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        modelCalls += 1;
+        return modelCalls === 1
+          ? { text: "", toolCalls: [{ id: "host-call", name: "host_tool", arguments: { value: 1 } }] }
+          : { text: "完成", toolCalls: [] };
+      },
+    },
+    toolHost,
+  });
+
+  await runtime.runTurn("执行", async () => true);
+
+  assert.equal(execution.call.name, "host_tool");
+  assert.equal(execution.hasSession, true);
+  assert.equal(execution.hasApproval, true);
+  assert.equal(runtime.state.phase, "completed");
+});
+
 function createRuntime({
   provider,
   state,
@@ -201,6 +253,8 @@ function createRuntime({
   reconcile,
   memorySearchTimeoutMs,
   memoryReconcileTimeoutMs,
+  flushMemory,
+  toolHost,
 } = {}) {
   tools ||= { schemas: () => [], get: () => null };
   return new AgentRuntime({
@@ -210,11 +264,13 @@ function createRuntime({
     }),
     provider: { name: "test", ...provider },
     tools,
+    toolHost,
     systemPrompt: () => "test",
     retrieveMemory,
     reconcile,
     memorySearchTimeoutMs,
     memoryReconcileTimeoutMs,
+    flushMemory,
     maxInputTokens,
     maxSteps,
   });
