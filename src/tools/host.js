@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { redactSensitiveText } from "../security/redact.js";
 import {
+  consumeSessionGrant,
   createSessionGrant,
   issueSessionGrant,
   normalizeCapability,
@@ -186,6 +187,8 @@ export class ToolHost {
       executionGrantId = grant.id;
     }
 
+    if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
+    if (executionGrantId) await consumeSessionGrant(session, executionGrantId, call.id);
     if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
     const timeoutSignal = AbortSignal.timeout(definition.timeoutMs);
     const executionSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;

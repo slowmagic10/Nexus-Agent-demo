@@ -78,6 +78,39 @@ test("Tool Host 将 Approval 绑定 args hash，并统一脱敏执行结果", as
   assert.ok(session.state.events.some((event) => event.type === "tool.execution_started"));
 });
 
+test("Approval 自动签发的 call-bound Grant 不能重放", async () => {
+  let approvals = 0;
+  let executions = 0;
+  const { host, session } = fixture({
+    name: "replay_write",
+    description: "重放保护写入",
+    parameters: objectSchema({ value: { type: "string" } }, ["value"]),
+    effects: ["write"],
+    idempotency: "unknown",
+    execute: async () => { executions += 1; return "ok"; },
+  });
+  const call = { id: "call-replayed", name: "replay_write", arguments: { value: "same" } };
+  const requestApproval = async () => {
+    approvals += 1;
+    return approvals === 1;
+  };
+
+  const first = await host.execute(call, { session, requestApproval });
+  const replay = await host.execute(call, { session, requestApproval });
+
+  assert.equal(first.status, "completed");
+  assert.equal(replay.status, "denied");
+  assert.equal(executions, 1);
+  assert.equal(approvals, 2);
+  const grant = session.state.toolGrants[0];
+  assert.equal(grant.usage, "single_use");
+  assert.equal(grant.consumedByCallId, call.id);
+  assert.ok(grant.consumedAt);
+  const eventTypes = session.state.events.map((event) => event.type);
+  assert.ok(eventTypes.indexOf("tool.grant_issued") < eventTypes.indexOf("tool.grant_consumed"));
+  assert.ok(eventTypes.indexOf("tool.grant_consumed") < eventTypes.indexOf("tool.execution_started"));
+});
+
 test("有副作用工具超时后记录 execution_unknown 且不悬挂", async () => {
   const { host, session } = fixture({
     name: "slow_write",

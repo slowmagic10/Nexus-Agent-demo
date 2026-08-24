@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
-import { createSession, reduceSession } from "../src/core/state.js";
+import { createSession, migrateSessionState, reduceSession } from "../src/core/state.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 
 test("会话状态可保存、列出并按 ID 恢复", () => {
@@ -187,12 +187,38 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 7);
+    assert.equal(restored.schemaVersion, 8);
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
   } finally {
     fixture.close();
   }
+});
+
+test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
+  const state = createSession({ provider: "demo", workspace: "/tmp" });
+  state.schemaVersion = 7;
+  state.toolGrants = [{
+    id: "grant-legacy-call",
+    sessionId: state.id,
+    workspace: state.workspace,
+    tool: "write_file",
+    capabilityHash: "capability",
+    policyVersion: "policy",
+    resources: [],
+    callId: "call-legacy",
+    argsHash: "args",
+    issuedAt: "2026-08-24T00:00:00.000Z",
+    expiresAt: "2026-08-24T00:05:00.000Z",
+    revokedAt: null,
+  }];
+
+  const migrated = migrateSessionState(state);
+
+  assert.equal(migrated.schemaVersion, 8);
+  assert.equal(migrated.toolGrants[0].usage, "single_use");
+  assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
+  assert.equal(migrated.toolGrants[0].consumedByCallId, "call-legacy");
 });
 
 test("SessionStore 不再从数据库路径猜测 workspace", () => {

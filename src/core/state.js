@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createMemoryScope } from "../memory/scope.js";
 
-export const SESSION_SCHEMA_VERSION = 7;
+export const SESSION_SCHEMA_VERSION = 8;
 
 export function createSession({ provider, workspace, memoryScope, id, createdAt }) {
   const now = createdAt || new Date().toISOString();
@@ -201,7 +201,10 @@ export function reduceSession(state, action) {
       });
       break;
     case "TOOL_GRANT_ISSUED":
-      next.toolGrants = (next.toolGrants || []).filter((grant) => grant.id !== action.grant.id);
+      if ((next.toolGrants || []).some((grant) => grant.id === action.grant.id)) {
+        throw new Error(`Session Grant ID 已存在：${action.grant.id}`);
+      }
+      next.toolGrants ||= [];
       next.toolGrants.push(redactSensitiveValue(action.grant));
       emit("tool.grant_issued", {
         grantId: action.grant.id,
@@ -211,8 +214,25 @@ export function reduceSession(state, action) {
         resources: action.grant.resources,
         expiresAt: action.grant.expiresAt,
         callId: action.grant.callId || null,
+        usage: action.grant.usage || (action.grant.callId || action.grant.argsHash ? "single_use" : "session"),
       });
       break;
+    case "TOOL_GRANT_CONSUMED": {
+      const grant = (next.toolGrants || []).find((candidate) => candidate.id === action.grantId);
+      if (!grant) throw new Error(`未找到 Session Grant：${action.grantId}`);
+      const usage = grant.usage || (grant.callId || grant.argsHash ? "single_use" : "session");
+      if (usage !== "single_use") throw new Error(`Session Grant 不是单次授权：${action.grantId}`);
+      if (grant.consumedAt) throw new Error(`Session Grant 已消费：${action.grantId}`);
+      if (grant.sessionId !== next.id || grant.workspace !== next.workspace) {
+        throw new Error(`Session Grant 与当前 Session 或 workspace 不匹配：${action.grantId}`);
+      }
+      if (grant.callId && grant.callId !== action.callId) throw new Error(`Session Grant 与 Tool Call 不匹配：${action.grantId}`);
+      grant.usage = "single_use";
+      grant.consumedAt = at;
+      grant.consumedByCallId = action.callId;
+      emit("tool.grant_consumed", { grantId: grant.id, tool: grant.tool, callId: action.callId });
+      break;
+    }
     case "TOOL_GRANT_REVOKED": {
       const grant = (next.toolGrants || []).find((candidate) => candidate.id === action.grantId);
       if (!grant) throw new Error(`未找到 Session Grant：${action.grantId}`);
@@ -448,7 +468,7 @@ export function reduceSession(state, action) {
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
   if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
-  if ([2, 3, 4, 5, 6].includes(state.schemaVersion)) {
+  if ([2, 3, 4, 5, 6, 7].includes(state.schemaVersion)) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
@@ -456,13 +476,25 @@ export function migrateSessionState(state) {
       memoryScope: createMemoryScope(state.memoryScope || { workspace: state.workspace }),
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
-      toolGrants: state.toolGrants || [],
+      toolGrants: migrateToolGrants(state.toolGrants || []),
     };
   }
   if (state.schemaVersion > SESSION_SCHEMA_VERSION) {
     throw new Error(`会话 schema v${state.schemaVersion} 高于当前支持的 v${SESSION_SCHEMA_VERSION}`);
   }
   throw new Error(`不支持的会话 schema version：${state.schemaVersion}`);
+}
+
+function migrateToolGrants(grants) {
+  return grants.map((grant) => {
+    const singleUse = grant.usage === "single_use" || (!grant.usage && (grant.callId || grant.argsHash));
+    return {
+      ...grant,
+      usage: singleUse ? "single_use" : "session",
+      consumedAt: grant.consumedAt || (singleUse ? grant.issuedAt || grant.expiresAt || new Date(0).toISOString() : null),
+      consumedByCallId: grant.consumedByCallId || (singleUse ? grant.callId || null : null),
+    };
+  });
 }
 
 export function createSessionBranch(parentState, {

@@ -85,8 +85,8 @@ _Avoid_: Inferring permissions only from tool name or description
 _Avoid_: Prompt-only policy, grant overriding deny
 
 **Session Grant**:
-绑定 sessionId、workspace、tool、capabilityHash、policyVersion 与资源范围的 durable 授权。Grant 可过期或撤销，不能跨 Session/workspace 使用；普通 Approval 只签发当前 callId/argsHash 的短期 Grant。
-_Avoid_: Global reusable approval, grant without policy identity
+绑定 sessionId、workspace、tool、capabilityHash、policyVersion 与资源范围的 durable 授权。显式 Session Grant 可按范围复用；普通 Approval 只签发当前 callId/argsHash 的 single-use Grant，必须在 Adapter 启动前 durable consume。Grant 可过期或撤销，不能跨 Session/workspace 使用。
+_Avoid_: Global reusable approval, replayable call-bound grant, grant without policy identity
 
 **Tool Execution Unknown**:
 有副作用且非 safe 的工具在 timeout、cancel 或进程中断时无法证明是否生效的终态。它写入 durable audit，补全工具协议，并禁止自动重放。

@@ -1,5 +1,5 @@
 // FOUNDATION — capability, workspace policy and durable session-grant decisions.
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
@@ -144,7 +144,7 @@ export function createSessionGrant({
     throw new Error("Session Grant 时间无效");
   }
   return {
-    id: id || `grant-${hashValue({ sessionId, tool, capabilityHash, policyVersion, resources, callId, argsHash, issuedAt }).slice(0, 20)}`,
+    id: id || `grant-${randomUUID()}`,
     sessionId,
     workspace: path.resolve(workspace),
     tool,
@@ -155,6 +155,9 @@ export function createSessionGrant({
     argsHash,
     issuedAt,
     expiresAt: expiry,
+    usage: callId || argsHash ? "single_use" : "session",
+    consumedAt: null,
+    consumedByCallId: null,
     revokedAt: null,
   };
 }
@@ -170,6 +173,16 @@ export async function issueSessionGrant(session, grant) {
 export async function revokeSessionGrant(session, grantId, reason = "用户撤销授权") {
   if (typeof grantId !== "string" || !grantId) throw new Error("Session Grant ID 无效");
   await session.dispatch({ type: "TOOL_GRANT_REVOKED", grantId, reason });
+}
+
+export async function consumeSessionGrant(session, grantId, callId) {
+  const grant = session.state.toolGrants?.find((candidate) => candidate.id === grantId);
+  if (!grant) throw new Error(`未找到 Session Grant：${grantId}`);
+  if (grantUsage(grant) !== "single_use") return false;
+  if (grant.consumedAt) throw new Error(`Session Grant 已消费：${grantId}`);
+  if (grant.callId && grant.callId !== callId) throw new Error(`Session Grant 与 Tool Call 不匹配：${grantId}`);
+  await session.dispatch({ type: "TOOL_GRANT_CONSUMED", grantId, callId });
+  return true;
 }
 
 export function capabilityVersion(capability) {
@@ -292,6 +305,7 @@ function defaultDecision(capability) {
 
 function grantMatches(grant, context) {
   if (!grant || grant.revokedAt) return false;
+  if (grantUsage(grant) === "single_use" && grant.consumedAt) return false;
   if (grant.sessionId !== context.state.id || path.resolve(grant.workspace) !== path.resolve(context.state.workspace)) return false;
   if (grant.tool !== context.definition.name || grant.capabilityHash !== context.capabilityHash) return false;
   if (grant.policyVersion !== context.policyVersion) return false;
@@ -299,6 +313,10 @@ function grantMatches(grant, context) {
   if (grant.argsHash && grant.argsHash !== context.argsHash) return false;
   if (!Number.isFinite(new Date(grant.expiresAt).getTime()) || new Date(grant.expiresAt).getTime() <= new Date(context.now).getTime()) return false;
   return context.resources.every((resource) => grant.resources.some((scope) => resourceMatches(scope, resource)));
+}
+
+function grantUsage(grant) {
+  return grant.usage || (grant.callId || grant.argsHash ? "single_use" : "session");
 }
 
 function resourceMatches(scope, resource) {
