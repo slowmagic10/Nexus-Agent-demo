@@ -58,6 +58,15 @@ npm run gateway:local
 
 `NEXUS_MAX_STEPS` 控制一次用户任务内部最多可以进行多少次模型/工具循环。正整数表示明确上限，`unlimited` 或 `0` 表示不限制步骤数。也可以临时使用 `--max-steps=20` 或 `--max-steps=unlimited` 覆盖环境变量。无限步骤仍会受到单轮 Token 预算、工具超时、人工审批和“停止”操作保护；会话中的用户消息轮次本身一直没有总数限制。
 
+配置按以下顺序覆盖：内置默认值、工作区 `nexus.config.json`、本机 `.nexus/config.local.json`、环境变量/`.env.local`、命令行参数。共享的 `nexus.config.json` 不允许保存 API Key；私有 JSON 和 `.env.local` 均由 Git 忽略。为防止不可信 workspace 在启动时拉起任意子进程，两个 workspace JSON 配置层都不能设置非空 `mcp.file`。
+
+可用下面的命令查看最终生效配置及每个字段的来源；API Key 只会显示为 `[REDACTED]`：
+
+```bash
+npm start -- --print-config
+npm run gateway:local -- --print-config
+```
+
 ## 基础能力
 
 - Agent Loop：模型、工具、Observation 循环，默认最多 8 步，可通过 `NEXUS_MAX_STEPS` 调整或设为无限，并保留单轮 Token 预算。
@@ -164,7 +173,7 @@ curl -X POST http://127.0.0.1:4317/sessions/父会话ID/branches \
 
 ## MCP 扩展
 
-MCP 只在显式传入 `--mcp=配置文件` 时启用。仓库包含零依赖 Echo 样例：
+MCP 只在显式传入 `--mcp=配置文件`，或由受信任的进程/本机环境设置 `NEXUS_MCP_CONFIG` 时启用；workspace 内的 JSON 配置不能启用 MCP。仓库包含零依赖 Echo 样例：
 
 ```bash
 npm run demo:mcp

@@ -7,12 +7,16 @@ export function loadLocalEnvironment(root, { env = process.env } = {}) {
   for (const name of LOCAL_ENV_FILES) {
     const file = path.join(root, name);
     if (!existsSync(file)) continue;
+    const appliedKeys = [];
     for (const [key, value] of parseEnvironment(readFileSync(file, "utf8"))) {
-      if (env[key] === undefined) env[key] = value;
+      if (env[key] === undefined) {
+        env[key] = value;
+        appliedKeys.push(key);
+      }
     }
-    return { file, legacy: name !== ".env.local" };
+    return { file, legacy: name !== ".env.local", appliedKeys };
   }
-  return { file: null, legacy: false };
+  return { file: null, legacy: false, appliedKeys: [] };
 }
 
 function parseEnvironment(source) {

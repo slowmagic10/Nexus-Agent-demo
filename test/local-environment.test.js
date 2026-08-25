@@ -16,6 +16,7 @@ test("通用本地配置优先于旧厂商配置且不覆盖进程环境", () =>
 
     assert.equal(path.basename(loaded.file), ".env.local");
     assert.equal(loaded.legacy, false);
+    assert.deepEqual(loaded.appliedKeys, ["OPENAI_API_KEY"]);
     assert.equal(env.OPENAI_API_KEY, "generic-key");
     assert.equal(env.OPENAI_MODEL, "shell-model");
   } finally {
@@ -32,6 +33,7 @@ test("没有通用配置时自动读取旧配置以保留现有密钥", () => {
     const loaded = loadLocalEnvironment(root, { env });
 
     assert.equal(loaded.legacy, true);
+    assert.deepEqual(loaded.appliedKeys, ["OPENAI_API_KEY", "NEXUS_MAX_STEPS"]);
     assert.equal(env.OPENAI_API_KEY, "legacy-key");
     assert.equal(env.NEXUS_MAX_STEPS, "unlimited");
   } finally {

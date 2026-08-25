@@ -6,8 +6,7 @@ import { promises as fs } from "node:fs";
 import { createSession, reduceSession } from "./core/state.js";
 import { AgentRuntime } from "./core/agent.js";
 import { AgentSession } from "./core/session.js";
-import { OpenAICompatibleProvider } from "./providers/openai-compatible.js";
-import { DemoProvider } from "./providers/demo.js";
+import { composeRuntimeConfig, createConfiguredProvider, inspectRuntimeConfig } from "./config/composer.js";
 import { createToolRegistry } from "./tools/registry.js";
 import { ToolHost } from "./tools/host.js";
 import { loadWorkspacePolicy } from "./tools/authorization.js";
@@ -16,7 +15,6 @@ import { TerminalUI, helpText } from "./ui.js";
 import { SessionStore } from "./persistence/session-store.js";
 import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
-import { readRuntimeOptions } from "./runtime-options.js";
 import { loadLocalEnvironment } from "./local-environment.js";
 import { createLocalMemoryScope } from "./memory/scope.js";
 import { createModelMemoryExtractor, MemoryFlushPolicy } from "./memory/flush-policy.js";
@@ -28,26 +26,22 @@ import {
 } from "./memory/outbox.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-loadLocalEnvironment(path.resolve(here, ".."));
+const root = path.resolve(here, "..");
+const localEnvironment = loadLocalEnvironment(root);
 const args = process.argv.slice(2);
-const workspaceArg = args.find((arg) => arg.startsWith("--workspace="))?.split("=").slice(1).join("=");
-const mcpConfigArg = args.find((arg) => arg.startsWith("--mcp="))?.slice("--mcp=".length);
-const workspace = path.resolve(workspaceArg || path.resolve(here, ".."));
+const config = await composeRuntimeConfig({ args, env: process.env, root, localEnvironment });
+if (config.printConfig) {
+  console.log(JSON.stringify(inspectRuntimeConfig(config), null, 2));
+  process.exit(0);
+}
+const workspace = config.workspace;
 const memoryScope = createLocalMemoryScope(workspace);
-const forceDemo = args.includes("--demo");
 const resumeArg = args.find((arg) => arg === "--resume" || arg.startsWith("--resume="));
 const resumeTarget = resumeArg === "--resume" ? "latest" : resumeArg?.slice("--resume=".length);
 const importFile = args.find((arg) => arg.startsWith("--import="))?.slice("--import=".length);
 const importAs = args.find((arg) => arg.startsWith("--import-as="))?.slice("--import-as=".length);
 const listOnly = args.includes("--sessions");
-const runtimeOptions = readRuntimeOptions(args, process.env);
-const provider = !forceDemo && process.env.OPENAI_API_KEY
-  ? new OpenAICompatibleProvider({
-      apiKey: process.env.OPENAI_API_KEY,
-      baseUrl: process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
-      model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-    })
-  : new DemoProvider();
+const provider = createConfiguredProvider(config);
 
 const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace, memoryScope });
 
@@ -79,7 +73,7 @@ if (importAs) {
 
 const context = await loadWorkspaceContext(workspace);
 
-const mcp = await connectMcpTools(await loadMcpConfig(mcpConfigArg, workspace));
+const mcp = await connectMcpTools(await loadMcpConfig(config.mcp.file, workspace));
 const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
@@ -125,7 +119,7 @@ const runtime = new AgentRuntime({
   }, { limit: 5 }),
   reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: store.memory, signal }),
   flushMemory: (input) => memoryFlushPolicy.flush(input),
-  maxSteps: runtimeOptions.maxSteps,
+  maxSteps: config.runtime.maxSteps,
 });
 
 ui.render(runtime.state);

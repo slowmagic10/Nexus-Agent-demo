@@ -92,3 +92,7 @@ _Avoid_: Global reusable approval, replayable call-bound grant, grant without po
 有副作用且非 safe 的工具在 timeout、cancel 或进程中断时无法证明是否生效的终态。它写入 durable audit，补全工具协议，并禁止自动重放。
 只有 Adapter Implementation 已经启动且结果不可证明时才进入 unknown；启动前取消属于确定未执行，补全 cancelled result。
 _Avoid_: Timeout means no side effect, automatic replay after crash
+
+**Config Composition**:
+把内置默认值、workspace profile、本机私有配置、环境变量和 CLI 覆盖合成为唯一 RuntimeConfig 的 deep Module。每个 leaf 字段保留最终来源；CLI/Gateway 只消费规范化结果，inspection 永不返回原始 Secret。workspace 内 JSON 配置不能启用 MCP 子进程，只有受信任环境或显式 CLI 可以。
+_Avoid_: Entrypoint-specific parsing, hidden precedence, printing raw secrets, process launch from workspace config

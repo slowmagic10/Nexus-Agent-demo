@@ -1,0 +1,222 @@
+// FOUNDATION — one normalized, inspectable configuration for every Nexus entrypoint.
+import { promises as fs } from "node:fs";
+import path from "node:path";
+import { DemoProvider } from "../providers/demo.js";
+import { OpenAICompatibleProvider } from "../providers/openai-compatible.js";
+import { formatMaxSteps, parseMaxSteps } from "../runtime-options.js";
+
+const PROFILE_FILE = "nexus.config.json";
+const LOCAL_FILE = path.join(".nexus", "config.local.json");
+const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible"]);
+
+export async function composeRuntimeConfig({
+  args = [],
+  env = process.env,
+  root = process.cwd(),
+  localEnvironment = { file: null, appliedKeys: [] },
+} = {}) {
+  const workspaceArg = valueArg(args, "workspace");
+  const workspace = path.resolve(workspaceArg || env.NEXUS_WORKSPACE || root);
+  const workspaceSource = workspaceArg ? "cli" : env.NEXUS_WORKSPACE ? environmentSource("NEXUS_WORKSPACE", localEnvironment) : "default";
+  const profileFile = path.join(workspace, PROFILE_FILE);
+  const localFile = path.join(workspace, LOCAL_FILE);
+  const profile = await readConfigFile(profileFile, { label: "workspace profile", allowApiKey: false });
+  const local = await readConfigFile(localFile, { label: "local private config", allowApiKey: true });
+  const values = {
+    "provider.type": "auto",
+    "provider.apiKey": null,
+    "provider.baseUrl": "https://api.openai.com/v1",
+    "provider.model": "gpt-4.1-mini",
+    "runtime.maxSteps": 8,
+    "mcp.file": null,
+    "gateway.port": 4317,
+  };
+  const sources = Object.fromEntries(Object.keys(values).map((key) => [key, "default"]));
+
+  applyLayer(values, sources, profile?.values, "workspace_profile");
+  applyLayer(values, sources, local?.values, "local_private");
+  applyEnvironment(values, sources, env, localEnvironment);
+  applyCli(values, sources, args);
+  validateValues(values);
+
+  if (values["provider.type"] === "auto") {
+    values["provider.type"] = values["provider.apiKey"] ? "openai-compatible" : "demo";
+    sources["provider.type"] = `derived:${sources["provider.apiKey"]}`;
+  }
+
+  return {
+    workspace,
+    provider: {
+      type: values["provider.type"],
+      apiKey: values["provider.apiKey"],
+      baseUrl: values["provider.baseUrl"],
+      model: values["provider.model"],
+    },
+    runtime: { maxSteps: values["runtime.maxSteps"] },
+    mcp: { file: values["mcp.file"] },
+    gateway: { port: values["gateway.port"] },
+    printConfig: args.includes("--print-config"),
+    sources: { workspace: workspaceSource, ...sources },
+    files: {
+      profile: profile?.file || null,
+      local: local?.file || null,
+      localEnvironment: localEnvironment.file || null,
+    },
+  };
+}
+
+export function createConfiguredProvider(config) {
+  if (config.provider.type === "demo") return new DemoProvider();
+  return new OpenAICompatibleProvider({
+    apiKey: config.provider.apiKey,
+    baseUrl: config.provider.baseUrl,
+    model: config.provider.model,
+  });
+}
+
+export function inspectRuntimeConfig(config) {
+  return {
+    workspace: config.workspace,
+    provider: {
+      type: config.provider.type,
+      apiKey: config.provider.apiKey ? "[REDACTED]" : null,
+      baseUrl: config.provider.baseUrl,
+      model: config.provider.model,
+    },
+    runtime: { maxSteps: formatMaxSteps(config.runtime.maxSteps) },
+    mcp: { file: config.mcp.file },
+    gateway: { port: config.gateway.port },
+    sources: config.sources,
+    files: config.files,
+  };
+}
+
+async function readConfigFile(file, { label, allowApiKey }) {
+  let payload;
+  try {
+    payload = JSON.parse(await fs.readFile(file, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`无法读取 ${label} ${file}：${error.message}`);
+  }
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error(`${label} 必须是 JSON 对象`);
+  assertKnownKeys(payload, new Set(["provider", "runtime", "mcp", "gateway"]), label);
+  const values = {};
+  if (payload.provider !== undefined) {
+    assertObject(payload.provider, `${label}.provider`);
+    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model"]), `${label}.provider`);
+    if (payload.provider.apiKey !== undefined && !allowApiKey) {
+      throw new Error(`${label} 不允许保存 provider.apiKey；请使用 .env.local 或 .nexus/config.local.json`);
+    }
+    copyDefined(values, "provider.type", payload.provider.type);
+    copyDefined(values, "provider.apiKey", payload.provider.apiKey);
+    copyDefined(values, "provider.baseUrl", payload.provider.baseUrl);
+    copyDefined(values, "provider.model", payload.provider.model);
+  }
+  if (payload.runtime !== undefined) {
+    assertObject(payload.runtime, `${label}.runtime`);
+    assertKnownKeys(payload.runtime, new Set(["maxSteps"]), `${label}.runtime`);
+    copyDefined(values, "runtime.maxSteps", payload.runtime.maxSteps);
+  }
+  if (payload.mcp !== undefined) {
+    assertObject(payload.mcp, `${label}.mcp`);
+    assertKnownKeys(payload.mcp, new Set(["file"]), `${label}.mcp`);
+    if (payload.mcp.file !== undefined && payload.mcp.file !== null) {
+      throw new Error(`${label} 不允许启用 MCP；请使用 NEXUS_MCP_CONFIG 或显式 --mcp`);
+    }
+    copyDefined(values, "mcp.file", payload.mcp.file);
+  }
+  if (payload.gateway !== undefined) {
+    assertObject(payload.gateway, `${label}.gateway`);
+    assertKnownKeys(payload.gateway, new Set(["port"]), `${label}.gateway`);
+    copyDefined(values, "gateway.port", payload.gateway.port);
+  }
+  return { file, values };
+}
+
+function applyEnvironment(values, sources, env, localEnvironment) {
+  const mappings = {
+    NEXUS_PROVIDER: "provider.type",
+    OPENAI_API_KEY: "provider.apiKey",
+    OPENAI_BASE_URL: "provider.baseUrl",
+    OPENAI_MODEL: "provider.model",
+    NEXUS_MAX_STEPS: "runtime.maxSteps",
+    NEXUS_MCP_CONFIG: "mcp.file",
+    NEXUS_GATEWAY_PORT: "gateway.port",
+  };
+  for (const [environmentKey, configKey] of Object.entries(mappings)) {
+    if (env[environmentKey] === undefined || env[environmentKey] === "") continue;
+    values[configKey] = env[environmentKey];
+    sources[configKey] = environmentSource(environmentKey, localEnvironment);
+  }
+}
+
+function applyCli(values, sources, args) {
+  if (args.includes("--demo") && valueArg(args, "provider")) throw new Error("--demo 不能与 --provider 同时使用");
+  const mappings = {
+    provider: "provider.type",
+    model: "provider.model",
+    "base-url": "provider.baseUrl",
+    "max-steps": "runtime.maxSteps",
+    mcp: "mcp.file",
+    port: "gateway.port",
+  };
+  for (const [argument, configKey] of Object.entries(mappings)) {
+    const value = valueArg(args, argument);
+    if (value === undefined) continue;
+    values[configKey] = value;
+    sources[configKey] = "cli";
+  }
+  if (args.includes("--demo")) {
+    values["provider.type"] = "demo";
+    sources["provider.type"] = "cli";
+  }
+}
+
+function validateValues(values) {
+  if (!PROVIDER_TYPES.has(values["provider.type"])) throw new Error("provider.type 必须是 auto、demo 或 openai-compatible");
+  for (const key of ["provider.baseUrl", "provider.model"]) {
+    if (typeof values[key] !== "string" || !values[key].trim()) throw new Error(`${key} 必须是非空字符串`);
+    values[key] = values[key].trim();
+  }
+  if (values["provider.apiKey"] !== null && typeof values["provider.apiKey"] !== "string") {
+    throw new Error("provider.apiKey 必须是字符串");
+  }
+  values["runtime.maxSteps"] = parseMaxSteps(values["runtime.maxSteps"]);
+  if (values["mcp.file"] !== null && (typeof values["mcp.file"] !== "string" || !values["mcp.file"].trim())) {
+    throw new Error("mcp.file 必须是非空字符串或 null");
+  }
+  if (typeof values["mcp.file"] === "string") values["mcp.file"] = values["mcp.file"].trim();
+  const port = typeof values["gateway.port"] === "number" ? values["gateway.port"] : Number(values["gateway.port"]);
+  if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("gateway.port 必须是 0 到 65535 的整数");
+  values["gateway.port"] = port;
+}
+
+function applyLayer(values, sources, layer, source) {
+  for (const [key, value] of Object.entries(layer || {})) {
+    values[key] = value;
+    sources[key] = source;
+  }
+}
+
+function environmentSource(key, localEnvironment) {
+  return localEnvironment.appliedKeys?.includes(key) ? "local_environment" : "environment";
+}
+
+function valueArg(args, name) {
+  const prefix = `--${name}=`;
+  return args.find((value) => value.startsWith(prefix))?.slice(prefix.length);
+}
+
+function copyDefined(target, key, value) {
+  if (value !== undefined) target[key] = value;
+}
+
+function assertObject(value, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} 必须是对象`);
+}
+
+function assertKnownKeys(value, allowed, label) {
+  const unknown = Object.keys(value).find((key) => !allowed.has(key));
+  if (unknown) throw new Error(`${label} 包含未知字段 ${unknown}`);
+}

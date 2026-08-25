@@ -2,6 +2,7 @@
 .nexus/nexus.db-shm
 .nexus/nexus.db-wal
 .nexus/mcp.json
+.nexus/config.local.json
 .nexus/exports/
 .env.local
 .env.deepseek.local
