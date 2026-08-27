@@ -62,7 +62,7 @@ export class AgentRuntime {
     return this.session.dispatch(action);
   }
 
-  async runTurn(content, requestApproval) {
+  async runTurn(content, requestApproval, { objective } = {}) {
     const abortController = new AbortController();
     this.abortController = abortController;
     try {
@@ -84,7 +84,7 @@ export class AgentRuntime {
     }
     if (["completed", "failed", "cancelled"].includes(this.state.phase)) await this.dispatch({ type: "READY" });
     const tokenBaseline = this.state.metrics.totalTokens || 0;
-    await this.dispatch({ type: "USER_MESSAGE", content });
+    await this.dispatch({ type: "USER_MESSAGE", content, ...(objective ? { objective } : {}) });
     const turnSourceCursor = this.session.cursor;
 
     try {

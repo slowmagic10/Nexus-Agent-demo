@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createMemoryScope } from "../memory/scope.js";
 
-export const SESSION_SCHEMA_VERSION = 10;
+export const SESSION_SCHEMA_VERSION = 11;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
 export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", id, createdAt }) {
@@ -20,6 +20,7 @@ export function createSession({ provider, workspace, memoryScope, permissionProf
     memoryScope: createMemoryScope(memoryScope || { workspace }),
     objective: null,
     plan: null,
+    delegations: [],
     messages: [],
     events: [],
     memory: [],
@@ -67,7 +68,7 @@ export function reduceSession(state, action) {
       next.messages.push({ role: "user", content: action.content });
       next.objective = {
         id: `objective-${next.events.length + 1}`,
-        text: redactSensitiveValue(action.content),
+        text: redactSensitiveValue(typeof action.objective === "string" && action.objective.trim() ? action.objective.trim() : action.content),
         status: "active",
         createdAt: at,
         updatedAt: at,
@@ -189,6 +190,7 @@ export function reduceSession(state, action) {
         idempotency: action.idempotency,
         adapter: action.adapter,
         reason: action.reason,
+        durationMs: action.durationMs || 0,
       });
       break;
     case "APPROVAL_REQUESTED":
@@ -459,6 +461,96 @@ export function reduceSession(state, action) {
       });
       break;
     }
+    case "DELEGATION_REQUESTED": {
+      if (next.lineage?.kind === "delegation") throw new Error("单层委派 Child Session 不能继续创建 Child");
+      if ((next.delegations || []).some((item) => item.status === "running")) {
+        throw new Error("当前 Session 已有正在运行的委派");
+      }
+      if (!action.delegation?.id || !action.delegation?.childSessionId || !action.delegation?.objective) {
+        throw new Error("委派必须包含 id、childSessionId 与 objective");
+      }
+      next.delegations ||= [];
+      next.delegations.push(redactSensitiveValue({
+        ...action.delegation,
+        status: "running",
+        requestedAt: at,
+        updatedAt: at,
+      }));
+      emit("agent.transfer_requested", {
+        delegationId: action.delegation.id,
+        childSessionId: action.delegation.childSessionId,
+        objective: redactSensitiveValue(action.delegation.objective).slice(0, 240),
+        budget: structuredClone(action.delegation.budget || null),
+        contextItems: action.delegation.contextItems || 0,
+        context: redactSensitiveValue(action.delegation.context || []),
+      });
+      break;
+    }
+    case "DELEGATION_COMPLETED":
+    case "DELEGATION_FAILED":
+    case "DELEGATION_CANCELLED": {
+      const delegation = (next.delegations || []).find((item) => item.id === action.delegationId);
+      if (!delegation) throw new Error(`未找到委派：${action.delegationId}`);
+      if (delegation.status !== "running") throw new Error(`委派已闭合：${action.delegationId}`);
+      const status = action.type === "DELEGATION_COMPLETED"
+        ? "completed"
+        : action.type === "DELEGATION_CANCELLED"
+          ? "cancelled"
+          : "failed";
+      delegation.status = status;
+      delegation.updatedAt = at;
+      delegation.finishedAt = at;
+      delegation.result = redactSensitiveValue(action.result || "").slice(0, 12_000);
+      delegation.childCursor = action.childCursor || null;
+      emit(`agent.transfer_${status}`, {
+        delegationId: delegation.id,
+        childSessionId: delegation.childSessionId,
+        childCursor: delegation.childCursor,
+        preview: delegation.result.slice(0, 240),
+      });
+      break;
+    }
+    case "DELEGATION_APPROVAL_REQUESTED": {
+      const delegation = (next.delegations || []).find((item) => item.id === action.delegationId);
+      if (!delegation || delegation.status !== "running") throw new Error("只有运行中的委派可以代理审批");
+      next.phase = "awaiting_approval";
+      next.pendingApproval = {
+        ...action.call,
+        arguments: redactSensitiveValue(action.call.arguments),
+        delegated: true,
+        delegationId: delegation.id,
+        childSessionId: delegation.childSessionId,
+        childCallId: action.childCallId,
+        reason: action.reason || "Child Session 请求执行需确认的工具",
+        approvalScopes: action.approvalScopes || ["once"],
+      };
+      emit("agent.transfer_approval_requested", {
+        delegationId: delegation.id,
+        childSessionId: delegation.childSessionId,
+        childCallId: action.childCallId,
+        callId: action.call.id,
+        tool: action.call.name,
+        approvalScopes: action.approvalScopes || ["once"],
+      });
+      break;
+    }
+    case "DELEGATION_APPROVAL_DECIDED": {
+      if (!next.pendingApproval?.delegated || next.pendingApproval.id !== action.callId) {
+        throw new Error("当前没有匹配的 Child 委派审批");
+      }
+      const pending = next.pendingApproval;
+      next.pendingApproval = null;
+      next.phase = "executing";
+      emit(action.approved ? "agent.transfer_approval_granted" : "agent.transfer_approval_denied", {
+        delegationId: pending.delegationId,
+        childSessionId: pending.childSessionId,
+        childCallId: pending.childCallId,
+        callId: pending.id,
+        tool: pending.name,
+        grantScope: action.approved ? action.scope || "once" : null,
+      });
+      break;
+    }
     case "COMPLETED":
       next.phase = "completed";
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
@@ -579,6 +671,17 @@ export function reduceSession(state, action) {
         }
         emit("objective.paused", { objectiveId: next.objective.id, reason: "process_interrupted" });
       }
+      for (const delegation of next.delegations || []) {
+        if (delegation.status !== "running") continue;
+        delegation.status = "interrupted";
+        delegation.updatedAt = at;
+        delegation.finishedAt = at;
+        delegation.result = "Gateway 恢复时委派仍未闭合；不会自动重放 Child 副作用。";
+        emit("agent.transfer_interrupted", {
+          delegationId: delegation.id,
+          childSessionId: delegation.childSessionId,
+        });
+      }
       emit("session.resumed", {
         previousPhase,
         discardedApproval,
@@ -597,7 +700,7 @@ export function reduceSession(state, action) {
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
   if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
-  if ([2, 3, 4, 5, 6, 7, 8, 9].includes(state.schemaVersion)) {
+  if ([2, 3, 4, 5, 6, 7, 8, 9, 10].includes(state.schemaVersion)) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
@@ -606,6 +709,7 @@ export function migrateSessionState(state) {
       memoryScope: createMemoryScope(state.memoryScope || { workspace: state.workspace }),
       objective: state.objective || null,
       plan: state.plan || null,
+      delegations: state.delegations || [],
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
       toolGrants: migrateToolGrants(state.toolGrants || []),
@@ -615,6 +719,44 @@ export function migrateSessionState(state) {
     throw new Error(`会话 schema v${state.schemaVersion} 高于当前支持的 v${SESSION_SCHEMA_VERSION}`);
   }
   throw new Error(`不支持的会话 schema version：${state.schemaVersion}`);
+}
+
+export function createDelegatedSession(parentState, {
+  id,
+  delegationId,
+  parentCursor,
+  provider,
+  workspace,
+  delegatedAt = new Date().toISOString(),
+}) {
+  const parent = migrateSessionState(parentState);
+  if (!id || !delegationId || !Number.isInteger(parentCursor) || parentCursor < 1) {
+    throw new Error("Delegated Session 需要 id、delegationId 与有效 parentCursor");
+  }
+  const child = createSession({
+    id,
+    provider: provider || parent.provider,
+    workspace: workspace || parent.workspace,
+    memoryScope: { ...parent.memoryScope, workspace: workspace || parent.workspace },
+    permissionProfile: parent.permissionProfile,
+    createdAt: delegatedAt,
+  });
+  child.lineage = {
+    kind: "delegation",
+    parentSessionId: parent.id,
+    parentCursor,
+    delegationId,
+    delegatedAt,
+  };
+  child.events.push({
+    seq: 1,
+    at: delegatedAt,
+    type: "session.delegated",
+    parentSessionId: parent.id,
+    parentCursor,
+    delegationId,
+  });
+  return child;
 }
 
 function normalizePlanSteps(value) {

@@ -166,7 +166,7 @@ test("模型请求只暴露 durable context，并与展示状态隔离", async (
       tools: [{ type: "function", function: { name: "read_file" } }],
     });
 
-    assert.deepEqual(Object.keys(promptContext).sort(), ["contextMemory", "loadedSkills", "memory", "messages", "objective", "plan"]);
+    assert.deepEqual(Object.keys(promptContext).sort(), ["contextMemory", "delegations", "loadedSkills", "memory", "messages", "objective", "plan"]);
     assert.deepEqual(request.messages.map((message) => message.content), ["真实消息"]);
     assert.equal(request.systemPrompt, "记忆 1，技能 1");
     assert.equal(request.tools[0].function.name, "read_file");

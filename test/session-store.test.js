@@ -187,12 +187,13 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 10);
+    assert.equal(restored.schemaVersion, 11);
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
     assert.equal(restored.permissionProfile, "workspace-auto");
     assert.equal(restored.objective, null);
     assert.equal(restored.plan, null);
+    assert.deepEqual(restored.delegations, []);
   } finally {
     fixture.close();
   }
@@ -218,7 +219,7 @@ test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 10);
+  assert.equal(migrated.schemaVersion, 11);
   assert.equal(migrated.toolGrants[0].usage, "single_use");
   assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
   assert.equal(migrated.toolGrants[0].consumedByCallId, "call-legacy");

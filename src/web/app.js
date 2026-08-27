@@ -243,7 +243,7 @@ function renderSession(session) {
   setGrantActionAvailability(busy);
 
   renderMessages(session.messages, session.pendingApproval, session.phase === "failed" ? session.lastError : null);
-  renderObjectivePlan(session.objective, session.plan);
+  renderObjectivePlan(session.objective, session.plan, session.delegations);
   renderEvents(session.events);
   updateSelectedSession(session, title);
 }
@@ -460,8 +460,8 @@ function renderMessages(messages, pendingApproval, terminalError) {
   requestAnimationFrame(() => { elements.messages.scrollTop = elements.messages.scrollHeight; });
 }
 
-function renderObjectivePlan(objective, plan) {
-  const view = objectivePlanViewModel(objective, plan);
+function renderObjectivePlan(objective, plan, delegations) {
+  const view = objectivePlanViewModel(objective, plan, delegations);
   elements.planPanel.classList.toggle("hidden", !view);
   if (!view) {
     elements.planPanel.replaceChildren();
@@ -505,13 +505,35 @@ function renderObjectivePlan(objective, plan) {
     }
     body.append(list);
   }
+  if (view.delegations.length) {
+    const heading = document.createElement("span");
+    heading.className = "delegation-heading";
+    heading.textContent = "Child 委派";
+    const list = document.createElement("div");
+    list.className = "delegation-list";
+    for (const delegation of view.delegations) {
+      const item = document.createElement("div");
+      item.className = `delegation-item ${delegation.status}`;
+      const marker = document.createElement("i");
+      marker.textContent = delegation.marker;
+      const copy = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = delegation.objective;
+      const detail = document.createElement("small");
+      detail.textContent = `${delegation.statusLabel} · ${delegation.childSessionId}`;
+      copy.append(title, detail);
+      item.append(marker, copy);
+      list.append(item);
+    }
+    body.append(heading, list);
+  }
   if (view.revision) {
     const revision = document.createElement("span");
     revision.className = "plan-revision";
     revision.textContent = `计划版本 ${view.revision}`;
     body.append(revision);
   }
-  const hasPlanDetails = Boolean(view.explanation || view.steps.length || view.revision);
+  const hasPlanDetails = Boolean(view.explanation || view.steps.length || view.delegations.length || view.revision);
   elements.planPanel.replaceChildren(header, ...(hasPlanDetails ? [body] : []));
 }
 
@@ -1114,6 +1136,7 @@ function toolLabel(name) {
     memory_search: "搜索长期记忆",
     remember: "保存会话记忆",
     update_plan: "更新任务计划",
+    delegate_task: "委派 Child Agent",
   };
   return labels[name] || name || "工具调用";
 }
@@ -1146,6 +1169,15 @@ function eventLabel(type) {
     "objective.cancelled": "目标取消",
     "objective.paused": "暂停旧目标",
     "plan.updated": "更新任务计划",
+    "agent.transfer_requested": "创建 Child 委派",
+    "agent.transfer_completed": "Child 委派完成",
+    "agent.transfer_failed": "Child 委派失败",
+    "agent.transfer_cancelled": "Child 委派取消",
+    "agent.transfer_interrupted": "Child 委派中断",
+    "agent.transfer_approval_requested": "Child 请求 Parent 审批",
+    "agent.transfer_approval_granted": "Parent 批准 Child 操作",
+    "agent.transfer_approval_denied": "Parent 拒绝 Child 操作",
+    "session.delegated": "创建 Child Session",
     "message.assistant": "Agent 回复",
     "model.requested": "请求模型",
     "model.completed": "模型返回",

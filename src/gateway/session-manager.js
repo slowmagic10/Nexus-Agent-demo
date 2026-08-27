@@ -1,5 +1,6 @@
 // FOUNDATION — coordinates isolated Agent sessions for local HTTP/SSE clients.
-import { createSession, reduceSession } from "../core/state.js";
+import { randomUUID } from "node:crypto";
+import { createDelegatedSession, createSession, reduceSession } from "../core/state.js";
 import { AgentRuntime } from "../core/agent.js";
 import { AgentSession } from "../core/session.js";
 import { assertMemoryInspection, assertMemoryInterface } from "../memory/interface.js";
@@ -79,8 +80,8 @@ export class GatewaySessionManager {
       throw new Error("启用 danger-full-access 时必须同时提供安全 Permission Profile");
     }
     this.executionInfo = executionInfo;
-    this.maxSteps = maxSteps;
-    this.maxTokensPerTurn = maxTokensPerTurn;
+    this.maxSteps = maxSteps ?? Infinity;
+    this.maxTokensPerTurn = maxTokensPerTurn ?? Infinity;
     this.sessions = new Map();
   }
 
@@ -120,30 +121,10 @@ export class GatewaySessionManager {
       });
     }
 
-    const entry = {
-      state: session.state,
-      session,
-      runtime: null,
-      run: null,
-      approval: null,
-      subscribers: new Set(),
-    };
-    entry.runtime = new AgentRuntime({
-      session,
-      provider: this.provider,
-      toolHost: this.toolHost,
-      systemPrompt: this.systemPrompt,
-      retrieveMemory: (query, { signal } = {}) => this.memory.search(query, {
-        scope: session.state.memoryScope,
-        signal,
-      }, { limit: 5 }),
-      reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
-      flushMemory: (input) => this.memoryFlushPolicy.flush(input),
+    const entry = this.#registerSession(session, {
       maxSteps: this.maxSteps,
       maxTokensPerTurn: this.maxTokensPerTurn,
     });
-    session.subscribe((next) => this.update(entry, next));
-    this.sessions.set(state.id, entry);
     if (resumed) {
       await reconcileMemoryOutbox({ session, memory: this.memory });
       await session.dispatch({ type: "RESUMED", provider: this.provider.name, workspace: this.workspace });
@@ -231,20 +212,93 @@ export class GatewaySessionManager {
     const entry = await this.ensureLoaded(id);
     if (entry.run) throw new GatewayError(409, "该会话已有正在运行的任务");
 
-    entry.run = entry.runtime.runTurn(content.trim(), (call, description) => (
-      new Promise((resolve) => {
-        entry.approval = {
-          call,
-          description,
-          scopes: entry.state.pendingApproval?.approvalScopes || ["once"],
-          resolve,
-        };
-      })
-    )).finally(() => {
-      entry.run = null;
-      entry.approval = null;
-    });
+    this.#startRun(entry, content.trim());
     return entry.state;
+  }
+
+  async delegate(id, specification, { signal } = {}) {
+    const parent = await this.ensureLoaded(id);
+    if (parent.state.lineage?.kind === "delegation") {
+      throw new GatewayError(409, "当前只支持单层委派，Child Session 不能继续创建 Child");
+    }
+    if (parent.children.size) throw new GatewayError(409, "当前 Session 已有正在运行的 Child");
+    if (signal?.aborted) throw signal.reason || new Error("委派已取消");
+    const input = normalizeDelegationSpec(specification, {
+      maxSteps: this.maxSteps,
+      maxTokensPerTurn: this.maxTokensPerTurn,
+    });
+    const delegationId = `delegation-${randomUUID().slice(0, 12)}`;
+    const childSessionId = `session-${randomUUID().slice(0, 12)}`;
+    await parent.session.dispatch({
+      type: "DELEGATION_REQUESTED",
+      delegation: {
+        id: delegationId,
+        childSessionId,
+        objective: input.objective,
+        contextItems: input.context.length,
+        context: input.context,
+        budget: input.durableBudget,
+      },
+    });
+
+    let child;
+    const delegatedAt = new Date().toISOString();
+    try {
+      const state = createDelegatedSession(parent.state, {
+        id: childSessionId,
+        delegationId,
+        parentCursor: parent.session.cursor,
+        provider: this.provider.name,
+        workspace: this.workspace,
+        delegatedAt,
+      });
+      const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
+      child = this.#registerSession(session, input.runtimeBudget);
+      parent.children.add(childSessionId);
+      const onAbort = () => this.#cancelEntry(child, signal.reason?.message || "Parent Session 已取消");
+      signal?.addEventListener("abort", onAbort, { once: true });
+      try {
+        const completed = await this.#startRun(child, delegatedPrompt(input), {
+          objective: input.objective,
+          approvalParent: parent,
+          delegationId,
+        });
+        const result = lastAssistantText(completed);
+        if (completed.phase === "completed") {
+          await parent.session.dispatch({
+            type: "DELEGATION_COMPLETED",
+            delegationId,
+            result,
+            childCursor: child.session.cursor,
+          });
+          return `Child Session ${childSessionId} 已完成：\n${result || "（无文本结果）"}`;
+        }
+        const actionType = completed.phase === "cancelled" ? "DELEGATION_CANCELLED" : "DELEGATION_FAILED";
+        const reason = completed.lastError || result || `Child Session ${completed.phase}`;
+        await parent.session.dispatch({
+          type: actionType,
+          delegationId,
+          result: reason,
+          childCursor: child.session.cursor,
+        });
+        throw new Error(`Child Session ${childSessionId} ${completed.phase}：${reason}`);
+      } finally {
+        signal?.removeEventListener("abort", onAbort);
+      }
+    } catch (error) {
+      const current = parent.state.delegations?.find((item) => item.id === delegationId);
+      if (current?.status === "running") {
+        await parent.session.dispatch({
+          type: signal?.aborted ? "DELEGATION_CANCELLED" : "DELEGATION_FAILED",
+          delegationId,
+          result: error.message,
+          childCursor: child?.session.cursor || null,
+        });
+      }
+      throw error;
+    } finally {
+      parent.children.delete(childSessionId);
+    }
   }
 
   async decideApproval(id, callId, approved, scope = "once") {
@@ -256,8 +310,18 @@ export class GatewaySessionManager {
     if (approved && !entry.approval.scopes.includes(scope)) {
       throw new GatewayError(400, `当前审批不支持授权范围：${scope}`);
     }
-    const { resolve } = entry.approval;
+    const approval = entry.approval;
+    const { resolve } = approval;
     entry.approval = null;
+    approval.signal?.removeEventListener("abort", approval.onAbort);
+    if (approval.delegated) {
+      await entry.session.dispatch({
+        type: "DELEGATION_APPROVAL_DECIDED",
+        callId,
+        approved,
+        scope: approved ? scope : null,
+      });
+    }
     resolve(approved ? { approved: true, scope } : false);
     return entry.state;
   }
@@ -306,13 +370,8 @@ export class GatewaySessionManager {
 
   async cancel(id) {
     const entry = await this.ensureLoaded(id);
-    if (!entry.run) throw new GatewayError(409, "该会话当前没有正在运行的任务");
-    entry.runtime.cancel("用户通过 Gateway 取消了任务");
-    if (entry.approval) {
-      const { resolve } = entry.approval;
-      entry.approval = null;
-      resolve(false);
-    }
+    if (!entry.run && !entry.children.size) throw new GatewayError(409, "该会话当前没有正在运行的任务");
+    this.#cancelEntry(entry, "用户通过 Gateway 取消了任务");
     return entry.state;
   }
 
@@ -453,13 +512,8 @@ export class GatewaySessionManager {
     const runs = [];
     for (const entry of this.sessions.values()) {
       if (entry.run) {
-        entry.runtime.cancel("Gateway 正在关闭");
+        this.#cancelEntry(entry, "Gateway 正在关闭");
         runs.push(entry.run);
-      }
-      if (entry.approval) {
-        const { resolve } = entry.approval;
-        entry.approval = null;
-        resolve(false);
       }
     }
     await Promise.allSettled(runs);
@@ -477,6 +531,112 @@ export class GatewaySessionManager {
   update(entry, state) {
     entry.state = state;
     for (const listener of entry.subscribers) listener(state);
+  }
+
+  #registerSession(session, { maxSteps, maxTokensPerTurn }) {
+    const entry = {
+      state: session.state,
+      session,
+      runtime: null,
+      run: null,
+      approval: null,
+      children: new Set(),
+      subscribers: new Set(),
+    };
+    entry.runtime = new AgentRuntime({
+      session,
+      provider: this.provider,
+      toolHost: this.toolHost,
+      systemPrompt: this.systemPrompt,
+      retrieveMemory: (query, { signal } = {}) => this.memory.search(query, {
+        scope: session.state.memoryScope,
+        signal,
+      }, { limit: 5 }),
+      reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
+      flushMemory: (input) => this.memoryFlushPolicy.flush(input),
+      maxSteps,
+      maxTokensPerTurn,
+    });
+    session.subscribe((next) => this.update(entry, next));
+    this.sessions.set(session.id, entry);
+    return entry;
+  }
+
+  #startRun(entry, content, options = {}) {
+    if (entry.run) throw new GatewayError(409, "该会话已有正在运行的任务");
+    const operation = entry.runtime.runTurn(content, (call, description, approvalSignal) => (
+      options.approvalParent
+        ? this.#requestDelegationApproval(options.approvalParent, entry, options.delegationId, call, description, approvalSignal)
+        : new Promise((resolve) => {
+        entry.approval = {
+          call,
+          description,
+          scopes: entry.state.pendingApproval?.approvalScopes || ["once"],
+          resolve,
+        };
+      })
+    ), options);
+    entry.run = operation.finally(() => {
+      entry.run = null;
+      entry.approval = null;
+    });
+    return entry.run;
+  }
+
+  #cancelEntry(entry, reason, visited = new Set()) {
+    if (!entry || visited.has(entry.session.id)) return;
+    visited.add(entry.session.id);
+    entry.runtime.cancel(reason);
+    if (entry.approval) {
+      const { resolve } = entry.approval;
+      entry.approval.signal?.removeEventListener("abort", entry.approval.onAbort);
+      entry.approval = null;
+      resolve(false);
+    }
+    for (const childId of entry.children) this.#cancelEntry(this.sessions.get(childId), reason, visited);
+  }
+
+  #requestDelegationApproval(parent, child, delegationId, call, description, signal) {
+    return new Promise((resolve, reject) => {
+      const proxyCall = {
+        ...call,
+        id: `${delegationId}:${call.id}`,
+      };
+      const approval = {
+        call: proxyCall,
+        childCall: call,
+        childSessionId: child.session.id,
+        delegated: true,
+        description,
+        scopes: child.state.pendingApproval?.approvalScopes || ["once"],
+        resolve,
+        signal,
+        onAbort: null,
+      };
+      const onAbort = () => {
+        if (parent.approval !== approval) return;
+        parent.approval = null;
+        signal?.removeEventListener("abort", onAbort);
+        void parent.session.dispatch({
+          type: "DELEGATION_APPROVAL_DECIDED",
+          callId: proxyCall.id,
+          approved: false,
+        }).then(() => resolve(false), reject);
+      };
+      approval.onAbort = onAbort;
+      void parent.session.dispatch({
+        type: "DELEGATION_APPROVAL_REQUESTED",
+        delegationId,
+        childCallId: call.id,
+        call: proxyCall,
+        reason: description,
+        approvalScopes: approval.scopes,
+      }).then(() => {
+        parent.approval = approval;
+        if (signal?.aborted) onAbort();
+        else signal?.addEventListener("abort", onAbort, { once: true });
+      }, reject);
+    });
   }
 
   #assertMutationIdle(entry) {
@@ -522,6 +682,58 @@ function resumedProfile(state, requested, fallback) {
     return state.permissionProfile || fallback;
   }
   return requested || fallback;
+}
+
+function normalizeDelegationSpec(specification, inherited) {
+  if (!specification || typeof specification !== "object" || Array.isArray(specification)) {
+    throw new GatewayError(400, "委派 specification 必须是对象");
+  }
+  const objective = typeof specification.objective === "string" ? specification.objective.trim() : "";
+  if (!objective || objective.length > 4_000) throw new GatewayError(400, "委派 objective 必须是 1 到 4000 字符");
+  const context = specification.context ?? [];
+  if (!Array.isArray(context) || context.length > 20 || context.some((item) => typeof item !== "string" || !item.trim() || item.length > 2_000)) {
+    throw new GatewayError(400, "委派 context 最多 20 条，每条必须是 1 到 2000 字符");
+  }
+  if (context.reduce((total, item) => total + item.length, 0) > 10_000) {
+    throw new GatewayError(400, "委派 context 总长度不能超过 10000 字符");
+  }
+  const requested = specification.budget ?? {};
+  if (!requested || typeof requested !== "object" || Array.isArray(requested)) {
+    throw new GatewayError(400, "委派 budget 必须是对象");
+  }
+  const maxSteps = childLimit(requested.maxSteps, inherited.maxSteps, "maxSteps");
+  const maxTokensPerTurn = childLimit(requested.maxTokensPerTurn, inherited.maxTokensPerTurn, "maxTokensPerTurn");
+  return {
+    objective,
+    context: context.map((item) => item.trim()),
+    runtimeBudget: { maxSteps, maxTokensPerTurn },
+    durableBudget: {
+      maxSteps: maxSteps === Infinity ? "unlimited" : maxSteps,
+      maxTokensPerTurn: maxTokensPerTurn === Infinity ? "unlimited" : maxTokensPerTurn,
+    },
+  };
+}
+
+function childLimit(requested, inherited, label) {
+  if (requested === undefined) return inherited;
+  if (!Number.isSafeInteger(requested) || requested < 1) {
+    throw new GatewayError(400, `委派 ${label} 必须是正整数`);
+  }
+  if (inherited !== Infinity && requested > inherited) {
+    throw new GatewayError(400, `委派 ${label} 不能超过 Parent 预算 ${inherited}`);
+  }
+  return requested;
+}
+
+function delegatedPrompt(input) {
+  const context = input.context.length
+    ? input.context.map((item, index) => `${index + 1}. ${item}`).join("\n")
+    : "（无额外上下文；只根据当前 workspace 完成目标）";
+  return `你是由 Parent Session 创建的单层 Child Agent。\n\n委派目标：\n${input.objective}\n\n显式上下文子集：\n${context}\n\n要求：只完成这个边界清晰的目标；不能继续委派；完成后返回可供 Parent 直接使用的简洁结果与验证依据。`;
+}
+
+function lastAssistantText(state) {
+  return [...(state.messages || [])].reverse().find((message) => message.role === "assistant")?.content || "";
 }
 
 export class GatewayError extends Error {

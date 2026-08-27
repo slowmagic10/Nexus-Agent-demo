@@ -28,12 +28,13 @@ export class ToolHost {
     this.maxResultChars = maxResultChars;
   }
 
-  schemas() {
+  schemas({ session } = {}) {
     return this.registry.schemas().filter((schema) => {
       const name = schema.function?.name;
       const tool = name ? this.registry.get(name) : null;
       if (!tool) return false;
-      return this.policy.canExpose(normalizeDefinition(tool, this.defaultTimeoutMs));
+      const definition = normalizeDefinition(tool, this.defaultTimeoutMs);
+      return definitionAvailable(definition, session?.state) && this.policy.canExpose(definition);
     });
   }
 
@@ -59,6 +60,15 @@ export class ToolHost {
         ok: false,
         status: "not_found",
         result: `未知工具：${call.name}`,
+        durationMs: 0,
+      });
+    }
+
+    if (!definitionAvailable(definition, session.state)) {
+      return await complete(session, call, {
+        ok: false,
+        status: "capability_unavailable",
+        result: `工具 ${call.name} 在当前 Session 中不可用。`,
         durationMs: 0,
       });
     }
@@ -150,6 +160,7 @@ export class ToolHost {
         projectGrants: this.projectGrantStore?.list({ workspace: session.state.workspace }) || [],
       }) : null;
       const stale = !currentDefinition
+        || !definitionAvailable(currentDefinition, session.state)
         || !sameRegistration(registration, currentRegistration)
         || currentArgsHash !== argsHash
         || definitionVersion(currentDefinition) !== toolVersion
@@ -272,9 +283,16 @@ export class ToolHost {
       const durationMs = Math.round(performance.now() - started);
       if (signal?.aborted) {
         if (!implementationStarted) await cancelledBeforeStart(session, call, signal, durationMs);
-        if (outcomeMayBeUnknown(definition)) {
-          await executionUnknown(session, call, definition, argsHash, "cancelled");
-        }
+        const unknown = outcomeMayBeUnknown(definition);
+        if (unknown) await executionUnknown(session, call, definition, argsHash, "cancelled", durationMs);
+        await complete(session, call, {
+          ok: false,
+          status: unknown ? "execution_unknown" : "cancelled",
+          result: unknown
+            ? "任务已取消：工具已经启动，副作用结果未知，不会自动重试。"
+            : "任务已取消：工具执行已停止等待。",
+          durationMs,
+        });
         throw error;
       }
       if (timeoutSignal.aborted) {
@@ -287,7 +305,7 @@ export class ToolHost {
           });
         }
         const unknown = outcomeMayBeUnknown(definition);
-        if (unknown) await executionUnknown(session, call, definition, argsHash, "timeout");
+        if (unknown) await executionUnknown(session, call, definition, argsHash, "timeout", durationMs);
         return await complete(session, call, {
           ok: false,
           status: unknown ? "execution_unknown" : "timeout",
@@ -347,7 +365,7 @@ async function cancelledBeforeStart(session, call, signal, durationMs = 0) {
   throw signal?.reason || new Error("任务已取消");
 }
 
-async function executionUnknown(session, call, definition, argsHash, reason) {
+async function executionUnknown(session, call, definition, argsHash, reason, durationMs = 0) {
   await session.dispatch({
     type: "TOOL_EXECUTION_UNKNOWN",
     call,
@@ -356,6 +374,7 @@ async function executionUnknown(session, call, definition, argsHash, reason) {
     idempotency: definition.idempotency,
     adapter: definition.adapter,
     reason,
+    durationMs,
   });
 }
 
@@ -406,6 +425,10 @@ function definitionVersion(definition) {
     timeoutMs: definition.timeoutMs,
     capability: definition.capability,
   });
+}
+
+function definitionAvailable(definition, state) {
+  return typeof definition.available !== "function" || definition.available({ state }) === true;
 }
 
 function resolveRegistryTool(registry, name) {

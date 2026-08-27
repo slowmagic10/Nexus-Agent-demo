@@ -23,5 +23,21 @@ test("Objective 计划投影为紧凑 Web ViewModel", () => {
       { step: "Web", status: "in_progress", marker: "→" },
       { step: "验证", status: "pending", marker: "·" },
     ],
+    delegations: [],
   });
+});
+
+test("Objective 计划投影包含 Child 委派状态", () => {
+  const view = objectivePlanViewModel({ text: "完成父任务", status: "active" }, null, [{
+    objective: "检查子模块",
+    childSessionId: "session-child",
+    status: "running",
+  }]);
+  assert.deepEqual(view.delegations, [{
+    objective: "检查子模块",
+    childSessionId: "session-child",
+    status: "running",
+    statusLabel: "执行中",
+    marker: "→",
+  }]);
 });

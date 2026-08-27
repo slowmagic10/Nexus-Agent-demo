@@ -237,6 +237,43 @@ test("有副作用工具超时后记录 execution_unknown 且不悬挂", async (
   assert.equal(session.state.messages.at(-1).tool_call_id, "call-timeout");
 });
 
+test("执行中的有副作用工具被取消后仍记录实际工具耗时", async () => {
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const { host, session } = fixture({
+    name: "cancelled_slow_write",
+    description: "会被取消的缓慢写入",
+    parameters: objectSchema({}),
+    approval: "never",
+    effects: ["write"],
+    idempotency: "unknown",
+    execute: async () => {
+      markStarted();
+      return new Promise(() => {});
+    },
+  }, { policy: new WorkspacePolicy({ rules: [{ id: "allow-cancel-test", tools: ["cancelled_slow_write"], decision: "allow" }] }) });
+  const controller = new AbortController();
+
+  const execution = host.execute({ id: "call-cancelled-running", name: "cancelled_slow_write", arguments: {} }, {
+    session,
+    signal: controller.signal,
+  });
+  await started;
+  await new Promise((resolve) => setTimeout(resolve, 15));
+  controller.abort(new Error("cancelled by test"));
+
+  await assert.rejects(execution, /cancelled by test/);
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "call-cancelled-running"
+  ));
+  assert.equal(completed.status, "execution_unknown");
+  assert.ok(completed.durationMs > 0);
+  assert.equal(session.state.metrics.toolDurationMs, completed.durationMs);
+  assert.ok(session.state.events.some((event) => (
+    event.type === "tool.execution_unknown" && event.callId === "call-cancelled-running"
+  )));
+});
+
 test("Tool Host 收到预取消信号时不会启动有副作用工具", async () => {
   let executions = 0;
   const { host, session } = fixture({

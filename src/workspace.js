@@ -38,6 +38,9 @@ ${context.objective ? `[${context.objective.status}] ${context.objective.text}` 
 当前 Plan：
 ${context.plan?.steps?.map((item, index) => `${index + 1}. [${item.status}] ${item.step}`).join("\n") || "（无）"}
 
+当前 Child 委派：
+${context.delegations?.map((item) => `- [${item.status}] ${item.objective} → ${item.childSessionId}`).join("\n") || "（无）"}
+
 与本轮相关的长期记忆：
 ${context.contextMemory.map((item) => `- [${memorySource(item)}] ${item.content}`).join("\n") || "（空）"}
 

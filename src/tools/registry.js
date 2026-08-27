@@ -21,6 +21,7 @@ export function createToolRegistry({
   workspaceExecution = null,
   accessPolicy = null,
   accessPolicies = null,
+  delegateTask = null,
   shellTimeoutMs = 15_000,
 }) {
   const root = realpathSync(path.resolve(workspace));
@@ -275,6 +276,39 @@ export function createToolRegistry({
       return `计划已更新（${plan.length} 步）${active ? `，当前：${active.step}` : ""}`;
     },
   });
+
+  if (delegateTask) {
+    if (typeof delegateTask !== "function") throw new Error("delegateTask 必须是函数");
+    define({
+      name: "delegate_task",
+      description: "把一个边界清晰的子任务交给单层 Child Session，等待其结果后回填当前 Session。Child 不能继续委派。",
+      approval: "never",
+      effects: ["state"],
+      idempotency: "keyed",
+      timeoutMs: 10 * 60_000,
+      capability: scopedCapability("session", "write", "R0", false, "single_child_delegation"),
+      available: ({ state }) => state?.lineage?.kind !== "delegation",
+      parameters: objectSchema({
+        objective: { type: "string", description: "Child 必须完成的独立目标" },
+        context: {
+          type: "array",
+          items: { type: "string" },
+          description: "显式传递给 Child 的必要事实，不会复制父会话完整 transcript",
+        },
+        budget: {
+          type: "object",
+          properties: {
+            maxSteps: { type: "integer" },
+            maxTokensPerTurn: { type: "integer" },
+          },
+          additionalProperties: false,
+        },
+      }, ["objective"]),
+      execute: async ({ objective, context = [], budget = {} }, toolContext) => (
+        delegateTask({ objective, context, budget }, toolContext)
+      ),
+    });
+  }
 
   define({
     name: "recall_memory",

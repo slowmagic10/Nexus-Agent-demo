@@ -8,6 +8,7 @@ const MODEL_CONTEXT_DEFAULTS = {
   loadedSkills: [],
   objective: null,
   plan: null,
+  delegations: [],
 };
 const MODEL_CONTEXT_KEYS = Object.keys(MODEL_CONTEXT_DEFAULTS);
 const DEFAULT_MAX_INPUT_TOKENS = 32_000;

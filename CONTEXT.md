@@ -32,6 +32,10 @@ _Avoid_: Prompt-only goal, workflow definition, untracked task text
 绑定当前 Objective 的可修订步骤投影。内置 `update_plan` 通过 Tool Host 写入 `PLAN_UPDATED` Durable Session Event；每个版本最多一个 `in_progress` 步骤，Objective 终止时 Plan 同步终止。它只表达当前单 Agent turn 的执行意图，不等同于 Workflow graph，也不承担 child delegation。
 _Avoid_: Assistant prose checklist, workflow DAG, UI-only todo list
 
+**Single-level Delegation**:
+Parent Session 通过内置 `delegate_task` 创建一个拥有独立 Journal 的 Child Session，并只传显式 context subset、受 Parent 上限约束的子预算和单一 Objective。Parent 等待 Child 终态并通过工具结果归并；Child 的 Approval 代理到 Parent，Parent 取消会级联取消 Child。Child 不暴露 `delegate_task`，恢复时未闭合委派标记为 interrupted 且不自动重放。
+_Avoid_: Copying parent transcript, nested delegation, hidden child approval, automatic replay after interruption
+
 **Client Projection**:
 客户端依据 durable event patch 维护的会话展示状态，不是恢复事实来源。
 _Avoid_: Source of truth, session snapshot

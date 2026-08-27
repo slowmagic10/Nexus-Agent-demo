@@ -121,6 +121,7 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 - Agent Loop：模型、工具、Observation 循环默认不限制步骤数和累计 Token；可按需显式设置边界。模型被要求持续执行到完成并验证、明确阻塞或需要用户输入。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
 - Objective 与计划：每个用户任务建立 durable Objective；复杂任务可通过内置 `update_plan` 维护有版本的步骤状态，Journal 恢复和 Web Client Projection 会保留同一计划。
+- 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
 - 模型上下文：只从 durable event 投影消息、记忆与 Skills；默认按 32,000 estimated input tokens 规划窗口，超限时只保留连续的最近完整 turn，运行指标、审批和 UI 状态不会进入模型输入。
 - 工具安全：`read-only` 提供不可被 Policy/Grant/Approval 提升的只读闭环；`workspace-auto` 自动执行普通工作区写入与沙箱内常规 Shell；工作区删除、动态解释器、网络/安装/Git 写入审批并支持 Session Grant；秘密、宿主逃逸和系统破坏硬拒绝；工具有超时与取消信号。
 - Workspace 与 Skills：读取 `AGENTS.md`、`SOUL.md`，按需加载 `.nexus/skills/*/SKILL.md`。

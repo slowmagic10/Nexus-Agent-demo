@@ -51,6 +51,7 @@ const permissionProfiles = Object.fromEntries(enabledPermissionProfiles.map((nam
   executionType: config.execution.type,
   networkTargets: config.network.targets,
 })]));
+let manager = null;
 const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
@@ -60,6 +61,10 @@ const tools = createToolRegistry({
   workspaceExecution,
   accessPolicy: permissionProfile,
   accessPolicies: permissionProfiles,
+  delegateTask: (input, toolContext) => {
+    if (!manager) throw new Error("Gateway Delegation Coordinator 尚未就绪");
+    return manager.delegate(toolContext.state.id, input, { signal: toolContext.signal });
+  },
 });
 const mcp = await connectMcpTools(await loadMcpConfig(config.mcp.file, workspace), { capabilityRuntime });
 const workspacePolicy = await loadWorkspacePolicy(workspace, { profile: permissionProfile });
@@ -68,7 +73,7 @@ const permissionToolHosts = Object.fromEntries(Object.entries(permissionProfiles
   const policy = new WorkspacePolicy(workspacePolicy.config, { profile, allowElevation: false });
   return [name, new ToolHost({ registry: tools, policy, projectGrantStore })];
 }));
-const manager = new GatewaySessionManager({
+manager = new GatewaySessionManager({
   workspace,
   provider,
   tools,

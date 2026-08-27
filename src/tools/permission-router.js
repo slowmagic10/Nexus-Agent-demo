@@ -21,7 +21,7 @@ export class PermissionToolHostRouter {
   }
 
   schemas({ session } = {}) {
-    return this.#resolve(session?.state?.permissionProfile).schemas();
+    return this.#resolve(session?.state?.permissionProfile).schemas({ session });
   }
 
   execute(call, context = {}) {
