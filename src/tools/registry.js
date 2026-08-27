@@ -1,17 +1,51 @@
 import { promises as fs } from "node:fs";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
-import { spawn } from "node:child_process";
+import { CapabilityRuntime } from "../capabilities/runtime.js";
+import { assertWorkspaceExecution, createExecutionSpec } from "../execution/interface.js";
+import { LocalWorkspaceAdapter } from "../execution/local-workspace-adapter.js";
 import { assertMemoryInterface } from "../memory/interface.js";
 import { executeMemoryMutation } from "../memory/outbox.js";
+import { createPermissionProfile } from "./permission-profile.js";
 
-export function createToolRegistry({ workspace, bundledSkills, memory, memoryStore, extraTools = [] }) {
+const NATIVE_TOOL_OWNER = "nexus:native-tools";
+const SAFE_READ_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
+
+export function createToolRegistry({
+  workspace,
+  bundledSkills,
+  memory,
+  memoryStore,
+  extraTools = [],
+  capabilityRuntime = new CapabilityRuntime(),
+  workspaceExecution = null,
+  accessPolicy = null,
+  accessPolicies = null,
+  shellTimeoutMs = 15_000,
+}) {
   const root = realpathSync(path.resolve(workspace));
+  if (!Number.isSafeInteger(shellTimeoutMs) || shellTimeoutMs < 1) throw new Error("shellTimeoutMs 必须是正整数");
+  const execution = assertWorkspaceExecution(workspaceExecution || new LocalWorkspaceAdapter({ workspace: root }));
+  const permissionProfile = accessPolicy || createPermissionProfile({
+    name: "workspace-auto",
+    workspace: root,
+    executionType: executionType(execution),
+  });
+  const permissionProfiles = normalizeAccessPolicies(accessPolicies, permissionProfile);
+  const policyFor = (context) => permissionProfiles.get(context?.state?.permissionProfile) || permissionProfile;
   const configuredMemory = memory || memoryStore?.memory || memoryStore || null;
   const memoryAdapter = configuredMemory ? assertMemoryInterface(configuredMemory) : null;
   const skillRoots = [path.join(root, ".nexus", "skills"), bundledSkills];
-  const tools = new Map();
-  const define = (tool) => tools.set(tool.name, { adapter: "native", ...tool });
+  assertCapabilityRuntime(capabilityRuntime);
+  const define = (tool, owner = NATIVE_TOOL_OWNER) => {
+    const { capabilityOwner: _capabilityOwner, ...definition } = tool;
+    return capabilityRuntime.register({
+      kind: "tool",
+      name: definition.name,
+      owner,
+      value: { adapter: "native", ...definition },
+    });
+  };
 
   define({
     name: "list_files",
@@ -21,10 +55,16 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     idempotency: "safe",
     capability: workspacePathCapability("path", "read", "R0", true, "."),
     parameters: objectSchema({ path: { type: "string", description: "相对工作区路径" } }),
-    execute: async ({ path: requested = "." }) => {
+    execute: async ({ path: requested = "." }, context) => {
+      const currentPolicy = policyFor(context);
       const target = safePath(root, requested);
+      assertWorkspaceAccess(currentPolicy, root, target, "read");
       const entries = await fs.readdir(target, { withFileTypes: true });
-      return entries.slice(0, 120).map((entry) => `${entry.isDirectory() ? "目录" : "文件"}\t${path.join(requested, entry.name)}`).join("\n") || "（空目录）";
+      return entries
+        .filter((entry) => currentPolicy.canAccessPath(path.relative(root, path.join(target, entry.name)) || ".", "read"))
+        .slice(0, 120)
+        .map((entry) => `${entry.isDirectory() ? "目录" : "文件"}\t${path.join(requested, entry.name)}`)
+        .join("\n") || "（空目录）";
     },
   });
 
@@ -122,7 +162,11 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     idempotency: "safe",
     capability: workspacePathCapability("path", "read", "R0", true),
     parameters: objectSchema({ path: { type: "string" } }, ["path"]),
-    execute: async ({ path: requested }) => truncate(await fs.readFile(safePath(root, requested), "utf8"), 12_000),
+    execute: async ({ path: requested }, context) => {
+      const target = safePath(root, requested);
+      assertWorkspaceAccess(policyFor(context), root, target, "read");
+      return truncate(await fs.readFile(target, "utf8"), 12_000);
+    },
   });
 
   define({
@@ -133,9 +177,11 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     idempotency: "safe",
     capability: workspacePathCapability("path", "read", "R0", true, "."),
     parameters: objectSchema({ query: { type: "string" }, path: { type: "string" } }, ["query"]),
-    execute: async ({ query, path: requested = "." }) => {
+    execute: async ({ query, path: requested = "." }, context) => {
+      const currentPolicy = policyFor(context);
       const base = safePath(root, requested);
-      const files = await walk(base, 300);
+      assertWorkspaceAccess(currentPolicy, root, base, "read");
+      const files = await walk(base, 300, root, currentPolicy);
       const hits = [];
       for (const file of files) {
         try {
@@ -153,14 +199,15 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
 
   define({
     name: "write_file",
-    description: "写入工作区文件。属于有副作用操作，未获 Session Grant 时要求审批。",
+    description: "写入工作区文件。普通路径可由 workspace-auto 自动执行，受保护路径始终拒绝。",
     approval: "always",
     effects: ["write"],
     idempotency: "unknown",
     capability: workspacePathCapability("path", "write", "R1", false),
     parameters: objectSchema({ path: { type: "string" }, content: { type: "string" } }, ["path", "content"]),
-    execute: async ({ path: requested, content }) => {
+    execute: async ({ path: requested, content }, context) => {
       const target = safePath(root, requested);
+      assertWorkspaceAccess(policyFor(context), root, target, "write");
       await fs.mkdir(path.dirname(target), { recursive: true });
       await fs.writeFile(target, content, "utf8");
       return `已写入 ${path.relative(root, target)}（${Buffer.byteLength(content)} 字节）`;
@@ -169,14 +216,21 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
 
   define({
     name: "run_shell",
-    description: "在工作区执行 Shell 命令。高风险，必须通过 Workspace Policy 与 Session Grant/审批，危险命令会被策略层拒绝。",
+    description: "在工作区执行 Shell 命令。read-only 仅允许沙箱内的最小只读检查；workspace-auto 可自动执行常规命令；网络、安装和外部路径需要审批，危险命令拒绝。",
     approval: "always",
     effects: ["execute"],
     idempotency: "unknown",
-    timeoutMs: 15_000,
-    capability: scopedCapability("workspace", "execute", "R2", false),
+    timeoutMs: shellTimeoutMs,
+    capability: {
+      risk: "R2",
+      readOnly: false,
+      resources: [
+        { kind: "workspace", access: "execute" },
+        { kind: "shell_command", argument: "command", access: "execute" },
+      ],
+    },
     parameters: objectSchema({ command: { type: "string" } }, ["command"]),
-    execute: async ({ command }, context) => runShell(root, command, context.signal),
+    execute: async ({ command }, context) => executeShell(execution, policyFor(context), command, context.signal),
   });
 
   define({
@@ -190,6 +244,35 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
     execute: async ({ content }, context) => {
       await context.dispatch({ type: "MEMORY_ADDED", content });
       return `已加入短期记忆：${content}`;
+    },
+  });
+
+  define({
+    name: "update_plan",
+    description: "创建或更新当前 Objective 的执行计划。用于多步骤任务；计划变化会写入 Session Journal，且不产生工作区外部副作用。",
+    approval: "never",
+    effects: ["state"],
+    idempotency: "safe",
+    capability: scopedCapability("session", "write", "R0", false),
+    parameters: objectSchema({
+      explanation: { type: "string", description: "可选的计划调整原因" },
+      plan: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            step: { type: "string" },
+            status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+          },
+          required: ["step", "status"],
+          additionalProperties: false,
+        },
+      },
+    }, ["plan"]),
+    execute: async ({ explanation = "", plan }, context) => {
+      await context.dispatch({ type: "PLAN_UPDATED", explanation, steps: plan });
+      const active = plan.find((item) => item.status === "in_progress");
+      return `计划已更新（${plan.length} 步）${active ? `，当前：${active.step}` : ""}`;
     },
   });
 
@@ -236,17 +319,41 @@ export function createToolRegistry({ workspace, bundledSkills, memory, memorySto
   });
 
   for (const tool of extraTools) {
-    if (tools.has(tool.name)) throw new Error(`工具名称冲突：${tool.name}`);
-    define(tool);
+    define(tool, tool.capabilityOwner || `adapter:${tool.adapter || "external"}`);
   }
 
   return {
-    get: (name) => tools.get(name),
-    schemas: () => [...tools.values()].map((tool) => ({
+    get: (name) => capabilityRuntime.get("tool", name),
+    resolve: (name) => capabilityRuntime.resolve("tool", name),
+    acquire: (name, registrationId) => capabilityRuntime.acquire("tool", name, registrationId),
+    schemas: () => capabilityRuntime.list("tool").map(({ value: tool }) => ({
       type: "function",
       function: { name: tool.name, description: tool.description, parameters: tool.parameters },
     })),
+    capabilityRuntime,
+    workspaceExecution: execution,
+    accessPolicy: permissionProfile,
+    accessPolicies: permissionProfiles,
   };
+}
+
+function normalizeAccessPolicies(configured, fallback) {
+  const entries = configured instanceof Map ? [...configured.entries()] : Object.entries(configured || {});
+  const profiles = new Map(entries);
+  if (!profiles.has(fallback.name)) profiles.set(fallback.name, fallback);
+  for (const [name, policy] of profiles) {
+    if (typeof name !== "string" || !name || typeof policy?.assertPath !== "function" || typeof policy?.classifyShell !== "function") {
+      throw new Error("Tool Registry accessPolicies 必须是具名 Permission Profile");
+    }
+  }
+  return profiles;
+}
+
+function assertCapabilityRuntime(runtime) {
+  const methods = ["register", "get", "resolve", "acquire", "list", "revokeOwner"];
+  if (!runtime || methods.some((method) => typeof runtime[method] !== "function")) {
+    throw new Error(`Tool Registry 需要 Capability Runtime：${methods.join(", ")}`);
+  }
 }
 
 function objectSchema(properties, required = []) {
@@ -286,7 +393,7 @@ function safePath(root, requested) {
   return path.join(realExisting, path.relative(existing, target));
 }
 
-async function walk(root, limit) {
+async function walk(root, limit, workspace, accessPolicy) {
   const results = [];
   const queue = [root];
   while (queue.length && results.length < limit) {
@@ -294,6 +401,8 @@ async function walk(root, limit) {
     for (const entry of await fs.readdir(current, { withFileTypes: true })) {
       if ([".git", "node_modules", "dist", "build"].includes(entry.name)) continue;
       const target = path.join(current, entry.name);
+      const relative = path.relative(workspace, target) || ".";
+      if (!accessPolicy.canAccessPath(relative, "read")) continue;
       if (entry.isDirectory()) queue.push(target);
       else if (entry.isFile() && !/^nexus\.db(?:-(?:wal|shm))?$/.test(entry.name) && (await fs.stat(target)).size < 1_000_000) results.push(target);
       if (results.length >= limit) break;
@@ -320,33 +429,33 @@ async function discoverSkills(roots) {
   return found;
 }
 
-function runShell(cwd, command, signal) {
-  const denied = /(^|\s)(rm\s+-rf|sudo|shutdown|reboot|mkfs|dd\s+if=|git\s+reset\s+--hard)(\s|$)/i;
-  if (denied.test(command)) throw new Error("安全策略拒绝了危险命令");
-  return new Promise((resolve, reject) => {
-    const child = spawn("/bin/zsh", ["-lc", command], { cwd, env: process.env });
-    let output = "";
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      reject(new Error("命令执行超过 15 秒，已终止"));
-    }, 15_000);
-    const onAbort = () => child.kill("SIGTERM");
-    signal?.addEventListener("abort", onAbort, { once: true });
-    child.stdout.on("data", (chunk) => { output += chunk; });
-    child.stderr.on("data", (chunk) => { output += chunk; });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      if (signal?.aborted) {
-        reject(signal.reason || new Error("任务已取消"));
-        return;
-      }
-      const summary = truncate(output.trim(), 12_000) || "（无输出）";
-      if (code === 0) resolve(summary);
-      else reject(new Error(`退出码 ${code}\n${summary}`));
-    });
-  });
+async function executeShell(execution, accessPolicy, command, signal) {
+  const classification = accessPolicy.classifyShell(command);
+  if (classification.decision === "deny") throw new Error(classification.reason);
+  const result = await execution.execute(createExecutionSpec({
+    program: "/bin/zsh",
+    args: ["-dfc", command],
+    cwd: ".",
+    filesystemMode: accessPolicy.name === "read-only" ? "read-only" : "workspace-write",
+    networkTargets: accessPolicy.networkTargetsForShell(command),
+    ...(["read-only", "workspace-untrusted"].includes(accessPolicy.name) && classification.decision === "allow"
+      ? { env: { PATH: SAFE_READ_PATH } }
+      : {}),
+    maxOutputChars: 12_000,
+  }), { signal });
+  const summary = result.output.trim() || "（无输出）";
+  if (result.exitCode === 0) return summary;
+  throw new Error(`退出码 ${result.exitCode}\n${summary}`);
+}
+
+function assertWorkspaceAccess(accessPolicy, workspace, target, access) {
+  return accessPolicy.assertPath(path.relative(workspace, target) || ".", access);
+}
+
+function executionType(execution) {
+  if (execution.id === "native-sandbox") return "native";
+  if (execution.id === "docker-workspace") return "docker";
+  return "local";
 }
 
 function truncate(value, length) {

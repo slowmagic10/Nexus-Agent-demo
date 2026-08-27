@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { redactSensitiveText } from "../security/redact.js";
 import {
   consumeSessionGrant,
+  createProjectGrant,
   createSessionGrant,
   issueSessionGrant,
   normalizeCapability,
@@ -10,10 +11,10 @@ import {
 
 const APPROVAL_MODES = new Set(["never", "always"]);
 const IDEMPOTENCY_MODES = new Set(["safe", "keyed", "unknown"]);
-const EFFECTS = new Set(["read", "write", "execute", "network", "memory", "credential"]);
+const EFFECTS = new Set(["read", "write", "execute", "network", "memory", "credential", "state"]);
 
 export class ToolHost {
-  constructor({ registry, policy = new WorkspacePolicy(), defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
+  constructor({ registry, policy = new WorkspacePolicy(), projectGrantStore = null, defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
     if (!registry || typeof registry.get !== "function" || typeof registry.schemas !== "function") {
       throw new Error("Tool Host 需要 Tool Registry");
     }
@@ -22,6 +23,7 @@ export class ToolHost {
     }
     this.registry = registry;
     this.policy = policy;
+    this.projectGrantStore = projectGrantStore;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.maxResultChars = maxResultChars;
   }
@@ -38,7 +40,8 @@ export class ToolHost {
   async execute(call, { session, signal, requestApproval } = {}) {
     validateCall(call);
     if (!session || typeof session.dispatch !== "function") throw new Error("Tool Host 需要 Agent Session");
-    const tool = this.registry.get(call.name);
+    const registration = resolveRegistryTool(this.registry, call.name);
+    const tool = registration?.tool || null;
     const argsHash = hashValue(call.arguments);
     const definition = tool ? normalizeDefinition(tool, this.defaultTimeoutMs) : null;
     await session.dispatch({
@@ -82,6 +85,7 @@ export class ToolHost {
       call,
       state: session.state,
       argsHash,
+      projectGrants: this.projectGrantStore?.list({ workspace: session.state.workspace }) || [],
     });
     await session.dispatch({
       type: "TOOL_AUTHORIZATION_DECIDED",
@@ -98,7 +102,7 @@ export class ToolHost {
       return await complete(session, call, {
         ok: false,
         status: "policy_denied",
-        result: `Workspace Policy 拒绝工具调用：${authorization.reason}`,
+        result: `权限策略拒绝工具调用：${authorization.reason}`,
         durationMs: 0,
       });
     }
@@ -106,8 +110,10 @@ export class ToolHost {
     if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
 
     let executionGrantId = authorization.grantId;
+    let executionGrantScope = authorization.grantScope;
     if (authorization.decision === "approval_required") {
       if (typeof requestApproval !== "function") throw new Error(`工具 ${call.name} 需要 Approval callback`);
+      const approvalScopes = authorization.approvalScopes || ["once", "session", ...(this.projectGrantStore ? ["project"] : [])];
       await session.dispatch({
         type: "APPROVAL_REQUESTED",
         call,
@@ -118,10 +124,22 @@ export class ToolHost {
         capabilityHash: authorization.capabilityHash,
         resources: authorization.resources,
         ruleId: authorization.ruleId,
+        profile: authorization.profile,
+        reason: authorization.reason,
+        explanation: authorization.explanation,
+        approvalScopes,
       });
-      const approved = await requestApproval(call, definition.description, signal);
+      const approval = normalizeApprovalDecision(await requestApproval(
+        call,
+        `${definition.description}\n授权原因：${authorization.reason}`,
+        signal,
+      ), { projectAvailable: Boolean(this.projectGrantStore) });
+      if (approval.approved && !approvalScopes.includes(approval.scope)) {
+        throw new Error(`当前工具审批不支持授权范围：${approval.scope}`);
+      }
       if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
-      const currentTool = this.registry.get(call.name);
+      const currentRegistration = resolveRegistryTool(this.registry, call.name);
+      const currentTool = currentRegistration?.tool || null;
       const currentDefinition = currentTool ? normalizeDefinition(currentTool, this.defaultTimeoutMs) : null;
       const currentArgsHash = hashValue(call.arguments);
       const currentAuthorization = currentDefinition ? this.policy.authorize({
@@ -129,8 +147,10 @@ export class ToolHost {
         call,
         state: session.state,
         argsHash: currentArgsHash,
+        projectGrants: this.projectGrantStore?.list({ workspace: session.state.workspace }) || [],
       }) : null;
       const stale = !currentDefinition
+        || !sameRegistration(registration, currentRegistration)
         || currentArgsHash !== argsHash
         || definitionVersion(currentDefinition) !== toolVersion
         || currentAuthorization.policyVersion !== authorization.policyVersion
@@ -139,13 +159,14 @@ export class ToolHost {
       await session.dispatch({
         type: "APPROVAL_DECIDED",
         call,
-        approved,
+        approved: approval.approved,
+        grantScope: approval.approved ? approval.scope : null,
         argsHash,
         toolVersion,
         policyVersion: authorization.policyVersion,
         capabilityHash: authorization.capabilityHash,
       });
-      if (!approved) {
+      if (!approval.approved) {
         return await complete(session, call, {
           ok: false,
           status: "denied",
@@ -171,39 +192,63 @@ export class ToolHost {
         });
       }
       const issuedAt = new Date().toISOString();
-      const grant = createSessionGrant({
-        sessionId: session.id,
-        workspace: session.state.workspace,
-        tool: call.name,
-        capabilityHash: authorization.capabilityHash,
-        policyVersion: authorization.policyVersion,
-        resources: authorization.resources,
-        callId: call.id,
-        argsHash,
-        issuedAt,
-        expiresAt: new Date(new Date(issuedAt).getTime() + 5 * 60_000).toISOString(),
-      });
-      await issueSessionGrant(session, grant);
+      const grant = approval.scope === "project"
+        ? createProjectGrant({
+            workspace: session.state.workspace,
+            tool: call.name,
+            capabilityHash: authorization.capabilityHash,
+            policyVersion: authorization.policyVersion,
+            resources: authorization.resources,
+            issuedAt,
+          })
+        : createSessionGrant({
+            sessionId: session.id,
+            workspace: session.state.workspace,
+            tool: call.name,
+            capabilityHash: authorization.capabilityHash,
+            policyVersion: authorization.policyVersion,
+            resources: authorization.resources,
+            ...(approval.scope === "once" ? { callId: call.id, argsHash } : {}),
+            issuedAt,
+            expiresAt: new Date(new Date(issuedAt).getTime() + (approval.scope === "once" ? 5 * 60_000 : 8 * 60 * 60_000)).toISOString(),
+          });
+      if (approval.scope === "project") {
+        this.projectGrantStore.issue(grant);
+        await session.dispatch({ type: "TOOL_PROJECT_GRANT_ISSUED", grant });
+      } else {
+        await issueSessionGrant(session, grant);
+      }
       executionGrantId = grant.id;
+      executionGrantScope = approval.scope;
     }
 
     if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
-    if (executionGrantId) await consumeSessionGrant(session, executionGrantId, call.id);
+    if (executionGrantId && executionGrantScope === "once") await consumeSessionGrant(session, executionGrantId, call.id);
     if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
+    const executionLease = acquireRegistryTool(this.registry, call.name, registration);
+    if (!executionLease || definitionVersion(normalizeDefinition(executionLease.tool, this.defaultTimeoutMs)) !== toolVersion) {
+      return await capabilityUnavailable(session, call, argsHash, registration, "能力已撤销或替换，Adapter 未启动");
+    }
     const timeoutSignal = AbortSignal.timeout(definition.timeoutMs);
     const executionSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-    await session.dispatch({
-      type: "TOOL_EXECUTION_STARTED",
-      call,
-      argsHash,
-      toolVersion,
-      effects: definition.effects,
-      idempotency: definition.idempotency,
-      adapter: definition.adapter,
-      policyVersion: authorization.policyVersion,
-      capabilityHash: authorization.capabilityHash,
-      grantId: executionGrantId,
-    });
+    try {
+      await session.dispatch({
+        type: "TOOL_EXECUTION_STARTED",
+        call,
+        argsHash,
+        toolVersion,
+        effects: definition.effects,
+        idempotency: definition.idempotency,
+        adapter: definition.adapter,
+        policyVersion: authorization.policyVersion,
+        capabilityHash: authorization.capabilityHash,
+        grantId: executionGrantId,
+        grantScope: executionGrantScope,
+      });
+    } catch (error) {
+      executionLease.release();
+      throw error;
+    }
     const started = performance.now();
     let implementationStarted = false;
     try {
@@ -258,8 +303,38 @@ export class ToolHost {
         result: `工具执行失败：${redactSensitiveText(error?.message || "未知错误")}`,
         durationMs,
       });
+    } finally {
+      executionLease.release();
     }
   }
+}
+
+function normalizeApprovalDecision(value, { projectAvailable }) {
+  if (typeof value === "boolean") return { approved: value, scope: "once" };
+  if (!value || typeof value !== "object" || typeof value.approved !== "boolean") {
+    throw new Error("Approval callback 必须返回布尔值或 { approved, scope }");
+  }
+  if (!value.approved) return { approved: false, scope: "once" };
+  const scope = value.scope || "once";
+  if (!["once", "session", "project"].includes(scope)) throw new Error(`Approval scope 无效：${scope}`);
+  if (scope === "project" && !projectAvailable) throw new Error("当前运行环境未配置 Project Grant Store");
+  return { approved: true, scope };
+}
+
+async function capabilityUnavailable(session, call, argsHash, registration, reason) {
+  await session.dispatch({
+    type: "TOOL_CAPABILITY_UNAVAILABLE",
+    call,
+    argsHash,
+    registrationId: serializableRegistrationId(registration?.registrationId),
+    reason,
+  });
+  return await complete(session, call, {
+    ok: false,
+    status: "capability_unavailable",
+    result: "工具能力已撤销或替换，本次调用不会启动 Adapter。",
+    durationMs: 0,
+  });
 }
 
 async function cancelledBeforeStart(session, call, signal, durationMs = 0) {
@@ -331,6 +406,33 @@ function definitionVersion(definition) {
     timeoutMs: definition.timeoutMs,
     capability: definition.capability,
   });
+}
+
+function resolveRegistryTool(registry, name) {
+  if (typeof registry.resolve === "function") {
+    const registration = registry.resolve(name);
+    return registration ? { tool: registration.value, registrationId: registration.registrationId } : null;
+  }
+  const tool = registry.get(name);
+  return tool ? { tool, registrationId: tool } : null;
+}
+
+function acquireRegistryTool(registry, name, expected) {
+  if (typeof registry.acquire === "function") {
+    const lease = registry.acquire(name, expected?.registrationId);
+    return lease ? { tool: lease.value, release: lease.release } : null;
+  }
+  const current = resolveRegistryTool(registry, name);
+  if (!sameRegistration(expected, current)) return null;
+  return { tool: current.tool, release: () => true };
+}
+
+function sameRegistration(left, right) {
+  return Boolean(left && right && left.registrationId === right.registrationId);
+}
+
+function serializableRegistrationId(value) {
+  return typeof value === "string" ? value : null;
 }
 
 function validateCall(call) {

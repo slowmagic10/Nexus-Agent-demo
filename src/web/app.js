@@ -1,12 +1,29 @@
 import { applyStatePatch } from "/state-patch.js";
+import {
+  composerActionState,
+  shouldCancelRun,
+  shouldSubmitMessage,
+} from "/keyboard.js";
+import { grantViewModel } from "/grants.js";
+import { objectivePlanViewModel } from "/plan-view.js";
 
 const $ = (selector) => document.querySelector(selector);
-const state = { sessionId: null, session: null, cursor: 0, source: null };
+const state = {
+  sessionId: null,
+  session: null,
+  cursor: 0,
+  source: null,
+  runtime: null,
+  selectedPermissionProfile: "workspace-auto",
+  inspectorTab: "events",
+  cancelling: false,
+};
 
 const elements = {
   sessionList: $("#session-list"),
   sessionCount: $("#session-count"),
   messages: $("#messages"),
+  planPanel: $("#plan-panel"),
   events: $("#events"),
   title: $("#session-title"),
   meta: $("#session-meta"),
@@ -14,41 +31,79 @@ const elements = {
   input: $("#message-input"),
   form: $("#message-form"),
   export: $("#export-session"),
-  cancel: $("#cancel-run"),
+  composerAction: $("#composer-action"),
+  composerShortcut: $("#composer-shortcut"),
   provider: $("#composer-provider"),
   memoryList: $("#memory-list"),
   candidateList: $("#candidate-list"),
+  grantList: $("#grant-list"),
+  grantCount: $("#grant-count"),
+  grantSummary: $("#grant-summary"),
   inspector: $("#inspector"),
   backdrop: $("#drawer-backdrop"),
   debugToggle: $("#debug-toggle"),
   themeToggle: $("#theme-toggle"),
+  permissionTrigger: $("#permission-trigger"),
+  permissionLabel: $("#permission-label"),
+  permissionMenu: $("#permission-menu"),
+  dangerConfirm: $("#danger-confirm"),
+  dangerConfirmBackdrop: $("#danger-confirm-backdrop"),
+  dangerConfirmAccept: $("#danger-confirm-accept"),
 };
 
 applyTheme(savedTheme());
 $("#new-session").addEventListener("click", createSession);
 elements.form.addEventListener("submit", sendMessage);
+let inputIsComposing = false;
+elements.input.addEventListener("compositionstart", () => {
+  inputIsComposing = true;
+});
+elements.input.addEventListener("compositionend", () => {
+  inputIsComposing = false;
+});
 elements.input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey) {
+  if (shouldSubmitMessage(event, { composing: inputIsComposing })) {
     event.preventDefault();
     elements.form.requestSubmit();
   }
 });
 elements.messages.addEventListener("click", useStarter);
-elements.cancel.addEventListener("click", cancelRun);
+elements.composerAction.addEventListener("click", handleComposerAction);
 elements.export.addEventListener("click", exportSession);
 elements.themeToggle.addEventListener("click", toggleTheme);
+elements.permissionTrigger.addEventListener("click", togglePermissionMenu);
+elements.permissionMenu.addEventListener("click", choosePermissionMode);
+elements.dangerConfirmAccept.addEventListener("click", confirmDangerFullAccess);
+$("#danger-confirm-cancel").addEventListener("click", closeDangerConfirm);
+elements.dangerConfirmBackdrop.addEventListener("click", closeDangerConfirm);
 elements.debugToggle.addEventListener("click", openInspector);
 $("#debug-close").addEventListener("click", closeInspector);
 elements.backdrop.addEventListener("click", closeInspector);
 $("#memory-form").addEventListener("submit", addMemory);
 document.addEventListener("keydown", (event) => {
-  if (event.key === "Escape") closeInspector();
+  if (shouldCancelRun(event, {
+    phase: state.session?.phase,
+    cancelling: state.cancelling,
+    overlayOpen: isOverlayOpen(),
+  })) {
+    event.preventDefault();
+    void cancelRun();
+    return;
+  }
+  if (event.key === "Escape") {
+    closeInspector();
+    closePermissionMenu();
+    closeDangerConfirm();
+  }
+});
+document.addEventListener("click", (event) => {
+  if (!event.target.closest(".permission-selector")) closePermissionMenu();
 });
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => selectTab(tab.dataset.tab));
 });
 
-await Promise.allSettled([checkHealth(), loadSessions(), loadMemories(), loadCandidates()]);
+await Promise.allSettled([checkHealth(), loadRuntime(), loadSessions(), loadMemories(), loadCandidates()]);
 
 function savedTheme() {
   try {
@@ -82,6 +137,12 @@ async function checkHealth() {
   }
 }
 
+async function loadRuntime() {
+  state.runtime = await api("/runtime");
+  state.selectedPermissionProfile = state.runtime.permission.defaultProfile;
+  renderPermissionControl();
+}
+
 async function loadSessions() {
   const { sessions } = await api("/sessions");
   elements.sessionCount.textContent = sessions.length;
@@ -110,7 +171,13 @@ function sessionButton(session) {
 }
 
 async function createSession() {
-  const { session } = await api("/sessions", { method: "POST", body: {} });
+  const { session } = await api("/sessions", {
+    method: "POST",
+    body: {
+      permissionProfile: state.selectedPermissionProfile,
+      ...(state.selectedPermissionProfile === "danger-full-access" ? { permissionConfirmation: "danger-full-access" } : {}),
+    },
+  });
   await loadSessions();
   await selectSession(session.id);
   elements.input.focus();
@@ -123,7 +190,7 @@ async function selectSession(id) {
   state.cursor = cursor;
   renderSession(session);
   connectEvents();
-  await loadSessions();
+  await Promise.all([loadSessions(), loadGrants()]);
 }
 
 function connectEvents() {
@@ -152,10 +219,14 @@ async function handleSessionEvent(message) {
   if (["MEMORY_CANDIDATE_CREATED", "MEMORY_CANDIDATE_APPROVED", "MEMORY_CANDIDATE_REJECTED"].includes(event.type)) {
     await Promise.allSettled([loadCandidates(), loadMemories()]);
   }
+  if (["TOOL_GRANT_ISSUED", "TOOL_GRANT_CONSUMED", "TOOL_GRANT_REVOKED", "TOOL_PROJECT_GRANT_ISSUED", "TOOL_PROJECT_GRANT_REVOKED"].includes(event.type)) {
+    await loadGrants();
+  }
 }
 
 function renderSession(session) {
   state.session = session;
+  state.selectedPermissionProfile = session.permissionProfile || state.runtime?.permission.defaultProfile || "workspace-auto";
   const title = sessionTitle(session);
   elements.title.textContent = title;
   document.title = `${title} · Nexus`;
@@ -163,13 +234,16 @@ function renderSession(session) {
   renderStatus(session);
 
   const busy = ["thinking", "executing", "awaiting_approval"].includes(session.phase);
+  if (!busy) state.cancelling = false;
   elements.input.disabled = busy;
-  elements.form.querySelector("button[type=submit]").disabled = busy;
-  elements.cancel.disabled = !busy;
+  renderComposerAction();
   elements.export.disabled = false;
   elements.provider.textContent = session.provider || "本地模型";
+  renderPermissionControl();
+  setGrantActionAvailability(busy);
 
-  renderMessages(session.messages, session.pendingApproval);
+  renderMessages(session.messages, session.pendingApproval, session.phase === "failed" ? session.lastError : null);
+  renderObjectivePlan(session.objective, session.plan);
   renderEvents(session.events);
   updateSelectedSession(session, title);
 }
@@ -179,6 +253,7 @@ function renderStatus(session) {
   const parts = [
     [phaseLabel(session.phase), `status-chip phase ${phaseClass(session.phase)}`],
     [session.provider || "本地模型", "status-chip"],
+    [permissionLabel(session.permissionProfile), "status-chip"],
     [formatTokens(metrics.totalTokens || 0), "status-chip"],
   ];
   if (metrics.lastTurnDurationMs) parts.push([formatDuration(metrics.lastTurnDurationMs), "status-chip"]);
@@ -191,6 +266,121 @@ function renderStatus(session) {
   }));
 }
 
+function togglePermissionMenu(event) {
+  event.stopPropagation();
+  if (!state.runtime || elements.permissionTrigger.disabled) return;
+  const opening = elements.permissionMenu.classList.contains("hidden");
+  elements.permissionMenu.classList.toggle("hidden", !opening);
+  elements.permissionTrigger.setAttribute("aria-expanded", String(opening));
+}
+
+function closePermissionMenu() {
+  elements.permissionMenu.classList.add("hidden");
+  elements.permissionTrigger.setAttribute("aria-expanded", "false");
+}
+
+async function choosePermissionMode(event) {
+  const option = event.target.closest("[data-profile]");
+  if (!option) return;
+  const profile = option.dataset.profile;
+  const mode = permissionMode(profile);
+  if (!mode?.available) {
+    toast(mode?.unavailableReason || "该权限档位当前不可用");
+    return;
+  }
+  if (profile === state.selectedPermissionProfile) {
+    closePermissionMenu();
+    return;
+  }
+  if (profile === "danger-full-access") {
+    openDangerConfirm();
+    return;
+  }
+  await applyPermissionMode(profile);
+}
+
+async function applyPermissionMode(profile, { confirmed = false } = {}) {
+  const option = elements.permissionMenu.querySelector(`[data-profile="${CSS.escape(profile)}"]`);
+  if (!option) return;
+  option.disabled = true;
+  try {
+    if (state.sessionId) {
+      const { session } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/permission-profile`, {
+        method: "POST",
+        body: {
+          profile,
+          ...(confirmed ? { confirmation: "danger-full-access" } : {}),
+        },
+      });
+      renderSession(session);
+    } else {
+      state.selectedPermissionProfile = profile;
+      renderPermissionControl();
+    }
+    closePermissionMenu();
+    return true;
+  } catch {
+    // api() 已向用户显示错误；保持原权限档位。
+    return false;
+  } finally {
+    option.disabled = false;
+  }
+}
+
+function openDangerConfirm() {
+  closePermissionMenu();
+  elements.dangerConfirm.classList.remove("hidden");
+  elements.dangerConfirmBackdrop.classList.remove("hidden");
+  requestAnimationFrame(() => elements.dangerConfirmAccept.focus());
+}
+
+function closeDangerConfirm() {
+  elements.dangerConfirm.classList.add("hidden");
+  elements.dangerConfirmBackdrop.classList.add("hidden");
+}
+
+async function confirmDangerFullAccess() {
+  elements.dangerConfirmAccept.disabled = true;
+  try {
+    if (await applyPermissionMode("danger-full-access", { confirmed: true })) closeDangerConfirm();
+  } finally {
+    elements.dangerConfirmAccept.disabled = false;
+  }
+}
+
+function renderPermissionControl() {
+  const profile = state.session?.permissionProfile || state.selectedPermissionProfile;
+  const busy = ["thinking", "executing", "awaiting_approval"].includes(state.session?.phase);
+  elements.permissionLabel.textContent = permissionLabel(profile);
+  elements.permissionTrigger.classList.toggle("dangerous", profile === "danger-full-access");
+  elements.permissionTrigger.disabled = !state.runtime || busy;
+  elements.permissionMenu.querySelectorAll("[data-profile]").forEach((option) => {
+    const mode = permissionMode(option.dataset.profile);
+    const selected = option.dataset.profile === profile;
+    option.classList.toggle("selected", selected);
+    option.classList.toggle("unavailable", !mode?.available);
+    option.setAttribute("aria-selected", String(selected));
+    option.title = mode?.available ? "" : (mode?.unavailableReason || "当前不可用");
+    option.querySelector(".permission-lock")?.classList.toggle("hidden", Boolean(mode?.available));
+  });
+  if (busy) closePermissionMenu();
+}
+
+function permissionMode(profile) {
+  return state.runtime?.permission.modes.find((mode) => mode.id === profile) || null;
+}
+
+function permissionLabel(profile) {
+  return permissionMode(profile)?.label || ({
+    "read-only": "只读模式",
+    "approval-required": "请求批准",
+    "workspace-confirm": "每次确认",
+    "workspace-untrusted": "谨慎工作区",
+    "workspace-auto": "帮我批准",
+    "danger-full-access": "完全访问",
+  })[profile] || "权限设置";
+}
+
 function updateSelectedSession(session, title) {
   const item = elements.sessionList.querySelector(`[data-session-id="${CSS.escape(session.id)}"]`);
   if (!item) return;
@@ -199,7 +389,7 @@ function updateSelectedSession(session, title) {
   item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
 }
 
-function renderMessages(messages, pendingApproval) {
+function renderMessages(messages, pendingApproval, terminalError) {
   if (!messages.length) {
     elements.messages.replaceChildren(createWelcome());
     return;
@@ -254,9 +444,75 @@ function renderMessages(messages, pendingApproval) {
     rendered.push(row);
   }
 
+  if (terminalError) {
+    const alert = document.createElement("div");
+    alert.className = "runtime-error";
+    const title = document.createElement("strong");
+    title.textContent = "任务已停止";
+    const detail = document.createElement("span");
+    detail.textContent = terminalError;
+    alert.append(title, detail);
+    rendered.push(alert);
+  }
+
   if (["thinking", "executing"].includes(state.session?.phase)) rendered.push(thinkingIndicator());
   elements.messages.replaceChildren(...rendered);
   requestAnimationFrame(() => { elements.messages.scrollTop = elements.messages.scrollHeight; });
+}
+
+function renderObjectivePlan(objective, plan) {
+  const view = objectivePlanViewModel(objective, plan);
+  elements.planPanel.classList.toggle("hidden", !view);
+  if (!view) {
+    elements.planPanel.replaceChildren();
+    return;
+  }
+
+  const header = document.createElement("header");
+  const heading = document.createElement("div");
+  heading.className = "plan-heading";
+  const eyebrow = document.createElement("span");
+  eyebrow.textContent = "当前目标";
+  const title = document.createElement("strong");
+  title.textContent = view.objective;
+  heading.append(eyebrow, title);
+
+  const status = document.createElement("span");
+  status.className = `plan-status ${view.status}`;
+  status.textContent = view.statusLabel;
+  header.append(heading, status);
+
+  const body = document.createElement("div");
+  body.className = "plan-body";
+  if (view.explanation) {
+    const explanation = document.createElement("p");
+    explanation.className = "plan-explanation";
+    explanation.textContent = view.explanation;
+    body.append(explanation);
+  }
+  if (view.steps.length) {
+    const list = document.createElement("ol");
+    list.className = "plan-steps";
+    for (const step of view.steps) {
+      const item = document.createElement("li");
+      item.className = step.status;
+      const marker = document.createElement("i");
+      marker.textContent = step.marker;
+      const text = document.createElement("span");
+      text.textContent = step.step;
+      item.append(marker, text);
+      list.append(item);
+    }
+    body.append(list);
+  }
+  if (view.revision) {
+    const revision = document.createElement("span");
+    revision.className = "plan-revision";
+    revision.textContent = `计划版本 ${view.revision}`;
+    body.append(revision);
+  }
+  const hasPlanDetails = Boolean(view.explanation || view.steps.length || view.revision);
+  elements.planPanel.replaceChildren(header, ...(hasPlanDetails ? [body] : []));
 }
 
 function toolCard(call, result, pending) {
@@ -300,20 +556,35 @@ function toolCard(call, result, pending) {
 function approvalActions(call) {
   const notice = document.createElement("p");
   notice.className = "approval-copy";
-  notice.textContent = "此操作需要你的确认后才会在本地执行。";
+  notice.textContent = call.reason || "此操作需要你的确认后才会在本地执行。";
+  const context = document.createElement("p");
+  context.className = "approval-copy";
+  context.textContent = `权限档位：${call.profile || "未指定"} · 风险：${call.risk || "未分类"} · 规则：${call.ruleId || "未命中"}`;
   const row = document.createElement("div");
   row.className = "approval-actions";
-  const approve = document.createElement("button");
-  approve.className = "approve-button";
-  approve.textContent = "批准一次";
+  const scopes = call.approvalScopes || ["once"];
+  const approvals = [
+    ["once", "仅本次", "只允许当前工具调用，使用后立即失效"],
+    ["session", "本会话允许", "相同工具和资源在当前会话中可复用，最长 8 小时"],
+    ["project", "本项目允许", "相同工具和资源可跨本项目会话复用，最长 30 天"],
+  ].filter(([scope]) => scopes.includes(scope)).map(([scope, label, title]) => {
+    const button = document.createElement("button");
+    button.className = `approve-button approve-${scope}`;
+    button.textContent = label;
+    button.title = title;
+    return { button, scope };
+  });
   const deny = document.createElement("button");
   deny.className = "deny-button";
   deny.textContent = "拒绝";
-  approve.addEventListener("click", () => decide(call.id, true, [approve, deny]));
-  deny.addEventListener("click", () => decide(call.id, false, [approve, deny]));
-  row.append(approve, deny);
+  const buttons = [...approvals.map(({ button }) => button), deny];
+  approvals.forEach(({ button, scope }) => {
+    button.addEventListener("click", () => decide(call.id, true, scope, buttons));
+  });
+  deny.addEventListener("click", () => decide(call.id, false, "once", buttons));
+  row.append(...buttons);
   const fragment = document.createDocumentFragment();
-  fragment.append(notice, row);
+  fragment.append(notice, context, row);
   return fragment;
 }
 
@@ -369,7 +640,7 @@ async function sendMessage(event) {
   if (!content || !state.sessionId) return;
   elements.input.value = "";
   elements.input.disabled = true;
-  elements.form.querySelector("button[type=submit]").disabled = true;
+  elements.composerAction.disabled = true;
   try {
     await api(`/sessions/${encodeURIComponent(state.sessionId)}/messages`, {
       method: "POST",
@@ -378,16 +649,25 @@ async function sendMessage(event) {
   } catch {
     elements.input.value = content;
     elements.input.disabled = false;
-    elements.form.querySelector("button[type=submit]").disabled = false;
+    renderComposerAction();
   }
 }
 
-async function decide(callId, approved, buttons) {
+function handleComposerAction() {
+  const action = composerActionState(state.session?.phase, { cancelling: state.cancelling });
+  if (action.mode === "stop") {
+    void cancelRun();
+    return;
+  }
+  elements.form.requestSubmit();
+}
+
+async function decide(callId, approved, scope, buttons) {
   buttons.forEach((button) => { button.disabled = true; });
   try {
     await api(`/sessions/${encodeURIComponent(state.sessionId)}/approvals/${encodeURIComponent(callId)}`, {
       method: "POST",
-      body: { approved },
+      body: { approved, scope },
     });
   } catch {
     buttons.forEach((button) => { button.disabled = false; });
@@ -395,7 +675,32 @@ async function decide(callId, approved, buttons) {
 }
 
 async function cancelRun() {
-  await api(`/sessions/${encodeURIComponent(state.sessionId)}/cancel`, { method: "POST", body: {} });
+  const action = composerActionState(state.session?.phase, { cancelling: state.cancelling });
+  if (!state.sessionId || action.mode !== "stop" || state.cancelling) return;
+  state.cancelling = true;
+  renderComposerAction();
+  try {
+    await api(`/sessions/${encodeURIComponent(state.sessionId)}/cancel`, { method: "POST", body: {} });
+  } catch {
+    state.cancelling = false;
+    renderComposerAction();
+  }
+}
+
+function renderComposerAction() {
+  const action = composerActionState(state.session?.phase, { cancelling: state.cancelling });
+  elements.composerAction.textContent = action.symbol;
+  elements.composerAction.disabled = !state.sessionId || action.disabled;
+  elements.composerAction.setAttribute("aria-label", action.label);
+  elements.composerAction.title = action.mode === "stop" ? "停止当前任务（Esc）" : "发送消息（Enter）";
+  elements.composerAction.classList.toggle("stop-button", action.mode === "stop");
+  elements.composerShortcut.textContent = action.shortcut;
+}
+
+function isOverlayOpen() {
+  return !elements.dangerConfirm.classList.contains("hidden")
+    || elements.inspector.getAttribute("aria-hidden") === "false"
+    || !elements.permissionMenu.classList.contains("hidden");
 }
 
 async function exportSession() {
@@ -493,6 +798,118 @@ async function addMemory(event) {
   await loadMemories();
 }
 
+async function loadGrants() {
+  if (!state.sessionId) {
+    elements.grantCount.textContent = "0";
+    elements.grantSummary.textContent = "选择任务后查看";
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "请先选择一个任务。";
+    elements.grantList.replaceChildren(empty);
+    return;
+  }
+  const { grants } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/grants`);
+  renderGrants(grants);
+}
+
+function renderGrants(grants = {}) {
+  const views = [
+    ...(grants.session || []).map((grant) => grantViewModel(grant, { scope: grant.scope || (grant.callId || grant.argsHash ? "once" : "session") })),
+    ...(grants.project || []).map((grant) => grantViewModel(grant, { scope: "project" })),
+  ];
+  elements.grantCount.textContent = String(views.length);
+  elements.grantSummary.textContent = views.length ? `${views.length} 个有效授权` : "当前没有有效授权";
+  if (!views.length) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty grant-empty";
+    empty.textContent = "需要审批时可以选择仅本次、本会话或本项目；仅本次授权使用后会立即消失。";
+    elements.grantList.replaceChildren(empty);
+    return;
+  }
+  elements.grantList.replaceChildren(...views.map(grantCard));
+  setGrantActionAvailability(["thinking", "executing", "awaiting_approval"].includes(state.session?.phase));
+}
+
+function grantCard(grant) {
+  const box = document.createElement("section");
+  box.className = "grant-card";
+  const head = document.createElement("div");
+  head.className = "grant-head";
+  const title = document.createElement("strong");
+  title.textContent = toolLabel(grant.tool);
+  const scope = document.createElement("span");
+  scope.className = `grant-scope scope-${grant.scope}`;
+  scope.textContent = grant.scopeLabel;
+  head.append(title, scope);
+
+  const resources = document.createElement("ul");
+  resources.className = "grant-resources";
+  (grant.resources.length ? grant.resources : ["未声明资源"]).forEach((label) => {
+    const item = document.createElement("li");
+    item.textContent = label;
+    resources.append(item);
+  });
+
+  const foot = document.createElement("div");
+  foot.className = "grant-foot";
+  const expiry = document.createElement("span");
+  expiry.textContent = grant.expiryLabel;
+  if (grant.expiresAt) expiry.title = new Date(grant.expiresAt).toLocaleString();
+  const revoke = document.createElement("button");
+  revoke.type = "button";
+  revoke.dataset.grantAction = "revoke";
+  revoke.textContent = "撤销";
+
+  const confirmation = document.createElement("div");
+  confirmation.className = "grant-revoke-confirm hidden";
+  const copy = document.createElement("span");
+  copy.textContent = "撤销后，下次匹配操作会重新请求批准。";
+  const cancel = document.createElement("button");
+  cancel.type = "button";
+  cancel.textContent = "取消";
+  const confirm = document.createElement("button");
+  confirm.type = "button";
+  confirm.className = "grant-revoke-danger";
+  confirm.dataset.grantAction = "confirm-revoke";
+  confirm.textContent = "确认撤销";
+  confirmation.append(copy, cancel, confirm);
+
+  revoke.addEventListener("click", () => {
+    revoke.classList.add("hidden");
+    confirmation.classList.remove("hidden");
+    confirm.focus();
+  });
+  cancel.addEventListener("click", () => {
+    confirmation.classList.add("hidden");
+    revoke.classList.remove("hidden");
+    revoke.focus();
+  });
+  confirm.addEventListener("click", async () => {
+    for (const button of [cancel, confirm]) button.disabled = true;
+    try {
+      const { grants } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/grants/${encodeURIComponent(grant.id)}/revoke`, {
+        method: "POST",
+        body: { scope: grant.scope, reason: "用户在 Web UI 中撤销授权" },
+      });
+      renderGrants(grants);
+      toast("授权已撤销；下次匹配操作将重新请求批准");
+    } catch {
+      for (const button of [cancel, confirm]) button.disabled = false;
+    }
+  });
+
+  foot.append(expiry, revoke);
+  box.append(head, resources, foot, confirmation);
+  return box;
+}
+
+function setGrantActionAvailability(busy) {
+  elements.grantList.querySelectorAll("[data-grant-action]").forEach((button) => {
+    button.disabled = busy;
+    button.title = busy ? "任务运行期间不能撤销授权" : "";
+  });
+}
+
 function openInspector() {
   elements.inspector.classList.add("open");
   elements.inspector.setAttribute("aria-hidden", "false");
@@ -508,6 +925,7 @@ function closeInspector() {
 }
 
 function selectTab(name) {
+  state.inspectorTab = name;
   document.querySelectorAll(".tab").forEach((tab) => {
     const active = tab.dataset.tab === name;
     tab.classList.toggle("active", active);
@@ -515,6 +933,8 @@ function selectTab(name) {
   });
   $("#events-view").classList.toggle("hidden", name !== "events");
   $("#memory-view").classList.toggle("hidden", name !== "memory");
+  $("#grants-view").classList.toggle("hidden", name !== "grants");
+  if (name === "grants") void loadGrants();
 }
 
 function renderMarkdown(source) {
@@ -693,6 +1113,7 @@ function toolLabel(name) {
     memory_save: "保存长期记忆",
     memory_search: "搜索长期记忆",
     remember: "保存会话记忆",
+    update_plan: "更新任务计划",
   };
   return labels[name] || name || "工具调用";
 }
@@ -719,6 +1140,12 @@ function phaseClass(phase) {
 function eventLabel(type) {
   return ({
     "message.user": "收到任务",
+    "objective.created": "建立当前目标",
+    "objective.completed": "目标完成",
+    "objective.failed": "目标失败",
+    "objective.cancelled": "目标取消",
+    "objective.paused": "暂停旧目标",
+    "plan.updated": "更新任务计划",
     "message.assistant": "Agent 回复",
     "model.requested": "请求模型",
     "model.completed": "模型返回",
@@ -742,6 +1169,13 @@ function eventLabel(type) {
     "approval.granted": "审批通过",
     "approval.denied": "审批拒绝",
     "approval.stale": "审批已失效",
+    "tool.grant_issued": "签发会话授权",
+    "tool.grant_consumed": "消费单次授权",
+    "tool.grant_revoked": "撤销会话授权",
+    "tool.project_grant_issued": "签发项目授权",
+    "tool.project_grant_revoked": "撤销项目授权",
+    "permission.profile_changed": "切换权限档位",
+    "permission.profile_downgraded": "安全降级权限档位",
     "session.turn_completed": "任务完成",
     "session.failed": "任务失败",
     "session.cancelled": "任务取消",

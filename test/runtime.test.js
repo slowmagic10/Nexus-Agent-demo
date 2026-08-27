@@ -3,19 +3,87 @@ import test from "node:test";
 import { AgentRuntime } from "../src/core/agent.js";
 import { AgentSession } from "../src/core/session.js";
 import { createSession, reduceSession } from "../src/core/state.js";
-import { redactSensitiveText } from "../src/security/redact.js";
+import { redactSensitiveText, redactSensitiveValue } from "../src/security/redact.js";
 
 test("模型用量和耗时进入状态指标", async () => {
   const runtime = createRuntime({
     provider: {
-      complete: async () => ({ text: "完成", toolCalls: [], usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }),
+      complete: async () => ({ text: "完成", toolCalls: [], finishReason: "stop", usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 } }),
     },
   });
   await runtime.runTurn("测试", async () => false);
   assert.equal(runtime.state.phase, "completed");
   assert.equal(runtime.state.metrics.totalTokens, 14);
   assert.equal(runtime.state.metrics.modelCalls, 1);
-  assert.ok(runtime.state.events.some((event) => event.type === "model.completed"));
+  assert.equal(runtime.state.events.find((event) => event.type === "model.completed").finishReason, "stop");
+});
+
+test("默认无限步骤与累计 Token 预算允许持续工具循环直到模型完成", async () => {
+  let calls = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        calls += 1;
+        return calls <= 3
+          ? {
+              text: "继续执行",
+              toolCalls: [{ id: `budget-call-${calls}`, name: "noop", arguments: {} }],
+              usage: { inputTokens: 17_000, outputTokens: 500, totalTokens: 17_500 },
+            }
+          : {
+              text: "目标已完成并验证",
+              toolCalls: [],
+              finishReason: "stop",
+              usage: { inputTokens: 17_000, outputTokens: 500, totalTokens: 17_500 },
+            };
+      },
+    },
+    tools: {
+      schemas: () => [],
+      get: () => ({ approval: "never", effects: ["read"], idempotency: "safe", execute: async () => "ok" }),
+    },
+  });
+
+  await runtime.runTurn("完成需要多轮工具调用的任务", async () => false);
+
+  assert.equal(calls, 4);
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(runtime.state.messages.at(-1).content, "目标已完成并验证");
+});
+
+test("显式累计 Token 预算在下一工具启动前停止并闭合工具协议", async () => {
+  let modelCalls = 0;
+  let executions = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        modelCalls += 1;
+        return {
+          text: "继续执行",
+          toolCalls: [{ id: `limited-call-${modelCalls}`, name: "noop", arguments: {} }],
+          usage: { inputTokens: 19_500, outputTokens: 500, totalTokens: 20_000 },
+        };
+      },
+    },
+    toolHost: {
+      schemas: () => [],
+      execute: async (call, context) => {
+        executions += 1;
+        await context.session.dispatch({ type: "TOOL_REQUESTED", call });
+        await context.session.dispatch({ type: "TOOL_RESULT", call, ok: true, result: "ok", durationMs: 1 });
+      },
+    },
+    maxTokensPerTurn: 30_000,
+  });
+
+  await runtime.runTurn("执行直到预算边界", async () => false);
+
+  assert.equal(modelCalls, 2);
+  assert.equal(executions, 1, runtime.state.lastError);
+  assert.equal(runtime.state.phase, "failed");
+  assert.match(runtime.state.lastError, /累计 Token 用量超过预算 30000/);
+  assert.equal(runtime.state.messages.at(-1).role, "tool");
+  assert.match(runtime.state.messages.at(-1).content, /没有执行/);
 });
 
 test("运行时按预算压缩历史 turn 并留下 durable audit event", async () => {
@@ -101,6 +169,29 @@ test("取消会为未闭合工具调用补充安全结果", () => {
 test("敏感凭据会从工具日志文本中脱敏", () => {
   assert.equal(redactSensitiveText("OPENAI_API_KEY=sk-1234567890abcdefghijklmnop"), "OPENAI_API_KEY=[REDACTED]");
   assert.equal(redactSensitiveText("Authorization: Bearer secret-token"), "Authorization: Bearer [REDACTED]");
+  assert.equal(redactSensitiveText("sshpass -p plain-secret ssh user@host"), "sshpass -p [REDACTED] ssh user@host");
+  assert.equal(redactSensitiveText("expect /tmp/login.exp host user 'plain-secret' 'uptime'"), "expect /tmp/login.exp host user [REDACTED] 'uptime'");
+  assert.deepEqual(
+    redactSensitiveValue({ password: "plain-secret", totalTokens: 14 }),
+    { password: "[REDACTED]", totalTokens: 14 },
+  );
+});
+
+test("Assistant 正文中的高熵引号凭据会在持久化前脱敏", async () => {
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => ({
+        text: "登录密码是 'FakePass@4321'，不要公开。",
+        toolCalls: [],
+      }),
+    },
+  });
+
+  await runtime.runTurn("检查输出脱敏", async () => false);
+
+  const content = runtime.state.messages.at(-1).content;
+  assert.equal(content.includes("FakePass@4321"), false);
+  assert.match(content, /\[REDACTED\]/);
 });
 
 test("无限步骤模式允许单次任务执行超过默认八步", async () => {
@@ -250,6 +341,7 @@ function createRuntime({
   state,
   maxInputTokens,
   maxSteps,
+  maxTokensPerTurn,
   tools,
   retrieveMemory,
   reconcile,
@@ -275,5 +367,6 @@ function createRuntime({
     flushMemory,
     maxInputTokens,
     maxSteps,
+    maxTokensPerTurn,
   });
 }

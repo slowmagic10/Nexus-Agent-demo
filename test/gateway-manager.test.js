@@ -5,6 +5,12 @@ import path from "node:path";
 import test from "node:test";
 import { GatewaySessionManager } from "../src/gateway/session-manager.js";
 import { SessionStore } from "../src/persistence/session-store.js";
+import {
+  createProjectGrant,
+  createSessionGrant,
+  issueSessionGrant,
+} from "../src/tools/authorization.js";
+import { ProjectGrantStore } from "../src/tools/project-grant-store.js";
 
 test("关闭 Gateway 会取消仍在运行的任务", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-test-"));
@@ -34,6 +40,144 @@ test("关闭 Gateway 会取消仍在运行的任务", async (t) => {
 
   assert.equal((await manager.get(session.id)).phase, "cancelled");
   assert.equal((await manager.get(session.id)).lastError, "Gateway 正在关闭");
+});
+
+test("Gateway 可在模型运行中由用户显式打断任务", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-cancel-test-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: {
+      name: "interruptible-provider",
+      complete: async ({ signal }) => new Promise((resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      }),
+    },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const session = await manager.create();
+  await manager.sendMessage(session.id, "开始长任务");
+
+  await manager.cancel(session.id);
+  await waitFor(async () => (await manager.get(session.id)).phase === "cancelled");
+
+  const cancelled = await manager.get(session.id);
+  assert.equal(cancelled.phase, "cancelled");
+  assert.equal(cancelled.lastError, "用户通过 Gateway 取消了任务");
+  await assert.rejects(manager.cancel(session.id), /当前没有正在运行/);
+});
+
+test("Gateway 审批只接受当前卡片公开的 Grant scope", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-approval-scope-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: { name: "approval-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const state = await manager.create();
+  const entry = manager.sessions.get(state.id);
+  let resolved;
+  entry.approval = {
+    call: { id: "approval-scope-call" },
+    scopes: ["once", "session"],
+    resolve: (value) => { resolved = value; },
+  };
+
+  await assert.rejects(
+    manager.decideApproval(state.id, "approval-scope-call", true, "project"),
+    (error) => error.status === 400 && /不支持授权范围/.test(error.message),
+  );
+  assert.ok(entry.approval);
+  await manager.decideApproval(state.id, "approval-scope-call", true, "session");
+  assert.deepEqual(resolved, { approved: true, scope: "session" });
+});
+
+test("Gateway 只列出可用 Grant，并按真实 scope 撤销", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-project-grant-"));
+  const projectGrantStore = new ProjectGrantStore(path.join(workspace, "private", "project-grants.db"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: { name: "grant-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    projectGrantStore,
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    projectGrantStore.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const state = await manager.create();
+  const entry = manager.sessions.get(state.id);
+  const sessionGrant = createSessionGrant({
+    id: "session-grant-active",
+    sessionId: state.id,
+    workspace,
+    tool: "write_file",
+    capabilityHash: "cap-session",
+    policyVersion: "policy-session",
+    resources: [{ kind: "workspace_path", value: "notes/a.md", access: "write" }],
+  });
+  await issueSessionGrant(entry.session, sessionGrant);
+  const consumedGrant = createSessionGrant({
+    id: "once-grant-consumed",
+    sessionId: state.id,
+    workspace,
+    tool: "run_shell",
+    capabilityHash: "cap-once",
+    policyVersion: "policy-once",
+    resources: [{ kind: "shell_command", value: "npm test", access: "execute" }],
+    callId: "once-call",
+    argsHash: "once-args",
+  });
+  await issueSessionGrant(entry.session, consumedGrant);
+  await entry.session.dispatch({ type: "TOOL_GRANT_CONSUMED", grantId: consumedGrant.id, callId: "once-call" });
+  const grant = createProjectGrant({
+    workspace,
+    tool: "run_shell",
+    capabilityHash: "cap",
+    policyVersion: "policy",
+    resources: [{ kind: "shell_command", value: "npm test", access: "execute" }],
+  });
+  projectGrantStore.issue(grant);
+  const listed = await manager.listGrants(state.id);
+  assert.deepEqual(listed.session.map((item) => item.id), [sessionGrant.id]);
+  assert.equal(listed.project[0].id, grant.id);
+
+  await assert.rejects(
+    manager.revokeGrant(state.id, sessionGrant.id, "project", "错误 scope"),
+    (error) => error.status === 404,
+  );
+  await assert.rejects(
+    manager.revokeGrant(state.id, grant.id, "session", "错误 scope"),
+    (error) => error.status === 404,
+  );
+
+  const afterSessionRevoke = await manager.revokeGrant(state.id, sessionGrant.id, "session", "测试撤销 Session Grant");
+  assert.deepEqual(afterSessionRevoke.session, []);
+  assert.ok((await manager.get(state.id)).events.some((event) => event.type === "tool.grant_revoked"));
+
+  const grants = await manager.revokeGrant(state.id, grant.id, "project", "测试撤销");
+  assert.deepEqual(grants.project, []);
+  assert.ok((await manager.get(state.id)).events.some((event) => event.type === "tool.project_grant_revoked"));
 });
 
 test("Gateway 从指定游标补发事件后继续推送实时事件", async (t) => {
@@ -253,9 +397,164 @@ test("Gateway 可列出、批准和拒绝候选记忆", async (t) => {
   assert.ok(finalState.events.some((event) => event.type === "memory.candidate_rejected"));
 });
 
+test("Gateway 权限菜单按会话持久切换且运行中禁止变化", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-permission-test-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const host = { schemas: () => [], execute: async () => { throw new Error("不应执行"); } };
+  const provider = {
+    name: "permission-provider",
+    complete: async ({ signal }) => new Promise((resolve, reject) => {
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+    }),
+  };
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider,
+    tools: { schemas: () => [], get: () => null },
+    permissionToolHosts: { "read-only": host, "approval-required": host, "workspace-confirm": host, "workspace-untrusted": host, "workspace-auto": host },
+    defaultPermissionProfile: "workspace-auto",
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const created = await manager.create({ permissionProfile: "approval-required" });
+  assert.equal(created.permissionProfile, "approval-required");
+  assert.equal(manager.runtimeInfo().permission.modes.find((mode) => mode.id === "read-only").available, true);
+  assert.equal(manager.runtimeInfo().permission.modes.find((mode) => mode.id === "workspace-confirm").available, true);
+  assert.equal(manager.runtimeInfo().permission.modes.find((mode) => mode.id === "workspace-untrusted").available, true);
+  assert.equal(manager.runtimeInfo().permission.modes.find((mode) => mode.id === "danger-full-access").available, false);
+  const cautious = await manager.setPermissionProfile(created.id, "workspace-untrusted");
+  assert.equal(cautious.permissionProfile, "workspace-untrusted");
+  const confirm = await manager.setPermissionProfile(created.id, "workspace-confirm");
+  assert.equal(confirm.permissionProfile, "workspace-confirm");
+  const readOnly = await manager.setPermissionProfile(created.id, "read-only");
+  assert.equal(readOnly.permissionProfile, "read-only");
+  const changed = await manager.setPermissionProfile(created.id, "workspace-auto");
+  assert.equal(changed.permissionProfile, "workspace-auto");
+  assert.equal(store.load(created.id).permissionProfile, "workspace-auto");
+  assert.ok(changed.events.some((event) => event.type === "permission.profile_changed"));
+  await assert.rejects(manager.setPermissionProfile(created.id, "danger-full-access"), /权限档位不可用/);
+
+  await manager.sendMessage(created.id, "保持运行");
+  await assert.rejects(manager.setPermissionProfile(created.id, "approval-required"), /运行期间不能切换/);
+  await manager.cancel(created.id);
+});
+
+test("Gateway 完全访问要求可用 trusted-local Host 和显式二次确认", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-danger-permission-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const host = { schemas: () => [], execute: async () => { throw new Error("不应执行"); } };
+  const options = {
+    workspace,
+    provider: { name: "danger-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    permissionToolHosts: {
+      "approval-required": host,
+      "workspace-auto": host,
+      "danger-full-access": host,
+    },
+    defaultPermissionProfile: "workspace-auto",
+    systemPrompt: () => "test",
+    store,
+  };
+  assert.throws(
+    () => new GatewaySessionManager({ ...options, executionInfo: { id: "native-sandbox", isolation: "macos-seatbelt" } }),
+    /只能在 trusted-local Gateway/,
+  );
+  const manager = new GatewaySessionManager({
+    ...options,
+    executionInfo: { id: "local-workspace", isolation: "trusted-local" },
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  assert.equal(manager.runtimeInfo().permission.modes.find((mode) => mode.id === "danger-full-access").available, true);
+  await assert.rejects(manager.create({ permissionProfile: "danger-full-access" }), /需要显式风险确认/);
+  const session = await manager.create({
+    permissionProfile: "danger-full-access",
+    permissionConfirmation: "danger-full-access",
+  });
+  assert.equal(session.permissionProfile, "danger-full-access");
+
+  await manager.setPermissionProfile(session.id, "workspace-auto");
+  await assert.rejects(manager.setPermissionProfile(session.id, "danger-full-access"), /需要显式风险确认/);
+  const changed = await manager.setPermissionProfile(session.id, "danger-full-access", { confirmation: "danger-full-access" });
+  assert.equal(changed.permissionProfile, "danger-full-access");
+  const event = changed.events.findLast((item) => item.type === "permission.profile_changed");
+  assert.equal(event.riskAcknowledged, true);
+});
+
+test("Gateway 恢复和导入危险会话时不会复用历史确认", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-danger-resume-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const host = { schemas: () => [], execute: async () => { throw new Error("不应执行"); } };
+  const options = {
+    workspace,
+    provider: { name: "danger-resume-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    toolHost: host,
+    permissionToolHosts: {
+      "approval-required": host,
+      "workspace-auto": host,
+      "danger-full-access": host,
+    },
+    defaultPermissionProfile: "workspace-auto",
+    executionInfo: { id: "local-workspace", isolation: "trusted-local" },
+    systemPrompt: () => "test",
+    store,
+  };
+  const sourceManager = new GatewaySessionManager(options);
+  t.after(async () => {
+    await sourceManager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const resumable = await sourceManager.create({
+    permissionProfile: "danger-full-access",
+    permissionConfirmation: "danger-full-access",
+  });
+  const explicitlyResumable = await sourceManager.create({
+    permissionProfile: "danger-full-access",
+    permissionConfirmation: "danger-full-access",
+  });
+  const archive = await sourceManager.exportSession(resumable.id);
+  await sourceManager.close();
+
+  const resumedManager = new GatewaySessionManager(options);
+  t.after(() => resumedManager.close());
+  const resumed = await resumedManager.create({ resume: resumable.id });
+  assert.equal(resumed.permissionProfile, "workspace-auto");
+  assert.ok(resumed.events.some((event) => (
+    event.type === "permission.profile_downgraded"
+    && event.reason === "resume_requires_confirmation"
+  )));
+
+  const explicitlyResumed = await resumedManager.create({
+    resume: explicitlyResumable.id,
+    permissionConfirmation: "danger-full-access",
+  });
+  assert.equal(explicitlyResumed.permissionProfile, "danger-full-access");
+
+  const imported = await resumedManager.importSession(archive, { id: "session-danger-imported" });
+  assert.equal(imported.permissionProfile, "workspace-auto");
+  assert.ok(imported.events.some((event) => (
+    event.type === "permission.profile_downgraded"
+    && event.reason === "journal_import"
+  )));
+});
+
 async function waitFor(predicate) {
   for (let index = 0; index < 50; index += 1) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 2));
   }
   throw new Error("等待事件超时");

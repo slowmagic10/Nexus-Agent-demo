@@ -6,6 +6,7 @@ import { promises as fs } from "node:fs";
 import { createSession, reduceSession } from "./core/state.js";
 import { AgentRuntime } from "./core/agent.js";
 import { AgentSession } from "./core/session.js";
+import { CapabilityRuntime } from "./capabilities/runtime.js";
 import { composeRuntimeConfig, createConfiguredProvider, inspectRuntimeConfig } from "./config/composer.js";
 import { createToolRegistry } from "./tools/registry.js";
 import { ToolHost } from "./tools/host.js";
@@ -17,7 +18,10 @@ import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { loadLocalEnvironment } from "./local-environment.js";
 import { createLocalMemoryScope } from "./memory/scope.js";
+import { createWorkspaceExecution } from "./execution/factory.js";
+import { createPermissionProfile } from "./tools/permission-profile.js";
 import { createModelMemoryExtractor, MemoryFlushPolicy } from "./memory/flush-policy.js";
+import { defaultProjectGrantStoreFile, ProjectGrantStore } from "./tools/project-grant-store.js";
 import {
   discardMemoryMutation,
   reconcileMemoryOutbox,
@@ -73,14 +77,29 @@ if (importAs) {
 
 const context = await loadWorkspaceContext(workspace);
 
-const mcp = await connectMcpTools(await loadMcpConfig(config.mcp.file, workspace));
+const capabilityRuntime = new CapabilityRuntime();
+const workspaceExecution = createWorkspaceExecution(config, { environment: process.env });
+const permissionProfile = createPermissionProfile({
+  name: config.permission.profile,
+  workspace,
+  executionType: config.execution.type,
+  networkTargets: config.network.targets,
+});
 const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
-  extraTools: mcp.tools,
   memory: store.memory,
+  capabilityRuntime,
+  workspaceExecution,
+  accessPolicy: permissionProfile,
 });
-const toolHost = new ToolHost({ registry: tools, policy: await loadWorkspacePolicy(workspace) });
+const mcp = await connectMcpTools(await loadMcpConfig(config.mcp.file, workspace), { capabilityRuntime });
+const projectGrantStore = new ProjectGrantStore(defaultProjectGrantStoreFile(process.env));
+const toolHost = new ToolHost({
+  registry: tools,
+  policy: await loadWorkspacePolicy(workspace, { profile: permissionProfile }),
+  projectGrantStore,
+});
 const ui = new TerminalUI();
 let initialState = resumeTarget === "latest"
   ? store.latest(workspace)
@@ -92,6 +111,7 @@ if (resumeTarget && !initialState) {
   store.close();
   ui.close();
   await mcp.close();
+  projectGrantStore.close();
   console.error(resumeTarget === "latest" ? "没有可恢复的会话。" : `未找到会话：${resumeTarget}`);
   process.exit(1);
 }
@@ -120,6 +140,7 @@ const runtime = new AgentRuntime({
   reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: store.memory, signal }),
   flushMemory: (input) => memoryFlushPolicy.flush(input),
   maxSteps: config.runtime.maxSteps,
+  maxTokensPerTurn: config.runtime.maxTokensPerTurn,
 });
 
 ui.render(runtime.state);
@@ -235,6 +256,7 @@ while (true) {
 ui.close();
 store.close();
 await mcp.close();
+projectGrantStore.close();
 console.log(`已退出 Nexus 基础版；会话 ${runtime.state.id} 已保存。`);
 
 function printSessions(sessions) {

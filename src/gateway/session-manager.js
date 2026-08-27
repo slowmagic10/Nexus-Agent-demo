@@ -13,26 +13,78 @@ import {
   retryMemoryMutation,
 } from "../memory/outbox.js";
 import { ToolHost } from "../tools/host.js";
+import { PermissionToolHostRouter } from "../tools/permission-router.js";
+import { revokeSessionGrant } from "../tools/authorization.js";
+
+const PERMISSION_MODE_INFO = Object.freeze([
+  Object.freeze({
+    id: "read-only",
+    label: "只读模式",
+    description: "只读取和分析，禁止修改、联网和非只读命令",
+    icon: "eye",
+  }),
+  Object.freeze({
+    id: "workspace-confirm",
+    label: "每次确认",
+    description: "读取自动执行，写入和命令请求确认并可记住到本会话",
+    icon: "hand",
+  }),
+  Object.freeze({
+    id: "workspace-untrusted",
+    label: "谨慎工作区",
+    description: "自动编辑文件，Shell 仅自动执行明确只读检查",
+    icon: "shield",
+  }),
+  Object.freeze({
+    id: "workspace-auto",
+    label: "帮我批准",
+    description: "沙箱内安全操作自动执行，仅风险操作请求批准",
+    icon: "auto",
+  }),
+  Object.freeze({
+    id: "danger-full-access",
+    label: "完全访问",
+    description: "可不受限制访问互联网和宿主文件",
+    icon: "warning",
+    dangerous: true,
+  }),
+]);
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, tools, toolHost, workspacePolicy, systemPrompt, store, memory = store?.memory, memoryScope, maxSteps, memoryFlushPolicy }) {
+  constructor({ workspace, provider, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, memoryScope, maxSteps, maxTokensPerTurn, memoryFlushPolicy }) {
     this.workspace = workspace;
     this.provider = provider;
     this.systemPrompt = systemPrompt;
     this.store = store;
     this.memory = assertMemoryInterface(memory);
+    this.projectGrantStore = projectGrantStore;
     assertMemoryInspection(this.memory);
     this.defaultMemoryScope = createMemoryScope(memoryScope || { workspace });
     this.memoryFlushPolicy = memoryFlushPolicy || new MemoryFlushPolicy({
       memory: this.memory,
       extractCandidates: createModelMemoryExtractor(provider),
     });
-    this.toolHost = toolHost || new ToolHost({ registry: tools, policy: workspacePolicy });
+    const fallbackHost = toolHost || new ToolHost({ registry: tools, policy: workspacePolicy });
+    const hosts = permissionToolHosts || { [defaultPermissionProfile || workspacePolicy?.profile?.name || "approval-required"]: fallbackHost };
+    if (Object.hasOwn(hosts, "danger-full-access") && executionInfo?.isolation !== "trusted-local") {
+      throw new Error("danger-full-access Tool Host 只能在 trusted-local Gateway 中注册");
+    }
+    this.toolHost = new PermissionToolHostRouter({
+      hosts,
+      defaultProfile: defaultPermissionProfile || Object.keys(hosts)[0],
+    });
+    this.defaultPermissionProfile = this.toolHost.defaultProfile;
+    this.safePermissionProfile = ["workspace-auto", "workspace-confirm", "approval-required"].find((profile) => this.toolHost.has(profile)) || null;
+    if (this.toolHost.has("danger-full-access") && !this.safePermissionProfile) {
+      throw new Error("启用 danger-full-access 时必须同时提供安全 Permission Profile");
+    }
+    this.executionInfo = executionInfo;
     this.maxSteps = maxSteps;
+    this.maxTokensPerTurn = maxTokensPerTurn;
     this.sessions = new Map();
   }
 
-  async create({ resume } = {}) {
+  async create({ resume, permissionProfile, permissionConfirmation } = {}) {
     let state = resume === "latest"
       ? this.store.latest(this.workspace)
       : resume
@@ -47,8 +99,26 @@ export class GatewaySessionManager {
     if (existing) return existing.state;
 
     const resumed = Boolean(state);
-    state ||= createSession({ provider: this.provider.name, workspace: this.workspace, memoryScope: this.defaultMemoryScope });
+    const selectedProfile = resumedProfile(state, permissionProfile, this.defaultPermissionProfile);
+    const downgradeDangerousResume = resumed
+      && selectedProfile === "danger-full-access"
+      && permissionConfirmation !== "danger-full-access";
+    const activeProfile = downgradeDangerousResume ? this.safePermissionProfile : selectedProfile;
+    this.#assertPermissionProfile(activeProfile, permissionConfirmation);
+    state ||= createSession({
+      provider: this.provider.name,
+      workspace: this.workspace,
+      memoryScope: this.defaultMemoryScope,
+      permissionProfile: activeProfile,
+    });
     const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
+    if (downgradeDangerousResume) {
+      await session.dispatch({
+        type: "PERMISSION_PROFILE_DOWNGRADED",
+        profile: activeProfile,
+        reason: "resume_requires_confirmation",
+      });
+    }
 
     const entry = {
       state: session.state,
@@ -70,6 +140,7 @@ export class GatewaySessionManager {
       reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
       flushMemory: (input) => this.memoryFlushPolicy.flush(input),
       maxSteps: this.maxSteps,
+      maxTokensPerTurn: this.maxTokensPerTurn,
     });
     session.subscribe((next) => this.update(entry, next));
     this.sessions.set(state.id, entry);
@@ -82,6 +153,37 @@ export class GatewaySessionManager {
 
   list() {
     return this.store.list(this.workspace);
+  }
+
+  runtimeInfo() {
+    return {
+      execution: this.executionInfo,
+      runtime: {
+        maxSteps: this.maxSteps === Infinity ? "unlimited" : this.maxSteps,
+        maxTokensPerTurn: this.maxTokensPerTurn === Infinity ? "unlimited" : this.maxTokensPerTurn,
+      },
+      permission: {
+        defaultProfile: this.defaultPermissionProfile,
+        modes: PERMISSION_MODE_INFO.map((mode) => ({
+          ...mode,
+          available: this.toolHost.has(mode.id),
+          ...(!this.toolHost.has(mode.id) ? { unavailableReason: mode.dangerous ? "完全访问仅在显式 --execution=local 的 Gateway 中可用" : "当前运行环境未启用" } : {}),
+        })),
+      },
+    };
+  }
+
+  async setPermissionProfile(id, profile, { confirmation } = {}) {
+    this.#assertPermissionProfile(profile, confirmation);
+    const entry = await this.ensureLoaded(id);
+    if (entry.run) throw new GatewayError(409, "会话运行期间不能切换权限档位");
+    if (entry.state.permissionProfile === profile) return entry.state;
+    await entry.session.dispatch({
+      type: "PERMISSION_PROFILE_CHANGED",
+      profile,
+      riskAcknowledged: profile === "danger-full-access",
+    });
+    return entry.state;
   }
 
   async get(id) {
@@ -114,7 +216,8 @@ export class GatewaySessionManager {
 
   async importSession(archive, { id } = {}) {
     try {
-      return this.store.importJournal(archive, { id, workspace: this.workspace });
+      const imported = this.store.importJournal(archive, { id, workspace: this.workspace });
+      return await this.#downgradeImportedDangerousSession(imported);
     } catch (error) {
       if (/会话已存在/.test(error.message)) throw new GatewayError(409, error.message);
       throw new GatewayError(400, error.message);
@@ -130,7 +233,12 @@ export class GatewaySessionManager {
 
     entry.run = entry.runtime.runTurn(content.trim(), (call, description) => (
       new Promise((resolve) => {
-        entry.approval = { call, description, resolve };
+        entry.approval = {
+          call,
+          description,
+          scopes: entry.state.pendingApproval?.approvalScopes || ["once"],
+          resolve,
+        };
       })
     )).finally(() => {
       entry.run = null;
@@ -139,16 +247,61 @@ export class GatewaySessionManager {
     return entry.state;
   }
 
-  async decideApproval(id, callId, approved) {
+  async decideApproval(id, callId, approved, scope = "once") {
     if (typeof approved !== "boolean") throw new GatewayError(400, "approved 必须是布尔值");
     const entry = await this.ensureLoaded(id);
     if (!entry.approval || entry.approval.call.id !== callId) {
       throw new GatewayError(409, "该工具调用当前不在等待审批");
     }
+    if (approved && !entry.approval.scopes.includes(scope)) {
+      throw new GatewayError(400, `当前审批不支持授权范围：${scope}`);
+    }
     const { resolve } = entry.approval;
     entry.approval = null;
-    resolve(approved);
+    resolve(approved ? { approved: true, scope } : false);
     return entry.state;
+  }
+
+  async listGrants(id) {
+    const entry = await this.ensureLoaded(id);
+    const now = Date.now();
+    const session = (entry.state.toolGrants || []).filter((grant) => (
+      !grant.revokedAt && !grant.consumedAt && new Date(grant.expiresAt).getTime() > now
+    ));
+    const project = this.projectGrantStore?.list({ workspace: entry.state.workspace }) || [];
+    return { session, project };
+  }
+
+  async revokeGrant(id, grantId, scope, reason = "用户通过 Gateway 撤销授权") {
+    const entry = await this.ensureLoaded(id);
+    if (entry.run) throw new GatewayError(409, "会话运行期间不能撤销授权");
+    try {
+      if (scope === "session" || scope === "once") {
+        const now = Date.now();
+        const grant = (entry.state.toolGrants || []).find((item) => (
+          item.id === grantId
+          && !item.revokedAt
+          && !item.consumedAt
+          && new Date(item.expiresAt).getTime() > now
+          && (item.scope || (item.callId || item.argsHash ? "once" : "session")) === scope
+        ));
+        if (!grant) throw new GatewayError(404, `未找到当前会话的 ${scope} Grant：${grantId}`);
+        await revokeSessionGrant(entry.session, grantId, reason);
+      } else if (scope === "project") {
+        if (!this.projectGrantStore) throw new GatewayError(400, "当前运行环境未配置 Project Grant Store");
+        const grant = this.projectGrantStore.list({ workspace: entry.state.workspace }).find((item) => item.id === grantId);
+        if (!grant) throw new GatewayError(404, `未找到当前项目的 Grant：${grantId}`);
+        this.projectGrantStore.revoke(grantId, reason);
+        await entry.session.dispatch({ type: "TOOL_PROJECT_GRANT_REVOKED", grantId, reason });
+      } else {
+        throw new GatewayError(400, `授权范围无效：${scope || "未指定"}`);
+      }
+      return await this.listGrants(id);
+    } catch (error) {
+      if (error instanceof GatewayError) throw error;
+      if (/未找到/.test(error.message)) throw new GatewayError(404, error.message);
+      throw error;
+    }
   }
 
   async cancel(id) {
@@ -330,6 +483,25 @@ export class GatewaySessionManager {
     if (entry.run) throw new GatewayError(409, "会话运行期间不能处理 Memory mutation");
   }
 
+  #assertPermissionProfile(profile, confirmation = null) {
+    if (typeof profile !== "string" || !this.toolHost.has(profile)) {
+      throw new GatewayError(400, `权限档位不可用：${profile || "未指定"}`);
+    }
+    if (profile === "danger-full-access" && confirmation !== "danger-full-access") {
+      throw new GatewayError(400, "启用完全访问需要显式风险确认");
+    }
+  }
+
+  async #downgradeImportedDangerousSession(state) {
+    if (state.permissionProfile !== "danger-full-access") return state;
+    const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
+    return await session.dispatch({
+      type: "PERMISSION_PROFILE_DOWNGRADED",
+      profile: this.safePermissionProfile,
+      reason: "journal_import",
+    });
+  }
+
   async #candidate(memoryId, scope) {
     const record = await this.memory.get(memoryId, { scope }, { includeInactive: true });
     if (!record || record.status !== "candidate") {
@@ -342,6 +514,14 @@ export class GatewaySessionManager {
     if (/未找到.*Memory mutation/.test(error.message)) return new GatewayError(404, error.message);
     return error instanceof GatewayError ? error : new GatewayError(400, error.message);
   }
+}
+
+function resumedProfile(state, requested, fallback) {
+  if (state) {
+    if (requested && requested !== state.permissionProfile) throw new GatewayError(409, "恢复会话时不能覆盖其权限档位");
+    return state.permissionProfile || fallback;
+  }
+  return requested || fallback;
 }
 
 export class GatewayError extends Error {

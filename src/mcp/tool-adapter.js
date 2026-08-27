@@ -1,17 +1,20 @@
 // FOUNDATION — maps MCP capabilities into Nexus tool registry entries.
 import { McpStdioClient } from "./stdio-client.js";
 
-export async function connectMcpTools(configs) {
+export async function connectMcpTools(configs, { capabilityRuntime = null } = {}) {
+  if (capabilityRuntime) assertCapabilityRuntime(capabilityRuntime);
   const clients = [];
   const tools = [];
   const names = new Set();
+  const owners = new Set();
   try {
     for (const config of configs) {
+      const toolStart = tools.length;
       const client = new McpStdioClient(config);
       clients.push(client);
       const initialized = await client.initialize();
-      const serverTools = initialized.capabilities?.tools ? await client.listTools() : [];
-      for (const tool of serverTools) {
+      const listedTools = initialized.capabilities?.tools ? await client.listTools() : [];
+      for (const tool of listedTools) {
         validateTool(config.name, tool);
         const exposedName = exposeName(config.name, tool.name);
         if (names.has(exposedName)) throw new Error(`MCP 工具名称冲突：${exposedName}`);
@@ -82,15 +85,40 @@ export async function connectMcpTools(configs) {
           execute: async ({ name, arguments: args = {} }, context) => formatPromptResult(await client.getPrompt(name, args, context.signal)),
         });
       }
+      if (capabilityRuntime) {
+        const owner = `mcp:${config.name}`;
+        owners.add(owner);
+        capabilityRuntime.register({
+          kind: "mcp_server",
+          name: config.name,
+          owner,
+          value: { name: config.name, serverInfo: initialized.serverInfo },
+          dispose: () => client.close(),
+        });
+        for (const tool of tools.slice(toolStart)) {
+          capabilityRuntime.register({ kind: "tool", name: tool.name, owner, value: tool });
+        }
+      }
     }
     return {
       tools,
       servers: configs.map((config) => config.name),
-      close: () => Promise.allSettled(clients.map((client) => client.close())),
+      close: () => capabilityRuntime
+        ? Promise.all([...owners].map((owner) => capabilityRuntime.revokeOwner(owner, "MCP connection closed")))
+        : Promise.allSettled(clients.map((client) => client.close())),
     };
   } catch (error) {
+    if (capabilityRuntime) {
+      await Promise.allSettled([...owners].map((owner) => capabilityRuntime.revokeOwner(owner, "MCP initialization failed")));
+    }
     await Promise.allSettled(clients.map((client) => client.close()));
     throw error;
+  }
+}
+
+function assertCapabilityRuntime(runtime) {
+  if (typeof runtime.register !== "function" || typeof runtime.revokeOwner !== "function") {
+    throw new Error("MCP Adapter 需要支持 register/revokeOwner 的 Capability Runtime");
   }
 }
 

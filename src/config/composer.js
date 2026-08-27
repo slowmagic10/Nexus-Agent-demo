@@ -3,11 +3,20 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { DemoProvider } from "../providers/demo.js";
 import { OpenAICompatibleProvider } from "../providers/openai-compatible.js";
-import { formatMaxSteps, parseMaxSteps } from "../runtime-options.js";
+import {
+  formatMaxSteps,
+  formatMaxTokensPerTurn,
+  parseMaxSteps,
+  parseMaxTokensPerTurn,
+} from "../runtime-options.js";
+import { normalizeDockerImage } from "../execution/docker-options.js";
+import { normalizeNetworkTargets } from "../execution/network-target.js";
 
 const PROFILE_FILE = "nexus.config.json";
 const LOCAL_FILE = path.join(".nexus", "config.local.json");
 const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible"]);
+const EXECUTION_TYPES = new Set(["native", "local", "docker"]);
+const SAFE_PERMISSION_PROFILES = new Set(["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto"]);
 
 export async function composeRuntimeConfig({
   args = [],
@@ -27,7 +36,12 @@ export async function composeRuntimeConfig({
     "provider.apiKey": null,
     "provider.baseUrl": "https://api.openai.com/v1",
     "provider.model": "gpt-4.1-mini",
-    "runtime.maxSteps": 8,
+    "runtime.maxSteps": Infinity,
+    "runtime.maxTokensPerTurn": Infinity,
+    "execution.type": "native",
+    "execution.dockerImage": null,
+    "permission.profile": "workspace-auto",
+    "network.targets": [],
     "mcp.file": null,
     "gateway.port": 4317,
   };
@@ -52,7 +66,16 @@ export async function composeRuntimeConfig({
       baseUrl: values["provider.baseUrl"],
       model: values["provider.model"],
     },
-    runtime: { maxSteps: values["runtime.maxSteps"] },
+    runtime: {
+      maxSteps: values["runtime.maxSteps"],
+      maxTokensPerTurn: values["runtime.maxTokensPerTurn"],
+    },
+    execution: {
+      type: values["execution.type"],
+      dockerImage: values["execution.dockerImage"],
+    },
+    permission: { profile: values["permission.profile"] },
+    network: { targets: values["network.targets"] },
     mcp: { file: values["mcp.file"] },
     gateway: { port: values["gateway.port"] },
     printConfig: args.includes("--print-config"),
@@ -83,7 +106,13 @@ export function inspectRuntimeConfig(config) {
       baseUrl: config.provider.baseUrl,
       model: config.provider.model,
     },
-    runtime: { maxSteps: formatMaxSteps(config.runtime.maxSteps) },
+    runtime: {
+      maxSteps: formatMaxSteps(config.runtime.maxSteps),
+      maxTokensPerTurn: formatMaxTokensPerTurn(config.runtime.maxTokensPerTurn),
+    },
+    execution: { ...config.execution },
+    permission: { ...config.permission },
+    network: { targets: [...config.network.targets] },
     mcp: { file: config.mcp.file },
     gateway: { port: config.gateway.port },
     sources: config.sources,
@@ -115,8 +144,9 @@ async function readConfigFile(file, { label, allowApiKey }) {
   }
   if (payload.runtime !== undefined) {
     assertObject(payload.runtime, `${label}.runtime`);
-    assertKnownKeys(payload.runtime, new Set(["maxSteps"]), `${label}.runtime`);
+    assertKnownKeys(payload.runtime, new Set(["maxSteps", "maxTokensPerTurn"]), `${label}.runtime`);
     copyDefined(values, "runtime.maxSteps", payload.runtime.maxSteps);
+    copyDefined(values, "runtime.maxTokensPerTurn", payload.runtime.maxTokensPerTurn);
   }
   if (payload.mcp !== undefined) {
     assertObject(payload.mcp, `${label}.mcp`);
@@ -141,6 +171,11 @@ function applyEnvironment(values, sources, env, localEnvironment) {
     OPENAI_BASE_URL: "provider.baseUrl",
     OPENAI_MODEL: "provider.model",
     NEXUS_MAX_STEPS: "runtime.maxSteps",
+    NEXUS_MAX_TOKENS_PER_TURN: "runtime.maxTokensPerTurn",
+    NEXUS_EXECUTION: "execution.type",
+    NEXUS_DOCKER_IMAGE: "execution.dockerImage",
+    NEXUS_PERMISSION_PROFILE: "permission.profile",
+    NEXUS_NETWORK_TARGETS: "network.targets",
     NEXUS_MCP_CONFIG: "mcp.file",
     NEXUS_GATEWAY_PORT: "gateway.port",
   };
@@ -148,6 +183,9 @@ function applyEnvironment(values, sources, env, localEnvironment) {
     if (env[environmentKey] === undefined || env[environmentKey] === "") continue;
     values[configKey] = env[environmentKey];
     sources[configKey] = environmentSource(environmentKey, localEnvironment);
+  }
+  if (typeof values["network.targets"] === "string") {
+    values["network.targets"] = values["network.targets"].split(",").map((value) => value.trim()).filter(Boolean);
   }
 }
 
@@ -158,6 +196,10 @@ function applyCli(values, sources, args) {
     model: "provider.model",
     "base-url": "provider.baseUrl",
     "max-steps": "runtime.maxSteps",
+    "max-tokens-per-turn": "runtime.maxTokensPerTurn",
+    execution: "execution.type",
+    "docker-image": "execution.dockerImage",
+    "permission-profile": "permission.profile",
     mcp: "mcp.file",
     port: "gateway.port",
   };
@@ -166,6 +208,11 @@ function applyCli(values, sources, args) {
     if (value === undefined) continue;
     values[configKey] = value;
     sources[configKey] = "cli";
+  }
+  const networkTargets = args.filter((value) => value.startsWith("--network-target=")).map((value) => value.slice("--network-target=".length));
+  if (networkTargets.length) {
+    values["network.targets"] = networkTargets;
+    sources["network.targets"] = "cli";
   }
   if (args.includes("--demo")) {
     values["provider.type"] = "demo";
@@ -183,6 +230,21 @@ function validateValues(values) {
     throw new Error("provider.apiKey 必须是字符串");
   }
   values["runtime.maxSteps"] = parseMaxSteps(values["runtime.maxSteps"]);
+  values["runtime.maxTokensPerTurn"] = parseMaxTokensPerTurn(values["runtime.maxTokensPerTurn"]);
+  if (!EXECUTION_TYPES.has(values["execution.type"])) throw new Error("execution.type 必须是 native、local 或 docker");
+  if (values["execution.type"] === "docker") {
+    if (values["execution.dockerImage"] === null) throw new Error("Docker 执行需要显式配置 execution.dockerImage");
+    values["execution.dockerImage"] = normalizeDockerImage(values["execution.dockerImage"]);
+  } else if (values["execution.dockerImage"] !== null) {
+    throw new Error("execution.dockerImage 只能与 execution.type=docker 一起使用");
+  }
+  if (!SAFE_PERMISSION_PROFILES.has(values["permission.profile"])) {
+    throw new Error("permission.profile 必须是安全档位 read-only、workspace-confirm、workspace-auto、workspace-untrusted 或兼容档位 approval-required");
+  }
+  values["network.targets"] = normalizeNetworkTargets(values["network.targets"]);
+  if (values["network.targets"].length && values["execution.type"] !== "native") {
+    throw new Error("network.targets 首版只支持 execution.type=native");
+  }
   if (values["mcp.file"] !== null && (typeof values["mcp.file"] !== "string" || !values["mcp.file"].trim())) {
     throw new Error("mcp.file 必须是非空字符串或 null");
   }

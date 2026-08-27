@@ -45,11 +45,11 @@
             <button id="theme-toggle" class="icon-button theme-toggle" aria-label="切换到浅色主题" aria-pressed="false">浅色</button>
             <button id="debug-toggle" class="icon-button" aria-label="打开调试抽屉" aria-expanded="false">调试</button>
             <button id="export-session" class="icon-button" disabled>导出</button>
-            <button id="cancel-run" class="icon-button danger" disabled>停止</button>
           </div>
         </header>
 
         <section class="conversation">
+          <section id="plan-panel" class="plan-panel hidden" aria-label="当前任务计划"></section>
           <div id="messages" class="messages">
             <div class="welcome">
               <div class="welcome-mark">N</div>
@@ -68,17 +68,70 @@
             <div class="composer-foot">
               <div class="composer-context">
                 <span id="composer-provider">本地模型</span>
-                <span>逐次审批</span>
+                <div class="permission-selector">
+                  <button id="permission-trigger" class="permission-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+                    <span class="permission-trigger-icon">◔</span>
+                    <span id="permission-label">帮我批准</span>
+                    <span class="permission-chevron">⌃</span>
+                  </button>
+                  <div id="permission-menu" class="permission-menu hidden" role="listbox" aria-label="Nexus 操作权限">
+                    <header><strong>Nexus 应如何操作？</strong><span>会话级设置</span></header>
+                    <button type="button" class="permission-option" data-profile="read-only" role="option">
+                      <span class="permission-option-icon">◉</span>
+                      <span><strong>只读模式</strong><small>只读取和分析，禁止修改、联网和非只读命令</small></span>
+                      <i class="permission-check">✓</i>
+                    </button>
+                    <button type="button" class="permission-option" data-profile="workspace-confirm" role="option">
+                      <span class="permission-option-icon">✋</span>
+                      <span><strong>每次确认</strong><small>读取自动执行，写入和命令可确认并记住到本会话</small></span>
+                      <i class="permission-check">✓</i>
+                    </button>
+                    <button type="button" class="permission-option" data-profile="workspace-untrusted" role="option">
+                      <span class="permission-option-icon">◇</span>
+                      <span><strong>谨慎工作区</strong><small>自动编辑，Shell 仅自动执行明确只读检查</small></span>
+                      <i class="permission-check">✓</i>
+                    </button>
+                    <button type="button" class="permission-option" data-profile="workspace-auto" role="option">
+                      <span class="permission-option-icon">◔</span>
+                      <span><strong>帮我批准</strong><small>仅对检测到的风险操作请求批准</small></span>
+                      <i class="permission-check">✓</i>
+                    </button>
+                    <button type="button" class="permission-option dangerous" data-profile="danger-full-access" role="option">
+                      <span class="permission-option-icon">!</span>
+                      <span><strong>完全访问</strong><small>可不受限制访问互联网和宿主文件</small></span>
+                      <i class="permission-lock">不可用</i>
+                    </button>
+                  </div>
+                </div>
               </div>
               <div class="composer-actions">
-                <span class="shortcut">Enter 发送</span>
-                <button type="submit" class="send-button" aria-label="发送消息" disabled>↑</button>
+                <span id="composer-shortcut" class="shortcut">Enter 发送</span>
+                <button id="composer-action" type="button" class="send-button" aria-label="发送消息" disabled>↑</button>
               </div>
             </div>
           </form>
         </section>
       </main>
     </div>
+
+    <div id="danger-confirm-backdrop" class="danger-confirm-backdrop hidden"></div>
+    <section id="danger-confirm" class="danger-confirm hidden" role="dialog" aria-modal="true" aria-labelledby="danger-confirm-title">
+      <div class="danger-confirm-icon">!</div>
+      <div>
+        <span class="danger-kicker">高风险权限</span>
+        <h2 id="danger-confirm-title">启用完全访问？</h2>
+        <p>Nexus 将不再请求工具审批，并可通过本机 Shell 读取宿主文件、访问互联网和执行破坏性命令。</p>
+        <ul>
+          <li>仅对当前会话生效，并写入审计记录</li>
+          <li>仍受当前系统账户本身的权限限制</li>
+          <li>工作区策略中的显式 deny 继续优先</li>
+        </ul>
+        <div class="danger-confirm-actions">
+          <button id="danger-confirm-cancel" type="button">取消</button>
+          <button id="danger-confirm-accept" type="button">启用完全访问</button>
+        </div>
+      </div>
+    </section>
 
     <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
     <aside id="inspector" class="inspector" aria-hidden="true">
@@ -92,6 +145,7 @@
       <div class="tabs" role="tablist">
         <button class="tab active" data-tab="events" role="tab">调试</button>
         <button class="tab" data-tab="memory" role="tab">记忆</button>
+        <button class="tab" data-tab="grants" role="tab">授权 <span id="grant-count" class="tab-count">0</span></button>
       </div>
       <div id="events-view" class="tab-view">
         <div class="debug-note">原始运行事件仅用于诊断，不影响任务执行。</div>
@@ -111,6 +165,14 @@
           <button type="submit">保存</button>
         </form>
         <div id="memory-list" class="memory-list"></div>
+      </div>
+      <div id="grants-view" class="tab-view hidden">
+        <div class="debug-note">这里只显示尚未消费、撤销或过期的授权。授权仅在工具、资源、策略和权限档位完全匹配时生效。</div>
+        <div class="grant-section-heading">
+          <strong>有效授权</strong>
+          <span id="grant-summary">选择任务后查看</span>
+        </div>
+        <div id="grant-list" class="grant-list"></div>
       </div>
     </aside>
 

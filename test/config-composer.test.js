@@ -15,7 +15,11 @@ test("Config Composition 默认生成可运行的 Demo 配置", async () => {
   assert.equal(config.workspace, "/tmp");
   assert.equal(config.provider.type, "demo");
   assert.equal(config.provider.model, "gpt-4.1-mini");
-  assert.equal(config.runtime.maxSteps, 8);
+  assert.equal(config.runtime.maxSteps, Infinity);
+  assert.equal(config.runtime.maxTokensPerTurn, Infinity);
+  assert.deepEqual(config.execution, { type: "native", dockerImage: null });
+  assert.deepEqual(config.network, { targets: [] });
+  assert.deepEqual(config.permission, { profile: "workspace-auto" });
   assert.equal(config.gateway.port, 4317);
   assert.equal(config.sources["provider.type"], "derived:default");
   assert.equal(createConfiguredProvider(config).name, "offline-demo");
@@ -105,16 +109,150 @@ test("共享 profile 不能启用会启动本地进程的 MCP", async (t) => {
   );
 });
 
-test("最终生效配置输出会脱敏 Key 并序列化无限步骤", async () => {
+test("Docker 执行只能由可信环境或 CLI 显式启用", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-docker-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
+    execution: { type: "docker", dockerImage: "evil:latest" },
+  }), "utf8");
+  await assert.rejects(composeRuntimeConfig({ root: workspace, env: {} }), /未知字段 execution/);
+
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), "{}", "utf8");
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    execution: { type: "local" },
+  }), "utf8");
+  await assert.rejects(composeRuntimeConfig({ root: workspace, env: {} }), /未知字段 execution/);
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), "{}", "utf8");
+
+  const fromEnvironment = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_EXECUTION: "docker", NEXUS_DOCKER_IMAGE: "node:22-alpine" },
+  });
+  assert.deepEqual(fromEnvironment.execution, { type: "docker", dockerImage: "node:22-alpine" });
+  assert.equal(fromEnvironment.sources["execution.type"], "environment");
+
+  const fromCli = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_EXECUTION: "docker", NEXUS_DOCKER_IMAGE: "node:20-alpine" },
+    args: ["--execution=docker", "--docker-image=node:22-alpine"],
+  });
+  assert.deepEqual(fromCli.execution, { type: "docker", dockerImage: "node:22-alpine" });
+  assert.equal(fromCli.sources["execution.dockerImage"], "cli");
+});
+
+test("Docker 执行配置缺失或组合冲突时 fail closed", async () => {
+  await assert.rejects(
+    composeRuntimeConfig({ root: "/tmp", env: {}, args: ["--execution=docker"] }),
+    /需要显式配置 execution\.dockerImage/,
+  );
+  await assert.rejects(
+    composeRuntimeConfig({ root: "/tmp", env: {}, args: ["--docker-image=node:22-alpine"] }),
+    /只能与 execution\.type=docker/,
+  );
+  await assert.rejects(
+    composeRuntimeConfig({ root: "/tmp", env: {}, args: ["--execution=docker", "--docker-image=--privileged"] }),
+    /合法的非空镜像引用/,
+  );
+});
+
+test("安全 Permission Profile 只能由可信环境或 CLI 选择", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-permission-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
+    permission: { profile: "danger-full-access" },
+  }), "utf8");
+  await assert.rejects(composeRuntimeConfig({ root: workspace, env: {} }), /未知字段 permission/);
+
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), "{}", "utf8");
+  const config = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_PERMISSION_PROFILE: "workspace-auto" },
+    args: ["--permission-profile=workspace-auto"],
+  });
+  assert.equal(config.permission.profile, "workspace-auto");
+  assert.equal(config.sources["permission.profile"], "cli");
+  const untrusted = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_PERMISSION_PROFILE: "workspace-untrusted" },
+  });
+  assert.equal(untrusted.permission.profile, "workspace-untrusted");
+  const readOnly = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_PERMISSION_PROFILE: "read-only" },
+  });
+  assert.equal(readOnly.permission.profile, "read-only");
+  const approvalRequired = await composeRuntimeConfig({
+    root: workspace,
+    args: ["--permission-profile=approval-required"],
+  });
+  assert.equal(approvalRequired.permission.profile, "approval-required");
+  const workspaceConfirm = await composeRuntimeConfig({
+    root: workspace,
+    args: ["--permission-profile=workspace-confirm"],
+  });
+  assert.equal(workspaceConfirm.permission.profile, "workspace-confirm");
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: { NEXUS_PERMISSION_PROFILE: "danger-full-access" } }),
+    /permission\.profile 必须是安全档位/,
+  );
+});
+
+test("网络目标只能由可信环境或 CLI 为 Native Sandbox 声明", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-network-target-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
+    network: { targets: ["192.168.121.110:22"] },
+  }), "utf8");
+  await assert.rejects(composeRuntimeConfig({ root: workspace, env: {} }), /未知字段 network/);
+
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), "{}", "utf8");
+  const fromEnvironment = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_NETWORK_TARGETS: "192.168.121.110:22,10.0.0.8:443" },
+  });
+  assert.deepEqual(fromEnvironment.network.targets, [
+    { host: "10.0.0.8", port: 443 },
+    { host: "192.168.121.110", port: 22 },
+  ]);
+  assert.equal(fromEnvironment.sources["network.targets"], "environment");
+
+  const fromCli = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_NETWORK_TARGETS: "10.0.0.8:443" },
+    args: ["--network-target=192.168.121.110:22", "--network-target=192.168.121.111:2222"],
+  });
+  assert.deepEqual(fromCli.network.targets, [
+    { host: "192.168.121.110", port: 22 },
+    { host: "192.168.121.111", port: 2222 },
+  ]);
+  assert.equal(fromCli.sources["network.targets"], "cli");
+
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: { NEXUS_NETWORK_TARGETS: "example.com:22" } }),
+    /只接受 IPv4 字面量/,
+  );
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: {}, args: ["--execution=local", "--network-target=192.168.121.110:22"] }),
+    /只支持 execution\.type=native/,
+  );
+});
+
+test("最终生效配置输出会脱敏 Key 并序列化无限步骤与 Token 预算", async () => {
   const config = await composeRuntimeConfig({
     root: "/tmp",
-    env: { OPENAI_API_KEY: "secret-key", NEXUS_MAX_STEPS: "unlimited" },
+    env: {
+      OPENAI_API_KEY: "secret-key",
+      NEXUS_MAX_STEPS: "unlimited",
+      NEXUS_MAX_TOKENS_PER_TURN: "unlimited",
+    },
   });
 
   const inspected = inspectRuntimeConfig(config);
 
   assert.equal(inspected.provider.apiKey, "[REDACTED]");
   assert.equal(inspected.runtime.maxSteps, "不限制");
+  assert.equal(inspected.runtime.maxTokensPerTurn, "不限制");
   assert.equal(JSON.stringify(inspected).includes("secret-key"), false);
   assert.equal(createConfiguredProvider(config).name, "openai-compatible/gpt-4.1-mini");
 });

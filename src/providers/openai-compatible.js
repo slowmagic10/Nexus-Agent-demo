@@ -32,6 +32,7 @@ export class OpenAICompatibleProvider {
 
     return {
       text: message.content || "",
+      finishReason: payload.choices?.[0]?.finish_reason || null,
       toolCalls: (message.tool_calls || []).map((call) => ({
         id: call.id,
         name: call.function.name,

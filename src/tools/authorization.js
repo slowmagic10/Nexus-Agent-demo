@@ -3,24 +3,34 @@ import { createHash, randomUUID } from "node:crypto";
 import { promises as fs } from "node:fs";
 import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
+import { createPermissionProfile } from "./permission-profile.js";
+import { projectIdentity } from "./project-grant-store.js";
 
 const DECISIONS = new Set(["allow", "approval_required", "deny"]);
 const RISKS = new Set(["R0", "R1", "R2", "R3"]);
-const RESOURCE_KINDS = new Set(["workspace_path", "workspace", "memory_scope", "mcp_server", "session", "external"]);
+const RESOURCE_KINDS = new Set(["workspace_path", "workspace", "shell_command", "memory_scope", "mcp_server", "session", "external"]);
 const POLICY_FILE = path.join(".nexus", "tool-policy.json");
 
 export class WorkspacePolicy {
-  constructor(config = {}) {
+  constructor(config = {}, {
+    profile = createPermissionProfile({ name: "approval-required", workspace: process.cwd(), executionType: "local" }),
+    allowElevation = true,
+  } = {}) {
+    if (!profile || typeof profile.authorize !== "function" || typeof profile.canExpose !== "function") {
+      throw new Error("Workspace Policy 需要 Permission Profile");
+    }
+    this.profile = profile;
+    this.allowElevation = Boolean(allowElevation);
     this.replace(config);
   }
 
   replace(config = {}) {
     this.config = normalizePolicyConfig(config);
-    this.version = hashValue({ schemaVersion: 1, ...this.config });
+    this.version = hashValue({ schemaVersion: 2, profileVersion: this.profile.version, allowElevation: this.allowElevation, ...this.config });
     return this;
   }
 
-  authorize({ definition, call, state, argsHash, now = new Date().toISOString() }) {
+  authorize({ definition, call, state, argsHash, projectGrants = [], now = new Date().toISOString() }) {
     const capability = definition.capability;
     const capabilityHash = capabilityVersion(capability);
     let resources;
@@ -39,7 +49,7 @@ export class WorkspacePolicy {
       });
     }
 
-    const policy = this.#policyDecision(definition, resources);
+    const policy = this.#policyDecision(definition, call, resources);
     if (policy.decision !== "approval_required") {
       return decisionResult({ ...policy, policyVersion: this.version, capability, capabilityHash, resources });
     }
@@ -53,18 +63,31 @@ export class WorkspacePolicy {
       argsHash,
       callId: call.id,
       now,
+    })) || projectGrants.find((candidate) => grantMatches(candidate, {
+      state,
+      definition,
+      capabilityHash,
+      resources,
+      policyVersion: this.version,
+      argsHash,
+      callId: call.id,
+      now,
     }));
     if (grant) {
+      const grantScope = grant.scope || (grantUsage(grant) === "single_use" ? "once" : "session");
       return decisionResult({
         decision: "allow",
         policyVersion: this.version,
         ruleId: policy.ruleId,
-        reason: `命中 Session Grant ${grant.id}`,
+        reason: `命中 ${grantScope === "project" ? "Project" : "Session"} Grant ${grant.id}`,
         capability,
         capabilityHash,
         resources,
         grantId: grant.id,
+        grantScope,
         baseDecision: "approval_required",
+        profile: policy.profile,
+        explanation: { ...policy.explanation, layer: `${grantScope}_grant`, grantId: grant.id, grantScope },
       });
     }
     return decisionResult({ ...policy, policyVersion: this.version, capability, capabilityHash, resources });
@@ -75,32 +98,41 @@ export class WorkspacePolicy {
       !rule.pathPrefixes && ruleMatchesDefinition(rule, definition)
     ));
     if (matched.some((rule) => rule.decision === "deny")) return false;
-    if (matched.length) return matched[0].decision !== "deny";
-    return defaultDecision(definition.capability).decision !== "deny";
+    return this.profile.canExpose(definition);
   }
 
-  #policyDecision(definition, resources) {
+  #policyDecision(definition, call, resources) {
+    const profile = this.profile.authorize({ definition, call, resources });
     const matched = this.config.rules.filter((rule) => ruleMatches(rule, definition, resources));
     const deny = matched.find((rule) => rule.decision === "deny");
     const rule = deny || matched[0];
-    if (rule) {
-      return {
-        decision: rule.decision,
-        ruleId: rule.id,
-        reason: rule.reason || `命中 Workspace Policy 规则 ${rule.id}`,
-      };
+    if (!rule) return profile;
+    const workspace = {
+      decision: rule.decision,
+      ruleId: rule.id,
+      reason: rule.reason || `命中 Workspace Policy 规则 ${rule.id}`,
+      profile: this.profile.name,
+      explanation: { layer: "workspace_policy", category: "workspace_rule", workspaceRuleId: rule.id },
+    };
+    if (profile.decision === "deny") return profile;
+    if (this.allowElevation || decisionRank(workspace.decision) >= decisionRank(profile.decision)) {
+      return { ...workspace, ...(profile.approvalScopes ? { approvalScopes: profile.approvalScopes } : {}) };
     }
-    return defaultDecision(definition.capability);
+    return {
+      ...profile,
+      reason: `${profile.reason}；Workspace Policy 规则 ${rule.id} 无权提升 Permission Profile`,
+      explanation: { ...profile.explanation, workspaceRuleId: rule.id, elevationBlocked: true },
+    };
   }
 }
 
-export async function loadWorkspacePolicy(workspace) {
+export async function loadWorkspacePolicy(workspace, { profile } = {}) {
   const file = path.join(path.resolve(workspace), POLICY_FILE);
   try {
     const config = JSON.parse(await fs.readFile(file, "utf8"));
-    return new WorkspacePolicy(config);
+    return new WorkspacePolicy(config, { profile, allowElevation: false });
   } catch (error) {
-    if (error?.code === "ENOENT") return new WorkspacePolicy();
+    if (error?.code === "ENOENT") return new WorkspacePolicy({}, { profile, allowElevation: false });
     throw new Error(`Workspace Policy 加载失败 ${file}：${error.message}`);
   }
 }
@@ -150,15 +182,52 @@ export function createSessionGrant({
     tool,
     capabilityHash,
     policyVersion,
-    resources: resources.map((resource) => ({ ...resource, match: resource.match || "exact" })),
+    resources: resources.map(grantResource),
     callId,
     argsHash,
     issuedAt,
     expiresAt: expiry,
     usage: callId || argsHash ? "single_use" : "session",
+    scope: callId || argsHash ? "once" : "session",
     consumedAt: null,
     consumedByCallId: null,
     revokedAt: null,
+  };
+}
+
+export function createProjectGrant({
+  id,
+  workspace,
+  tool,
+  capabilityHash,
+  policyVersion,
+  resources,
+  issuedAt = new Date().toISOString(),
+  expiresAt,
+}) {
+  for (const [label, value] of Object.entries({ workspace, tool, capabilityHash, policyVersion })) {
+    if (typeof value !== "string" || !value) throw new Error(`Project Grant ${label} 无效`);
+  }
+  if (!Array.isArray(resources)) throw new Error("Project Grant resources 必须是数组");
+  const expiry = expiresAt || new Date(new Date(issuedAt).getTime() + 30 * 24 * 60 * 60_000).toISOString();
+  if (!Number.isFinite(new Date(issuedAt).getTime()) || !Number.isFinite(new Date(expiry).getTime())) {
+    throw new Error("Project Grant 时间无效");
+  }
+  const resolvedWorkspace = path.resolve(workspace);
+  return {
+    id: id || `project-grant-${randomUUID()}`,
+    scope: "project",
+    usage: "project",
+    projectId: projectIdentity(resolvedWorkspace),
+    workspace: resolvedWorkspace,
+    tool,
+    capabilityHash,
+    policyVersion,
+    resources: resources.map(grantResource),
+    issuedAt,
+    expiresAt: expiry,
+    revokedAt: null,
+    revokedReason: null,
   };
 }
 
@@ -220,6 +289,9 @@ function normalizeResourceDescriptor(resource) {
   if (resource.kind === "workspace_path" && (typeof resource.argument !== "string" || !resource.argument)) {
     throw new Error("workspace_path capability 必须声明 argument");
   }
+  if (resource.kind === "shell_command" && (typeof resource.argument !== "string" || !resource.argument)) {
+    throw new Error("shell_command capability 必须声明 argument");
+  }
   return {
     kind: resource.kind,
     ...(resource.argument ? { argument: resource.argument } : {}),
@@ -241,6 +313,11 @@ function resolveCapabilityResources(capability, args, state) {
       };
     }
     if (resource.kind === "workspace") return { kind: resource.kind, value: ".", access: resource.access || "execute" };
+    if (resource.kind === "shell_command") {
+      const command = args[resource.argument || "command"];
+      if (typeof command !== "string" || !command.trim()) throw new Error("shell_command capability 必须引用非空命令参数");
+      return { kind: resource.kind, value: command.trim(), access: resource.access || "execute" };
+    }
     if (resource.kind === "memory_scope") return { kind: resource.kind, value: hashValue(state.memoryScope || {}) };
     if (resource.kind === "session") return { kind: resource.kind, value: state.id };
     return {
@@ -289,24 +366,14 @@ function ruleMatchesDefinition(rule, definition) {
   return true;
 }
 
-function defaultDecision(capability) {
-  if (capability.risk === "R3" || capability.effects.includes("credential")) {
-    return { decision: "deny", ruleId: "default.credential_deny", reason: "默认策略拒绝凭据或 R3 能力" };
-  }
-  if (capability.readOnly && !capability.effects.some((effect) => ["write", "execute", "network", "credential"].includes(effect))) {
-    return { decision: "allow", ruleId: "default.safe_read", reason: "默认策略允许安全只读能力" };
-  }
-  return {
-    decision: "approval_required",
-    ruleId: "default.elevated_approval",
-    reason: "默认策略要求审批写入、执行、网络或其他非只读能力",
-  };
-}
-
 function grantMatches(grant, context) {
   if (!grant || grant.revokedAt) return false;
   if (grantUsage(grant) === "single_use" && grant.consumedAt) return false;
-  if (grant.sessionId !== context.state.id || path.resolve(grant.workspace) !== path.resolve(context.state.workspace)) return false;
+  if (grantUsage(grant) === "project") {
+    if (grant.projectId !== projectIdentity(context.state.workspace)) return false;
+  } else if (grant.sessionId !== context.state.id || path.resolve(grant.workspace) !== path.resolve(context.state.workspace)) {
+    return false;
+  }
   if (grant.tool !== context.definition.name || grant.capabilityHash !== context.capabilityHash) return false;
   if (grant.policyVersion !== context.policyVersion) return false;
   if (grant.callId && grant.callId !== context.callId) return false;
@@ -316,15 +383,29 @@ function grantMatches(grant, context) {
 }
 
 function grantUsage(grant) {
-  return grant.usage || (grant.callId || grant.argsHash ? "single_use" : "session");
+  return grant.usage || (grant.scope === "project" ? "project" : grant.callId || grant.argsHash ? "single_use" : "session");
 }
 
 function resourceMatches(scope, resource) {
   if (scope.kind !== resource.kind) return false;
+  if (scope.valueHash) {
+    return scope.valueHash === resourceGrantHash(resource) && (!scope.access || scope.access === resource.access);
+  }
   if (scope.match === "prefix" && resource.kind === "workspace_path") {
     return pathWithinPrefix(resource.value, scope.value) && (!scope.access || scope.access === resource.access);
   }
   return scope.value === resource.value && (!scope.access || scope.access === resource.access);
+}
+
+function grantResource(resource) {
+  const normalized = { ...resource, match: resource.match || "exact" };
+  if (resource.kind !== "shell_command") return normalized;
+  delete normalized.value;
+  return { ...normalized, valueHash: resourceGrantHash(resource) };
+}
+
+function resourceGrantHash(resource) {
+  return hashValue({ kind: resource.kind, value: resource.value, access: resource.access || null });
 }
 
 function pathWithinPrefix(value, prefix) {
@@ -340,20 +421,28 @@ function normalizePathPrefix(value) {
   return normalized || ".";
 }
 
-function decisionResult({ decision, policyVersion, ruleId, reason, capability, capabilityHash, resources, grantId = null, baseDecision = null }) {
+function decisionResult({ decision, policyVersion, ruleId, reason, profile = null, explanation = null, capability, capabilityHash, resources, grantId = null, grantScope = null, baseDecision = null, approvalScopes = null }) {
   return {
     decision,
     policyVersion,
     ruleId,
     reason,
+    profile,
+    explanation,
     capabilityHash,
     effects: capability.effects,
     risk: capability.risk,
     readOnly: capability.readOnly,
     resources,
     grantId,
+    grantScope,
     baseDecision,
+    ...(approvalScopes ? { approvalScopes } : {}),
   };
+}
+
+function decisionRank(decision) {
+  return ({ allow: 0, approval_required: 1, deny: 2 })[decision];
 }
 
 function riskLevel(effects) {

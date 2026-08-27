@@ -4,6 +4,12 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/keyboard.js", "/grants.js", "/plan-view.js"]);
+
+export function isGatewayStaticAsset(pathname) {
+  return STATIC_ASSETS.has(pathname);
+}
+
 export function createGatewayServer({ manager, host = "127.0.0.1", port = 4317, staticRoot }) {
   if (!isLoopback(host)) throw new Error("基础版 Gateway 只允许绑定本机回环地址");
 
@@ -48,13 +54,18 @@ async function route(request, response, manager, staticRoot) {
     throw new GatewayError(415, "POST 请求必须使用 application/json");
   }
 
-  if (request.method === "GET" && staticRoot && ["/", "/app.js", "/styles.css", "/state-patch.js"].includes(url.pathname)) {
+  if (request.method === "GET" && staticRoot && isGatewayStaticAsset(url.pathname)) {
     await sendStatic(response, staticRoot, url.pathname);
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/health") {
     sendJson(response, 200, { ok: true, service: "nexus-gateway", transport: ["http", "sse"] });
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/runtime") {
+    sendJson(response, 200, manager.runtimeInfo());
     return;
   }
 
@@ -92,7 +103,11 @@ async function route(request, response, manager, staticRoot) {
 
   if (request.method === "POST" && url.pathname === "/sessions") {
     const body = await readJson(request);
-    const state = await manager.create({ resume: body.resume });
+    const state = await manager.create({
+      resume: body.resume,
+      permissionProfile: body.permissionProfile,
+      permissionConfirmation: body.permissionConfirmation,
+    });
     sendJson(response, 201, { session: state });
     return;
   }
@@ -155,6 +170,12 @@ async function route(request, response, manager, staticRoot) {
       sendJson(response, 202, { accepted: true, session: state });
       return;
     }
+    if (request.method === "POST" && parts[2] === "permission-profile" && parts.length === 3) {
+      const body = await readJson(request);
+      const state = await manager.setPermissionProfile(id, body.profile, { confirmation: body.confirmation });
+      sendJson(response, 200, { session: state });
+      return;
+    }
     if (request.method === "POST" && parts[2] === "branches" && parts.length === 3) {
       const body = await readJson(request);
       const state = await manager.branch(id, { cursor: body.cursor });
@@ -168,8 +189,18 @@ async function route(request, response, manager, staticRoot) {
     }
     if (request.method === "POST" && parts[2] === "approvals" && parts[3] && parts.length === 4) {
       const body = await readJson(request);
-      const state = await manager.decideApproval(id, parts[3], body.approved);
+      const state = await manager.decideApproval(id, parts[3], body.approved, body.scope || "once");
       sendJson(response, 202, { accepted: true, session: state });
+      return;
+    }
+    if (request.method === "GET" && parts[2] === "grants" && parts.length === 3) {
+      sendJson(response, 200, { grants: await manager.listGrants(id) });
+      return;
+    }
+    if (request.method === "POST" && parts[2] === "grants" && parts[3] && parts[4] === "revoke" && parts.length === 5) {
+      const body = await readJson(request);
+      const grants = await manager.revokeGrant(id, parts[3], body.scope, body.reason);
+      sendJson(response, 200, { grants });
       return;
     }
   }

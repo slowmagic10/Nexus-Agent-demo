@@ -61,8 +61,12 @@ export class TerminalUI {
     console.log(`\n${yellow}${bold}需要审批${reset}`);
     console.log(`${description}`);
     console.log(`${bold}${call.name}${reset} ${JSON.stringify(call.arguments, null, 2)}`);
-    const answer = await this.question("\n仅批准本次调用？[y/N] ");
-    return /^y(es)?$/i.test(answer?.trim() || "");
+    const answer = await this.question("\n授权范围：[o] 仅本次 / [s] 本会话 / [p] 本项目 / [N] 拒绝：");
+    const choice = answer?.trim().toLowerCase() || "";
+    if (["o", "once", "y", "yes"].includes(choice)) return { approved: true, scope: "once" };
+    if (["s", "session"].includes(choice)) return { approved: true, scope: "session" };
+    if (["p", "project"].includes(choice)) return { approved: true, scope: "project" };
+    return false;
   }
 
   answerFrom(state) {
@@ -76,5 +80,5 @@ export class TerminalUI {
 }
 
 export function helpText() {
-  return `离线演示可尝试：\n- 查看工作区有哪些文件\n- 读取 AGENTS.md\n- 搜索：Agent Loop\n- 记住：我偏好本地模型\n- 查看记忆\n- 查看技能\n- 创建 nexus-output.txt 内容：hello nexus（需要审批）\n- 运行：pwd（需要审批）\n- 使用 demo:mcp 启动后输入 MCP 回显：hello（需要审批）\n\n会话：/sessions 查看；长期记忆：/long-memory；来源审计：/memory-info=ID；软删除：/forget=ID；异常写入：/memory-issues、/memory-retry=ID、/memory-discard=ID、/memory-resolve=ID,MEMORY_ID；导出：/export。\n退出后用 --resume=latest 或 --resume=会话ID 恢复。\n真实模型：设置 OPENAI_API_KEY、OPENAI_MODEL；可选 OPENAI_BASE_URL。`;
+  return `离线演示可尝试：\n- 查看工作区有哪些文件\n- 读取 AGENTS.md\n- 搜索：Agent Loop\n- 记住：我偏好本地模型\n- 查看记忆\n- 查看技能\n- 创建 nexus-output.txt 内容：hello nexus（workspace-auto 自动执行）\n- 运行：pwd（Native/Docker 沙箱内自动执行）\n- 运行：npm install（需要审批）\n- 使用 demo:mcp 启动后输入 MCP 回显：hello（需要审批）\n\n会话：/sessions 查看；长期记忆：/long-memory；来源审计：/memory-info=ID；软删除：/forget=ID；异常写入：/memory-issues、/memory-retry=ID、/memory-discard=ID、/memory-resolve=ID,MEMORY_ID；导出：/export。\n退出后用 --resume=latest 或 --resume=会话ID 恢复。\n真实模型：设置 OPENAI_API_KEY、OPENAI_MODEL；可选 OPENAI_BASE_URL。`;
 }

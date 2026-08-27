@@ -1,0 +1,15 @@
+#!/usr/bin/expect -f
+# 非交互远程执行：用法 expect ssh_exec.exp <host> "<remote cmd>"
+set timeout 15
+set host [lindex $argv 0]
+set cmd [lindex $argv 1]
+set pwd $env(NEXUS_SSH_PWD)
+spawn ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=8 -o PreferredAuthentications=password -o PubkeyAuthentication=no -o ForwardX11=no $host "$cmd"
+expect {
+    -re "(yes/no|authenticity)" { send "yes\r"; exp_continue }
+    -re "password:" { send "$pwd\r" }
+    timeout { puts "\n=== TIMEOUT_CONNECT ==="; exit 1 }
+}
+expect eof
+catch wait result
+exit [lindex $result 3]

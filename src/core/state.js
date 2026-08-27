@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createMemoryScope } from "../memory/scope.js";
 
-export const SESSION_SCHEMA_VERSION = 8;
+export const SESSION_SCHEMA_VERSION = 10;
+const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
-export function createSession({ provider, workspace, memoryScope, id, createdAt }) {
+export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", id, createdAt }) {
   const now = createdAt || new Date().toISOString();
   return {
     schemaVersion: SESSION_SCHEMA_VERSION,
@@ -15,7 +16,10 @@ export function createSession({ provider, workspace, memoryScope, id, createdAt 
     phase: "idle",
     provider,
     workspace,
+    permissionProfile,
     memoryScope: createMemoryScope(memoryScope || { workspace }),
+    objective: null,
+    plan: null,
     messages: [],
     events: [],
     memory: [],
@@ -61,6 +65,15 @@ export function reduceSession(state, action) {
       next.phase = "thinking";
       next.turnStartedAt = at;
       next.messages.push({ role: "user", content: action.content });
+      next.objective = {
+        id: `objective-${next.events.length + 1}`,
+        text: redactSensitiveValue(action.content),
+        status: "active",
+        createdAt: at,
+        updatedAt: at,
+      };
+      next.plan = null;
+      emit("objective.created", { objectiveId: next.objective.id, preview: next.objective.text.slice(0, 160) });
       emit("message.user", { preview: action.content.slice(0, 120) });
       break;
     case "MODEL_REQUESTED":
@@ -77,7 +90,11 @@ export function reduceSession(state, action) {
       next.metrics.outputTokens += action.usage.outputTokens;
       next.metrics.totalTokens += action.usage.totalTokens;
       next.metrics.modelDurationMs += action.durationMs;
-      emit("model.completed", { durationMs: action.durationMs, usage: action.usage });
+      emit("model.completed", {
+        durationMs: action.durationMs,
+        usage: action.usage,
+        finishReason: action.finishReason || null,
+      });
       break;
     case "ASSISTANT_MESSAGE":
       next.messages.push(action.message);
@@ -122,7 +139,10 @@ export function reduceSession(state, action) {
         readOnly: action.readOnly,
         resources: action.resources || [],
         grantId: action.grantId || null,
+        grantScope: action.grantScope || null,
         baseDecision: action.baseDecision || null,
+        profile: action.profile || null,
+        explanation: action.explanation || null,
       });
       break;
     case "TOOL_EXECUTION_STARTED":
@@ -137,6 +157,7 @@ export function reduceSession(state, action) {
         policyVersion: action.policyVersion || null,
         capabilityHash: action.capabilityHash || null,
         grantId: action.grantId || null,
+        grantScope: action.grantScope || null,
       });
       break;
     case "TOOL_APPROVAL_STALE":
@@ -148,6 +169,15 @@ export function reduceSession(state, action) {
         toolVersion: action.toolVersion,
         policyVersion: action.policyVersion || null,
         currentPolicyVersion: action.currentPolicyVersion || null,
+      });
+      break;
+    case "TOOL_CAPABILITY_UNAVAILABLE":
+      emit("tool.capability_unavailable", {
+        callId: action.call.id,
+        tool: action.call.name,
+        argsHash: action.argsHash,
+        registrationId: action.registrationId || null,
+        reason: action.reason,
       });
       break;
     case "TOOL_EXECUTION_UNKNOWN":
@@ -173,6 +203,10 @@ export function reduceSession(state, action) {
         capabilityHash: action.capabilityHash || null,
         resources: action.resources || [],
         ruleId: action.ruleId || null,
+        profile: action.profile || null,
+        reason: action.reason || null,
+        explanation: action.explanation || null,
+        approvalScopes: action.approvalScopes || ["once"],
       };
       emit("approval.requested", {
         callId: action.call.id,
@@ -185,6 +219,10 @@ export function reduceSession(state, action) {
         capabilityHash: action.capabilityHash || null,
         resources: action.resources || [],
         ruleId: action.ruleId || null,
+        profile: action.profile || null,
+        reason: action.reason || null,
+        explanation: action.explanation || null,
+        approvalScopes: action.approvalScopes || ["once"],
       });
       break;
     case "APPROVAL_DECIDED":
@@ -198,6 +236,7 @@ export function reduceSession(state, action) {
         toolVersion: action.toolVersion || null,
         policyVersion: action.policyVersion || null,
         capabilityHash: action.capabilityHash || null,
+        grantScope: action.grantScope || null,
       });
       break;
     case "TOOL_GRANT_ISSUED":
@@ -215,6 +254,26 @@ export function reduceSession(state, action) {
         expiresAt: action.grant.expiresAt,
         callId: action.grant.callId || null,
         usage: action.grant.usage || (action.grant.callId || action.grant.argsHash ? "single_use" : "session"),
+        scope: action.grant.scope || (action.grant.callId || action.grant.argsHash ? "once" : "session"),
+      });
+      break;
+    case "TOOL_PROJECT_GRANT_ISSUED":
+      emit("tool.project_grant_issued", {
+        grantId: action.grant.id,
+        scope: "project",
+        projectId: action.grant.projectId,
+        tool: action.grant.tool,
+        capabilityHash: action.grant.capabilityHash,
+        policyVersion: action.grant.policyVersion,
+        resources: action.grant.resources,
+        expiresAt: action.grant.expiresAt,
+      });
+      break;
+    case "TOOL_PROJECT_GRANT_REVOKED":
+      emit("tool.project_grant_revoked", {
+        grantId: action.grantId,
+        scope: "project",
+        reason: action.reason || null,
       });
       break;
     case "TOOL_GRANT_CONSUMED": {
@@ -377,17 +436,50 @@ export function reduceSession(state, action) {
       }
       emit("skill.loaded", { skill: action.skill.name });
       break;
+    case "PLAN_UPDATED": {
+      if (!next.objective || next.objective.status !== "active") {
+        throw new Error("Plan 只能更新当前 active Objective");
+      }
+      const steps = normalizePlanSteps(action.steps);
+      const revision = next.plan?.objectiveId === next.objective.id ? next.plan.revision + 1 : 1;
+      next.plan = {
+        objectiveId: next.objective.id,
+        revision,
+        status: "active",
+        explanation: typeof action.explanation === "string" ? redactSensitiveValue(action.explanation.trim()).slice(0, 1000) : "",
+        steps,
+        createdAt: next.plan?.objectiveId === next.objective.id ? next.plan.createdAt : at,
+        updatedAt: at,
+      };
+      emit("plan.updated", {
+        objectiveId: next.objective.id,
+        revision,
+        explanation: next.plan.explanation,
+        steps: structuredClone(steps),
+      });
+      break;
+    }
     case "COMPLETED":
       next.phase = "completed";
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
+      finalizeObjective(next, "completed", at, emit);
       emit("session.turn_completed", { durationMs: next.metrics.lastTurnDurationMs });
       break;
     case "FAILED":
+      for (const call of findUnresolvedToolCalls(next.messages)) {
+        next.messages.push({
+          role: "tool",
+          tool_call_id: call.id,
+          content: "任务在工具启动前停止：该工具调用没有执行。",
+        });
+      }
       next.phase = "failed";
       next.lastError = action.error;
+      next.pendingApproval = null;
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
+      finalizeObjective(next, "failed", at, emit);
       emit("session.failed", { error: action.error, durationMs: next.metrics.lastTurnDurationMs });
       break;
     case "CANCELLED":
@@ -403,11 +495,39 @@ export function reduceSession(state, action) {
       next.pendingApproval = null;
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
+      finalizeObjective(next, "cancelled", at, emit);
       emit("session.cancelled", { reason: action.reason, durationMs: next.metrics.lastTurnDurationMs });
       break;
     case "READY":
       next.phase = "idle";
       next.lastError = null;
+      break;
+    case "PERMISSION_PROFILE_CHANGED":
+      if (!["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto", "danger-full-access"].includes(action.profile)) {
+        throw new Error(`会话权限档位无效：${action.profile}`);
+      }
+      if (["thinking", "executing", "awaiting_approval"].includes(next.phase)) {
+        throw new Error("会话运行期间不能切换权限档位");
+      }
+      next.permissionProfile = action.profile;
+      next.toolGrants = [];
+      emit("permission.profile_changed", {
+        profile: action.profile,
+        previousProfile: state.permissionProfile || "workspace-auto",
+        riskAcknowledged: action.profile === "danger-full-access" ? action.riskAcknowledged === true : false,
+      });
+      break;
+    case "PERMISSION_PROFILE_DOWNGRADED":
+      if (!["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto"].includes(action.profile)) {
+        throw new Error(`会话安全降级档位无效：${action.profile}`);
+      }
+      next.permissionProfile = action.profile;
+      next.toolGrants = [];
+      emit("permission.profile_downgraded", {
+        profile: action.profile,
+        previousProfile: state.permissionProfile || "workspace-auto",
+        reason: action.reason || "dangerous_profile_requires_confirmation",
+      });
       break;
     case "RESUMED": {
       next.contextMemory ||= [];
@@ -450,6 +570,15 @@ export function reduceSession(state, action) {
       next.memoryScope = createMemoryScope({ ...next.memoryScope, workspace: action.workspace });
       next.pendingApproval = null;
       next.lastError = null;
+      if (next.objective?.status === "active") {
+        next.objective.status = "paused";
+        next.objective.updatedAt = at;
+        if (next.plan?.status === "active") {
+          next.plan.status = "paused";
+          next.plan.updatedAt = at;
+        }
+        emit("objective.paused", { objectiveId: next.objective.id, reason: "process_interrupted" });
+      }
       emit("session.resumed", {
         previousPhase,
         discardedApproval,
@@ -468,12 +597,15 @@ export function reduceSession(state, action) {
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
   if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
-  if ([2, 3, 4, 5, 6, 7].includes(state.schemaVersion)) {
+  if ([2, 3, 4, 5, 6, 7, 8, 9].includes(state.schemaVersion)) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
       lineage: state.lineage || null,
+      permissionProfile: state.permissionProfile || "workspace-auto",
       memoryScope: createMemoryScope(state.memoryScope || { workspace: state.workspace }),
+      objective: state.objective || null,
+      plan: state.plan || null,
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
       toolGrants: migrateToolGrants(state.toolGrants || []),
@@ -483,6 +615,37 @@ export function migrateSessionState(state) {
     throw new Error(`会话 schema v${state.schemaVersion} 高于当前支持的 v${SESSION_SCHEMA_VERSION}`);
   }
   throw new Error(`不支持的会话 schema version：${state.schemaVersion}`);
+}
+
+function normalizePlanSteps(value) {
+  if (!Array.isArray(value) || !value.length) throw new Error("Plan 至少包含一个步骤");
+  if (value.length > 50) throw new Error("Plan 最多包含 50 个步骤");
+  const seen = new Set();
+  let inProgress = 0;
+  const steps = value.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) throw new Error(`Plan 第 ${index + 1} 个步骤无效`);
+    const step = typeof item.step === "string" ? redactSensitiveValue(item.step.trim()).slice(0, 500) : "";
+    if (!step) throw new Error(`Plan 第 ${index + 1} 个步骤必须是非空文本`);
+    if (seen.has(step)) throw new Error("Plan 步骤不能重复");
+    seen.add(step);
+    if (!PLAN_STEP_STATUSES.has(item.status)) throw new Error(`Plan 第 ${index + 1} 个步骤状态无效`);
+    if (item.status === "in_progress") inProgress += 1;
+    return { step, status: item.status };
+  });
+  if (inProgress > 1) throw new Error("Plan 最多一个步骤处于 in_progress");
+  return steps;
+}
+
+function finalizeObjective(state, status, at, emit) {
+  if (!state.objective || !["active", "paused"].includes(state.objective.status)) return;
+  state.objective.status = status;
+  state.objective.updatedAt = at;
+  state.objective.completedAt = at;
+  if (state.plan && ["active", "paused"].includes(state.plan.status)) {
+    state.plan.status = status;
+    state.plan.updatedAt = at;
+  }
+  emit(`objective.${status}`, { objectiveId: state.objective.id });
 }
 
 function migrateToolGrants(grants) {

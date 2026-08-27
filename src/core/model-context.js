@@ -1,7 +1,15 @@
 // FOUNDATION — event-derived projection of everything visible to the model.
 import { applyStatePatch } from "../state-patch.js";
 
-const MODEL_CONTEXT_KEYS = ["messages", "memory", "contextMemory", "loadedSkills"];
+const MODEL_CONTEXT_DEFAULTS = {
+  messages: [],
+  memory: [],
+  contextMemory: [],
+  loadedSkills: [],
+  objective: null,
+  plan: null,
+};
+const MODEL_CONTEXT_KEYS = Object.keys(MODEL_CONTEXT_DEFAULTS);
 const DEFAULT_MAX_INPUT_TOKENS = 32_000;
 const COMPACTION_MARKER = "[Model Context 已压缩：仅保留最近的完整会话轮次；更早事实仍保存在 durable journal 中。]";
 const CONTEXT_STRATEGY = "recent-complete-turns-v1";
@@ -93,7 +101,10 @@ export function prepareModelRequest(context, {
 }
 
 function selectModelContext(state) {
-  return Object.fromEntries(MODEL_CONTEXT_KEYS.map((key) => [key, structuredClone(state[key] || [])]));
+  return Object.fromEntries(MODEL_CONTEXT_KEYS.map((key) => [
+    key,
+    structuredClone(state[key] ?? MODEL_CONTEXT_DEFAULTS[key]),
+  ]));
 }
 
 function applyModelContextPatch(context, patch) {

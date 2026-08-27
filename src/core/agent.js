@@ -11,8 +11,8 @@ export class AgentRuntime {
     retrieveMemory = async () => [],
     reconcile = async () => [],
     flushMemory = async () => [],
-    maxSteps = 8,
-    maxTokensPerTurn = 50_000,
+    maxSteps = Infinity,
+    maxTokensPerTurn = Infinity,
     maxInputTokens = 32_000,
     memorySearchTimeoutMs = 2_000,
     memoryReconcileTimeoutMs = 2_000,
@@ -21,6 +21,9 @@ export class AgentRuntime {
     if (!toolHost && !tools) throw new Error("AgentRuntime 需要 Tool Host");
     if (maxSteps !== Infinity && (!Number.isSafeInteger(maxSteps) || maxSteps < 1)) {
       throw new Error("AgentRuntime maxSteps 必须是正整数或 Infinity");
+    }
+    if (maxTokensPerTurn !== Infinity && (!Number.isSafeInteger(maxTokensPerTurn) || maxTokensPerTurn < 1)) {
+      throw new Error("AgentRuntime maxTokensPerTurn 必须是正整数或 Infinity");
     }
     if (!Number.isSafeInteger(memorySearchTimeoutMs) || memorySearchTimeoutMs < 1) {
       throw new Error("AgentRuntime memorySearchTimeoutMs 必须是正整数");
@@ -114,14 +117,16 @@ export class AgentRuntime {
           signal: abortController.signal,
         });
         const usage = normalizeUsage(response.usage, request.messages, response.text);
-        await this.dispatch({ type: "MODEL_COMPLETED", usage, durationMs: Math.round(performance.now() - modelStarted) });
-        if (this.state.metrics.totalTokens - tokenBaseline > this.maxTokensPerTurn) {
-          throw new Error(`本轮 token 用量超过预算 ${this.maxTokensPerTurn}`);
-        }
+        await this.dispatch({
+          type: "MODEL_COMPLETED",
+          usage,
+          durationMs: Math.round(performance.now() - modelStarted),
+          finishReason: response.finishReason || null,
+        });
 
         const assistantMessage = {
           role: "assistant",
-          content: response.text || "",
+          content: redactSensitiveText(response.text || ""),
           ...(response.toolCalls.length ? {
             tool_calls: response.toolCalls.map((call) => ({
               id: call.id,
@@ -149,6 +154,10 @@ export class AgentRuntime {
             });
           }
           return this.state;
+        }
+
+        if (this.state.metrics.totalTokens - tokenBaseline > this.maxTokensPerTurn) {
+          throw new Error(`本轮累计 Token 用量超过预算 ${this.maxTokensPerTurn}；尚未执行最新工具调用。可通过 NEXUS_MAX_TOKENS_PER_TURN 或 --max-tokens-per-turn 调整`);
         }
 
         for (const call of response.toolCalls) {
