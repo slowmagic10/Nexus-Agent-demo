@@ -134,6 +134,57 @@ const migrations = [
       addColumn(db, "memory_mutations", "request_hash", "TEXT");
     },
   },
+  {
+    version: 6,
+    up(db) {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS artifacts (
+          id TEXT PRIMARY KEY,
+          session_id TEXT NOT NULL,
+          call_id TEXT,
+          kind TEXT NOT NULL,
+          media_type TEXT NOT NULL,
+          byte_size INTEGER NOT NULL,
+          sha256 TEXT NOT NULL,
+          content BLOB NOT NULL,
+          created_at TEXT NOT NULL,
+          FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS artifacts_session_created
+          ON artifacts(session_id, created_at, id);
+      `);
+    },
+  },
+  {
+    version: 7,
+    up(db) {
+      db.exec(`
+        DROP INDEX IF EXISTS artifacts_session_created;
+        ALTER TABLE artifacts RENAME TO artifacts_v6;
+        CREATE TABLE artifacts (
+          id TEXT NOT NULL,
+          session_id TEXT NOT NULL,
+          call_id TEXT,
+          kind TEXT NOT NULL,
+          media_type TEXT NOT NULL,
+          byte_size INTEGER NOT NULL,
+          sha256 TEXT NOT NULL,
+          content BLOB NOT NULL,
+          created_at TEXT NOT NULL,
+          PRIMARY KEY(session_id, id),
+          FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE
+        );
+        INSERT INTO artifacts (
+          id, session_id, call_id, kind, media_type, byte_size, sha256, content, created_at
+        )
+        SELECT id, session_id, call_id, kind, media_type, byte_size, sha256, content, created_at
+        FROM artifacts_v6;
+        DROP TABLE artifacts_v6;
+        CREATE INDEX artifacts_session_created
+          ON artifacts(session_id, created_at, id);
+      `);
+    },
+  },
 ];
 
 export function migrateDatabase(db) {

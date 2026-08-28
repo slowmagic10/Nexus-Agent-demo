@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto";
+import { assertArtifactStore } from "../artifacts/interface.js";
+import { beginFileChangeCapture, finishFileChangeCapture } from "../artifacts/file-change-manifest.js";
 import { redactSensitiveText } from "../security/redact.js";
 import {
   consumeSessionGrant,
@@ -14,16 +16,20 @@ const IDEMPOTENCY_MODES = new Set(["safe", "keyed", "unknown"]);
 const EFFECTS = new Set(["read", "write", "execute", "network", "memory", "credential", "state"]);
 
 export class ToolHost {
-  constructor({ registry, policy = new WorkspacePolicy(), projectGrantStore = null, defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
+  constructor({ registry, policy = new WorkspacePolicy(), projectGrantStore = null, artifactStore = null, defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
     if (!registry || typeof registry.get !== "function" || typeof registry.schemas !== "function") {
       throw new Error("Tool Host 需要 Tool Registry");
     }
     if (!Number.isSafeInteger(defaultTimeoutMs) || defaultTimeoutMs < 1) {
       throw new Error("Tool Host defaultTimeoutMs 必须是正整数");
     }
+    if (!Number.isSafeInteger(maxResultChars) || maxResultChars < 1) {
+      throw new Error("Tool Host maxResultChars 必须是正整数");
+    }
     this.registry = registry;
     this.policy = policy;
     this.projectGrantStore = projectGrantStore;
+    this.artifactStore = artifactStore ? assertArtifactStore(artifactStore) : null;
     this.defaultTimeoutMs = defaultTimeoutMs;
     this.maxResultChars = maxResultChars;
   }
@@ -41,6 +47,11 @@ export class ToolHost {
   async execute(call, { session, signal, requestApproval } = {}) {
     validateCall(call);
     if (!session || typeof session.dispatch !== "function") throw new Error("Tool Host 需要 Agent Session");
+    const finish = (targetCall, result) => complete(session, targetCall, {
+      ...result,
+      artifactStore: this.artifactStore,
+      maxResultChars: this.maxResultChars,
+    });
     const registration = resolveRegistryTool(this.registry, call.name);
     const tool = registration?.tool || null;
     const argsHash = hashValue(call.arguments);
@@ -56,7 +67,7 @@ export class ToolHost {
     const sourceCursor = session.cursor;
 
     if (!definition) {
-      return await complete(session, call, {
+      return await finish(call, {
         ok: false,
         status: "not_found",
         result: `未知工具：${call.name}`,
@@ -65,7 +76,7 @@ export class ToolHost {
     }
 
     if (!definitionAvailable(definition, session.state)) {
-      return await complete(session, call, {
+      return await finish(call, {
         ok: false,
         status: "capability_unavailable",
         result: `工具 ${call.name} 在当前 Session 中不可用。`,
@@ -81,7 +92,7 @@ export class ToolHost {
         argsHash,
         error: validationError,
       });
-      return await complete(session, call, {
+      return await finish(call, {
         ok: false,
         status: "validation_failed",
         result: `工具参数无效：${validationError}`,
@@ -109,7 +120,7 @@ export class ToolHost {
     });
 
     if (authorization.decision === "deny") {
-      return await complete(session, call, {
+      return await finish(call, {
         ok: false,
         status: "policy_denied",
         result: `权限策略拒绝工具调用：${authorization.reason}`,
@@ -117,7 +128,7 @@ export class ToolHost {
       });
     }
 
-    if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
+    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
 
     let executionGrantId = authorization.grantId;
     let executionGrantScope = authorization.grantScope;
@@ -147,7 +158,7 @@ export class ToolHost {
       if (approval.approved && !approvalScopes.includes(approval.scope)) {
         throw new Error(`当前工具审批不支持授权范围：${approval.scope}`);
       }
-      if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
+      if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
       const currentRegistration = resolveRegistryTool(this.registry, call.name);
       const currentTool = currentRegistration?.tool || null;
       const currentDefinition = currentTool ? normalizeDefinition(currentTool, this.defaultTimeoutMs) : null;
@@ -178,7 +189,7 @@ export class ToolHost {
         capabilityHash: authorization.capabilityHash,
       });
       if (!approval.approved) {
-        return await complete(session, call, {
+        return await finish(call, {
           ok: false,
           status: "denied",
           result: "用户拒绝了本次工具调用。",
@@ -195,7 +206,7 @@ export class ToolHost {
           policyVersion: authorization.policyVersion,
           currentPolicyVersion: currentAuthorization?.policyVersion || null,
         });
-        return await complete(session, call, {
+        return await finish(call, {
           ok: false,
           status: "approval_stale",
           result: "工具参数或定义在审批后发生变化，本次 Approval 已失效。",
@@ -233,12 +244,17 @@ export class ToolHost {
       executionGrantScope = approval.scope;
     }
 
-    if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
+    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
     if (executionGrantId && executionGrantScope === "once") await consumeSessionGrant(session, executionGrantId, call.id);
-    if (signal?.aborted) await cancelledBeforeStart(session, call, signal);
+    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
     const executionLease = acquireRegistryTool(this.registry, call.name, registration);
     if (!executionLease || definitionVersion(normalizeDefinition(executionLease.tool, this.defaultTimeoutMs)) !== toolVersion) {
-      return await capabilityUnavailable(session, call, argsHash, registration, "能力已撤销或替换，Adapter 未启动");
+      return await capabilityUnavailable(session, finish, call, argsHash, registration, "能力已撤销或替换，Adapter 未启动");
+    }
+    const changeCapture = await beginTrackedChanges(definition, call.arguments, session.state.workspace);
+    if (signal?.aborted) {
+      executionLease.release();
+      await cancelledBeforeStart(finish, call, signal);
     }
     const timeoutSignal = AbortSignal.timeout(definition.timeoutMs);
     const executionSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
@@ -262,6 +278,16 @@ export class ToolHost {
     }
     const started = performance.now();
     let implementationStarted = false;
+    let finalizedChanges = null;
+    const finishExecution = async (result) => {
+      finalizedChanges ||= finalizeTrackedChanges(changeCapture, {
+        artifactStore: this.artifactStore,
+        sessionId: session.id,
+        callId: call.id,
+      });
+      const fileChanges = await finalizedChanges;
+      return await finish(call, appendFileChangeSummary(result, fileChanges));
+    };
     try {
       const value = await raceWithSignal(() => {
         implementationStarted = true;
@@ -273,19 +299,19 @@ export class ToolHost {
           callId: call.id,
         });
       }, executionSignal);
-      return await complete(session, call, {
+      return await finishExecution({
         ok: true,
         status: "completed",
-        result: normalizeResult(value, this.maxResultChars),
+        result: normalizeResult(value),
         durationMs: Math.round(performance.now() - started),
       });
     } catch (error) {
       const durationMs = Math.round(performance.now() - started);
       if (signal?.aborted) {
-        if (!implementationStarted) await cancelledBeforeStart(session, call, signal, durationMs);
+        if (!implementationStarted) await cancelledBeforeStart(finish, call, signal, durationMs);
         const unknown = outcomeMayBeUnknown(definition);
         if (unknown) await executionUnknown(session, call, definition, argsHash, "cancelled", durationMs);
-        await complete(session, call, {
+        await finishExecution({
           ok: false,
           status: unknown ? "execution_unknown" : "cancelled",
           result: unknown
@@ -297,7 +323,7 @@ export class ToolHost {
       }
       if (timeoutSignal.aborted) {
         if (!implementationStarted) {
-          return await complete(session, call, {
+          return await finishExecution({
             ok: false,
             status: "timeout",
             result: `工具执行超时（${definition.timeoutMs}ms），实现尚未启动。`,
@@ -306,7 +332,7 @@ export class ToolHost {
         }
         const unknown = outcomeMayBeUnknown(definition);
         if (unknown) await executionUnknown(session, call, definition, argsHash, "timeout", durationMs);
-        return await complete(session, call, {
+        return await finishExecution({
           ok: false,
           status: unknown ? "execution_unknown" : "timeout",
           result: unknown
@@ -315,7 +341,7 @@ export class ToolHost {
           durationMs,
         });
       }
-      return await complete(session, call, {
+      return await finishExecution({
         ok: false,
         status: "external_failed",
         result: `工具执行失败：${redactSensitiveText(error?.message || "未知错误")}`,
@@ -339,7 +365,7 @@ function normalizeApprovalDecision(value, { projectAvailable }) {
   return { approved: true, scope };
 }
 
-async function capabilityUnavailable(session, call, argsHash, registration, reason) {
+async function capabilityUnavailable(session, finish, call, argsHash, registration, reason) {
   await session.dispatch({
     type: "TOOL_CAPABILITY_UNAVAILABLE",
     call,
@@ -347,7 +373,7 @@ async function capabilityUnavailable(session, call, argsHash, registration, reas
     registrationId: serializableRegistrationId(registration?.registrationId),
     reason,
   });
-  return await complete(session, call, {
+  return await finish(call, {
     ok: false,
     status: "capability_unavailable",
     result: "工具能力已撤销或替换，本次调用不会启动 Adapter。",
@@ -355,8 +381,8 @@ async function capabilityUnavailable(session, call, argsHash, registration, reas
   });
 }
 
-async function cancelledBeforeStart(session, call, signal, durationMs = 0) {
-  await complete(session, call, {
+async function cancelledBeforeStart(finish, call, signal, durationMs = 0) {
+  await finish(call, {
     ok: false,
     status: "cancelled",
     result: "任务已取消：工具尚未启动。",
@@ -379,7 +405,31 @@ async function executionUnknown(session, call, definition, argsHash, reason, dur
 }
 
 async function complete(session, call, result) {
-  const safeResult = redactSensitiveText(result.result);
+  const {
+    artifactStore = null,
+    maxResultChars = null,
+    ...publicResult
+  } = result;
+  const fullSafeResult = redactSensitiveText(result.result);
+  let safeResult = fullSafeResult;
+  let artifact = null;
+  if (maxResultChars && fullSafeResult.length > maxResultChars) {
+    if (artifactStore) {
+      try {
+        artifact = await artifactStore.put({
+          sessionId: session.id,
+          callId: call.id,
+          kind: "tool_output",
+          content: fullSafeResult,
+        });
+      } catch {
+        artifact = null;
+      }
+    }
+    safeResult = artifact
+      ? `${fullSafeResult.slice(0, maxResultChars)}\n…完整输出已保存为 Artifact：${artifact.id}（${artifact.byteSize} 字节）`
+      : `${fullSafeResult.slice(0, maxResultChars)}\n…（已截断）`;
+  }
   await session.dispatch({
     type: "TOOL_RESULT",
     call,
@@ -387,8 +437,10 @@ async function complete(session, call, result) {
     status: result.status,
     result: safeResult,
     durationMs: result.durationMs,
+    ...(artifact ? { artifact } : {}),
+    ...(result.fileChanges ? { fileChanges: result.fileChanges } : {}),
   });
-  return { ...result, result: safeResult };
+  return { ...publicResult, result: safeResult, ...(artifact ? { artifact } : {}) };
 }
 
 function normalizeDefinition(tool, defaultTimeoutMs) {
@@ -410,6 +462,7 @@ function normalizeDefinition(tool, defaultTimeoutMs) {
     effects,
     idempotency,
     timeoutMs,
+    changeTracking: normalizeChangeTracking(tool.changeTracking),
   };
   definition.capability = normalizeCapability(definition);
   return definition;
@@ -424,7 +477,94 @@ function definitionVersion(definition) {
     adapter: definition.adapter,
     timeoutMs: definition.timeoutMs,
     capability: definition.capability,
+    changeTracking: definition.changeTracking,
   });
+}
+
+function normalizeChangeTracking(value) {
+  if (value === undefined || value === null) return null;
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("changeTracking 必须是对象");
+  if (value.mode === "workspace" && Object.keys(value).every((key) => key === "mode")) {
+    return Object.freeze({ mode: "workspace", arguments: Object.freeze([]) });
+  }
+  if (value.mode === "paths" && Array.isArray(value.arguments) && value.arguments.length
+      && value.arguments.every((name) => typeof name === "string" && name)) {
+    const unknown = Object.keys(value).find((key) => !["mode", "arguments"].includes(key));
+    if (unknown) throw new Error(`changeTracking 包含未知字段 ${unknown}`);
+    return Object.freeze({ mode: "paths", arguments: Object.freeze([...new Set(value.arguments)]) });
+  }
+  throw new Error("changeTracking 必须声明 workspace 或带 arguments 的 paths 模式");
+}
+
+async function beginTrackedChanges(definition, args, workspace) {
+  if (!definition.changeTracking) return null;
+  try {
+    const paths = definition.changeTracking.arguments.map((name) => args[name]);
+    return await beginFileChangeCapture({
+      workspace,
+      mode: definition.changeTracking.mode,
+      paths,
+    });
+  } catch {
+    return { unavailable: true };
+  }
+}
+
+async function finalizeTrackedChanges(capture, { artifactStore, sessionId, callId }) {
+  if (!capture) return null;
+  if (capture.unavailable) return unavailableFileChanges();
+  try {
+    const { manifest, diff } = await finishFileChangeCapture(capture);
+    let diffArtifact = null;
+    if (diff && artifactStore) {
+      try {
+        diffArtifact = await artifactStore.put({
+          sessionId,
+          callId,
+          kind: "file_diff",
+          mediaType: "text/x-diff; charset=utf-8",
+          content: redactSensitiveText(diff),
+        });
+      } catch {
+        diffArtifact = null;
+      }
+    }
+    if (!manifest.summary.total && manifest.complete) return null;
+    return {
+      ...manifest,
+      ...(diffArtifact ? { diffArtifact } : {}),
+      ...(!diffArtifact && diff ? { diffUnavailable: true } : {}),
+    };
+  } catch {
+    return unavailableFileChanges();
+  }
+}
+
+function unavailableFileChanges() {
+  return {
+    version: 1,
+    complete: false,
+    summary: { created: 0, modified: 0, deleted: 0, total: 0 },
+    changes: [],
+    diffTruncated: false,
+    captureUnavailable: true,
+  };
+}
+
+function appendFileChangeSummary(result, fileChanges) {
+  if (!fileChanges) return result;
+  const { created, modified, deleted, total } = fileChanges.summary;
+  const summary = total
+    ? `文件变更：新增 ${created}、修改 ${modified}、删除 ${deleted}`
+    : "文件变更：采集不完整，未观察到可确认的变更";
+  const reference = fileChanges.diffArtifact
+    ? `；Diff Artifact：${fileChanges.diffArtifact.id}`
+    : "";
+  return {
+    ...result,
+    result: `${result.result}\n${summary}${reference}`,
+    fileChanges,
+  };
 }
 
 function definitionAvailable(definition, state) {
@@ -522,10 +662,9 @@ function outcomeMayBeUnknown(definition) {
   return definition.effects.some((effect) => ["write", "execute", "network", "credential"].includes(effect));
 }
 
-function normalizeResult(value, limit) {
+function normalizeResult(value) {
   const text = typeof value === "string" ? value : JSON.stringify(value);
-  const safe = redactSensitiveText(text ?? "");
-  return safe.length > limit ? `${safe.slice(0, limit)}\n…（已截断）` : safe;
+  return redactSensitiveText(text ?? "");
 }
 
 function hashValue(value) {

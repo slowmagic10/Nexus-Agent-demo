@@ -4,10 +4,12 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import { createSession, reduceSession } from "./core/state.js";
+import { createAgentProfileSnapshot } from "./core/agent-profile.js";
+import { appendAgentInstructions } from "./core/named-agent-profiles.js";
 import { AgentRuntime } from "./core/agent.js";
 import { AgentSession } from "./core/session.js";
 import { CapabilityRuntime } from "./capabilities/runtime.js";
-import { composeRuntimeConfig, createConfiguredProvider, inspectRuntimeConfig } from "./config/composer.js";
+import { composeRuntimeConfig, createConfiguredAgentProviders, inspectRuntimeConfig } from "./config/composer.js";
 import { createToolRegistry } from "./tools/registry.js";
 import { ToolHost } from "./tools/host.js";
 import { loadWorkspacePolicy } from "./tools/authorization.js";
@@ -17,7 +19,7 @@ import { SessionStore } from "./persistence/session-store.js";
 import { loadMcpConfig } from "./mcp/config.js";
 import { connectMcpTools } from "./mcp/tool-adapter.js";
 import { loadLocalEnvironment } from "./local-environment.js";
-import { createLocalMemoryScope } from "./memory/scope.js";
+import { createLocalMemoryScope, createMemoryScope } from "./memory/scope.js";
 import { createWorkspaceExecution } from "./execution/factory.js";
 import { createPermissionProfile } from "./tools/permission-profile.js";
 import { createModelMemoryExtractor, MemoryFlushPolicy } from "./memory/flush-policy.js";
@@ -39,15 +41,15 @@ if (config.printConfig) {
   process.exit(0);
 }
 const workspace = config.workspace;
-const memoryScope = createLocalMemoryScope(workspace);
+const baseMemoryScope = createLocalMemoryScope(workspace);
 const resumeArg = args.find((arg) => arg === "--resume" || arg.startsWith("--resume="));
 const resumeTarget = resumeArg === "--resume" ? "latest" : resumeArg?.slice("--resume=".length);
 const importFile = args.find((arg) => arg.startsWith("--import="))?.slice("--import=".length);
 const importAs = args.find((arg) => arg.startsWith("--import-as="))?.slice("--import-as=".length);
 const listOnly = args.includes("--sessions");
-const provider = createConfiguredProvider(config);
+const agentProviders = createConfiguredAgentProviders(config);
 
-const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace, memoryScope });
+const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace, memoryScope: baseMemoryScope });
 
 if (listOnly) {
   printSessions(store.list(workspace));
@@ -75,12 +77,44 @@ if (importAs) {
   process.exit(1);
 }
 
+let initialState = resumeTarget === "latest"
+  ? store.latest(workspace)
+  : resumeTarget
+    ? store.load(resumeTarget)
+    : null;
+
+if (resumeTarget && !initialState) {
+  store.close();
+  console.error(resumeTarget === "latest" ? "没有可恢复的会话。" : `未找到会话：${resumeTarget}`);
+  process.exit(1);
+}
+
+const explicitAgentProfile = ["cli", "environment", "local_environment"].includes(config.sources["agents.default"]);
+const resumedAgentProfileId = initialState?.agentProfile?.id;
+if (resumedAgentProfileId && explicitAgentProfile && resumedAgentProfileId !== config.agents.defaultProfile) {
+  store.close();
+  console.error("恢复会话时不能覆盖其 Agent Profile。");
+  process.exit(1);
+}
+const selectedAgentProfileId = resumedAgentProfileId || config.agents.defaultProfile;
+const selectedAgentProfile = config.agents.profiles.find((profile) => profile.id === selectedAgentProfileId);
+if (!selectedAgentProfile) {
+  store.close();
+  console.error(`会话绑定的 Agent Profile 已不可用：${selectedAgentProfileId}`);
+  process.exit(1);
+}
+const memoryScope = selectedAgentProfile.id === "default"
+  ? baseMemoryScope
+  : createMemoryScope({ ...baseMemoryScope, agentId: selectedAgentProfile.id });
+const selectedProviderBinding = agentProviders.get(selectedAgentProfile.id);
+const provider = selectedProviderBinding.provider;
+
 const context = await loadWorkspaceContext(workspace);
 
 const capabilityRuntime = new CapabilityRuntime();
 const workspaceExecution = createWorkspaceExecution(config, { environment: process.env });
 const permissionProfile = createPermissionProfile({
-  name: config.permission.profile,
+  name: selectedAgentProfile.permissionProfile,
   workspace,
   executionType: config.execution.type,
   networkTargets: config.network.targets,
@@ -89,6 +123,7 @@ const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
   memory: store.memory,
+  artifactStore: store.artifacts,
   capabilityRuntime,
   workspaceExecution,
   accessPolicy: permissionProfile,
@@ -99,25 +134,31 @@ const toolHost = new ToolHost({
   registry: tools,
   policy: await loadWorkspacePolicy(workspace, { profile: permissionProfile }),
   projectGrantStore,
+  artifactStore: store.artifacts,
+});
+const systemPrompt = appendAgentInstructions(buildSystemPrompt(context), selectedAgentProfile.instructions);
+const agentProfile = createAgentProfileSnapshot({
+  id: selectedAgentProfile.id,
+  provider: {
+    ...selectedProviderBinding.descriptor,
+  },
+  workspace,
+  systemPrompt,
+  toolSchemas: tools.schemas(),
+  permission: {
+    defaultProfile: permissionProfile.name,
+    profiles: [{ name: permissionProfile.name, policyVersion: toolHost.policy.version }],
+  },
+  execution: workspaceExecution.inspect?.() || { id: workspaceExecution.id },
+  memoryScope,
+  budgets: {
+    maxSteps: selectedAgentProfile.maxSteps,
+    maxTokensPerTurn: selectedAgentProfile.maxTokensPerTurn,
+  },
 });
 const ui = new TerminalUI();
-let initialState = resumeTarget === "latest"
-  ? store.latest(workspace)
-  : resumeTarget
-    ? store.load(resumeTarget)
-    : null;
-
-if (resumeTarget && !initialState) {
-  store.close();
-  ui.close();
-  await mcp.close();
-  projectGrantStore.close();
-  console.error(resumeTarget === "latest" ? "没有可恢复的会话。" : `未找到会话：${resumeTarget}`);
-  process.exit(1);
-}
-
 const resumed = Boolean(initialState);
-initialState ||= createSession({ provider: provider.name, workspace, memoryScope });
+initialState ||= createSession({ provider: provider.name, workspace, memoryScope, agentProfile });
 const session = new AgentSession({ state: initialState, reducer: reduceSession, journal: store });
 const memoryFlushPolicy = new MemoryFlushPolicy({
   memory: store.memory,
@@ -126,21 +167,27 @@ const memoryFlushPolicy = new MemoryFlushPolicy({
 session.subscribe((state) => ui.render(state));
 if (resumed) {
   await reconcileMemoryOutbox({ session, memory: store.memory });
-  await session.dispatch({ type: "RESUMED", provider: provider.name, workspace });
+  await session.dispatch({
+    type: "RESUMED",
+    provider: provider.name,
+    workspace,
+    agentProfile,
+    profileReason: "cli_resume",
+  });
 }
 const runtime = new AgentRuntime({
   session,
   provider,
   toolHost,
-  systemPrompt: buildSystemPrompt(context),
+  systemPrompt,
   retrieveMemory: (query, { signal } = {}) => store.memory.search(query, {
     scope: session.state.memoryScope,
     signal,
   }, { limit: 5 }),
   reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: store.memory, signal }),
   flushMemory: (input) => memoryFlushPolicy.flush(input),
-  maxSteps: config.runtime.maxSteps,
-  maxTokensPerTurn: config.runtime.maxTokensPerTurn,
+  maxSteps: selectedAgentProfile.maxSteps,
+  maxTokensPerTurn: selectedAgentProfile.maxTokensPerTurn,
 });
 
 ui.render(runtime.state);

@@ -1,9 +1,16 @@
 // FOUNDATION — coordinates isolated Agent sessions for local HTTP/SSE clients.
 import { randomUUID } from "node:crypto";
 import { createDelegatedSession, createSession, reduceSession } from "../core/state.js";
+import {
+  assertAgentProfileSnapshot,
+  createAgentProfileSnapshot,
+  deriveAgentProfileSnapshot,
+} from "../core/agent-profile.js";
+import { appendAgentInstructions } from "../core/named-agent-profiles.js";
 import { AgentRuntime } from "../core/agent.js";
 import { AgentSession } from "../core/session.js";
 import { assertMemoryInspection, assertMemoryInterface } from "../memory/interface.js";
+import { assertArtifactStore } from "../artifacts/interface.js";
 import { createModelMemoryExtractor, MemoryFlushPolicy } from "../memory/flush-policy.js";
 import { createMemoryScope } from "../memory/scope.js";
 import {
@@ -52,20 +59,17 @@ const PERMISSION_MODE_INFO = Object.freeze([
 ]);
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, memoryScope, maxSteps, maxTokensPerTurn, memoryFlushPolicy }) {
+  constructor({ workspace, provider, providerDescriptor, agentProfile, agentProfiles, agentProviders, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, artifactStore = store?.artifacts, memoryScope, maxSteps, maxTokensPerTurn, memoryFlushPolicy }) {
     this.workspace = workspace;
     this.provider = provider;
     this.systemPrompt = systemPrompt;
     this.store = store;
     this.memory = assertMemoryInterface(memory);
+    this.artifactStore = artifactStore ? assertArtifactStore(artifactStore) : null;
     this.projectGrantStore = projectGrantStore;
     assertMemoryInspection(this.memory);
     this.defaultMemoryScope = createMemoryScope(memoryScope || { workspace });
-    this.memoryFlushPolicy = memoryFlushPolicy || new MemoryFlushPolicy({
-      memory: this.memory,
-      extractCandidates: createModelMemoryExtractor(provider),
-    });
-    const fallbackHost = toolHost || new ToolHost({ registry: tools, policy: workspacePolicy });
+    const fallbackHost = toolHost || new ToolHost({ registry: tools, policy: workspacePolicy, artifactStore });
     const hosts = permissionToolHosts || { [defaultPermissionProfile || workspacePolicy?.profile?.name || "approval-required"]: fallbackHost };
     if (Object.hasOwn(hosts, "danger-full-access") && executionInfo?.isolation !== "trusted-local") {
       throw new Error("danger-full-access Tool Host 只能在 trusted-local Gateway 中注册");
@@ -82,10 +86,39 @@ export class GatewaySessionManager {
     this.executionInfo = executionInfo;
     this.maxSteps = maxSteps ?? Infinity;
     this.maxTokensPerTurn = maxTokensPerTurn ?? Infinity;
+    const runtimeProfiles = createRuntimeAgentProfiles({
+      catalog: agentProfiles,
+      snapshot: agentProfile,
+      providerClient: provider,
+      providerDescriptor: providerDescriptor || {
+        name: provider.name,
+        adapter: provider.constructor?.name || "unknown",
+        model: provider.model || provider.name,
+        baseUrl: provider.baseUrl || null,
+      },
+      providerBindings: agentProviders,
+      workspace,
+      systemPrompt,
+      toolSchemas: () => typeof tools?.schemas === "function" ? tools.schemas() : this.toolHost.schemas(),
+      permission: inspectPermissionConfiguration(this.toolHost),
+      execution: executionInfo,
+      memoryScope: this.defaultMemoryScope,
+      maxSteps: this.maxSteps,
+      maxTokensPerTurn: this.maxTokensPerTurn,
+    });
+    this.defaultAgentProfileId = runtimeProfiles.defaultProfile;
+    this.agentProfiles = new Map(runtimeProfiles.profiles.map((profile) => [profile.id, profile]));
+    for (const profile of this.agentProfiles.values()) {
+      profile.memoryFlushPolicy = memoryFlushPolicy || new MemoryFlushPolicy({
+        memory: this.memory,
+        extractCandidates: createModelMemoryExtractor(profile.provider),
+      });
+    }
+    this.agentProfile = this.#currentAgentProfile(this.defaultAgentProfileId);
     this.sessions = new Map();
   }
 
-  async create({ resume, permissionProfile, permissionConfirmation } = {}) {
+  async create({ resume, agentProfileId, permissionProfile, permissionConfirmation } = {}) {
     let state = resume === "latest"
       ? this.store.latest(this.workspace)
       : resume
@@ -97,20 +130,29 @@ export class GatewaySessionManager {
     }
 
     const existing = state ? this.sessions.get(state.id) : null;
-    if (existing) return existing.state;
+    if (existing) {
+      assertResumeAgentProfile(existing.state, agentProfileId);
+      return existing.state;
+    }
 
     const resumed = Boolean(state);
-    const selectedProfile = resumedProfile(state, permissionProfile, this.defaultPermissionProfile);
+    const runtimeProfile = this.#selectAgentProfile(state, agentProfileId);
+    const effectiveBudgets = effectiveSessionBudgets(state, runtimeProfile);
+    const runtimeAgentProfile = state?.lineage?.kind === "delegation"
+      ? deriveAgentProfileSnapshot(runtimeProfile.snapshot(), { budgets: effectiveBudgets })
+      : runtimeProfile.snapshot();
+    const selectedProfile = resumedProfile(state, permissionProfile, runtimeProfile.permissionProfile);
     const downgradeDangerousResume = resumed
       && selectedProfile === "danger-full-access"
       && permissionConfirmation !== "danger-full-access";
     const activeProfile = downgradeDangerousResume ? this.safePermissionProfile : selectedProfile;
     this.#assertPermissionProfile(activeProfile, permissionConfirmation);
     state ||= createSession({
-      provider: this.provider.name,
+      provider: runtimeProfile.provider.name,
       workspace: this.workspace,
-      memoryScope: this.defaultMemoryScope,
+      memoryScope: runtimeProfile.memoryScope,
       permissionProfile: activeProfile,
+      agentProfile: runtimeAgentProfile,
     });
     const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
     if (downgradeDangerousResume) {
@@ -122,12 +164,18 @@ export class GatewaySessionManager {
     }
 
     const entry = this.#registerSession(session, {
-      maxSteps: this.maxSteps,
-      maxTokensPerTurn: this.maxTokensPerTurn,
-    });
+      maxSteps: effectiveBudgets.maxSteps,
+      maxTokensPerTurn: effectiveBudgets.maxTokensPerTurn,
+    }, runtimeProfile);
     if (resumed) {
       await reconcileMemoryOutbox({ session, memory: this.memory });
-      await session.dispatch({ type: "RESUMED", provider: this.provider.name, workspace: this.workspace });
+      await session.dispatch({
+        type: "RESUMED",
+        provider: runtimeProfile.provider.name,
+        workspace: this.workspace,
+        agentProfile: runtimeAgentProfile,
+        profileReason: "gateway_resume",
+      });
     }
     return session.state;
   }
@@ -137,11 +185,34 @@ export class GatewaySessionManager {
   }
 
   runtimeInfo() {
+    const profile = this.#currentAgentProfile(this.defaultAgentProfileId);
     return {
       execution: this.executionInfo,
       runtime: {
         maxSteps: this.maxSteps === Infinity ? "unlimited" : this.maxSteps,
         maxTokensPerTurn: this.maxTokensPerTurn === Infinity ? "unlimited" : this.maxTokensPerTurn,
+      },
+      agentProfile: {
+        id: profile.id,
+        version: profile.version,
+        provider: profile.provider,
+        toolCount: profile.toolset.names.length,
+      },
+      agentProfiles: {
+        defaultProfile: this.defaultAgentProfileId,
+        profiles: [...this.agentProfiles.values()].map((item) => {
+          const snapshot = item.snapshot();
+          return {
+            id: item.id,
+            label: item.label,
+            description: item.description,
+            permissionProfile: item.permissionProfile,
+            maxSteps: durableLimit(item.maxSteps),
+            maxTokensPerTurn: durableLimit(item.maxTokensPerTurn),
+            provider: snapshot.provider,
+            version: snapshot.version,
+          };
+        }),
       },
       permission: {
         defaultProfile: this.defaultPermissionProfile,
@@ -172,6 +243,21 @@ export class GatewaySessionManager {
     return entry.state;
   }
 
+  async listArtifacts(id) {
+    await this.ensureLoaded(id);
+    if (!this.artifactStore) return [];
+    return this.artifactStore.list({ sessionId: id });
+  }
+
+  async getArtifact(id, artifactId) {
+    await this.ensureLoaded(id);
+    const artifact = this.artifactStore
+      ? await this.artifactStore.get(artifactId, { sessionId: id })
+      : null;
+    if (!artifact) throw new GatewayError(404, "Artifact 不存在或不属于当前 Session");
+    return artifact;
+  }
+
   async view(id) {
     const entry = await this.ensureLoaded(id);
     return { state: entry.state, cursor: entry.session.cursor };
@@ -185,8 +271,9 @@ export class GatewaySessionManager {
     }
     return this.store.branchSession(id, {
       cursor: parentCursor,
-      provider: this.provider.name,
+      provider: this.#runtimeProfileForState(entry.state).provider.name,
       workspace: this.workspace,
+      agentProfile: this.#runtimeProfileForState(entry.state).snapshot(),
     });
   }
 
@@ -224,8 +311,8 @@ export class GatewaySessionManager {
     if (parent.children.size) throw new GatewayError(409, "当前 Session 已有正在运行的 Child");
     if (signal?.aborted) throw signal.reason || new Error("委派已取消");
     const input = normalizeDelegationSpec(specification, {
-      maxSteps: this.maxSteps,
-      maxTokensPerTurn: this.maxTokensPerTurn,
+      maxSteps: parent.runtime.maxSteps,
+      maxTokensPerTurn: parent.runtime.maxTokensPerTurn,
     });
     const delegationId = `delegation-${randomUUID().slice(0, 12)}`;
     const childSessionId = `session-${randomUUID().slice(0, 12)}`;
@@ -248,12 +335,15 @@ export class GatewaySessionManager {
         id: childSessionId,
         delegationId,
         parentCursor: parent.session.cursor,
-        provider: this.provider.name,
+        provider: this.#runtimeProfileForState(parent.state).provider.name,
         workspace: this.workspace,
+        agentProfile: deriveAgentProfileSnapshot(parent.state.agentProfile, {
+          budgets: input.runtimeBudget,
+        }),
         delegatedAt,
       });
       const session = new AgentSession({ state, reducer: reduceSession, journal: this.store });
-      child = this.#registerSession(session, input.runtimeBudget);
+      child = this.#registerSession(session, input.runtimeBudget, this.#runtimeProfileForState(parent.state));
       parent.children.add(childSessionId);
       const onAbort = () => this.#cancelEntry(child, signal.reason?.message || "Parent Session 已取消");
       signal?.addEventListener("abort", onAbort, { once: true });
@@ -533,7 +623,7 @@ export class GatewaySessionManager {
     for (const listener of entry.subscribers) listener(state);
   }
 
-  #registerSession(session, { maxSteps, maxTokensPerTurn }) {
+  #registerSession(session, { maxSteps, maxTokensPerTurn }, runtimeProfile = this.#runtimeProfileForState(session.state)) {
     const entry = {
       state: session.state,
       session,
@@ -545,21 +635,44 @@ export class GatewaySessionManager {
     };
     entry.runtime = new AgentRuntime({
       session,
-      provider: this.provider,
+      provider: runtimeProfile.provider,
       toolHost: this.toolHost,
-      systemPrompt: this.systemPrompt,
+      systemPrompt: runtimeProfile.systemPrompt,
       retrieveMemory: (query, { signal } = {}) => this.memory.search(query, {
         scope: session.state.memoryScope,
         signal,
       }, { limit: 5 }),
       reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
-      flushMemory: (input) => this.memoryFlushPolicy.flush(input),
+      flushMemory: (input) => runtimeProfile.memoryFlushPolicy.flush(input),
       maxSteps,
       maxTokensPerTurn,
     });
     session.subscribe((next) => this.update(entry, next));
     this.sessions.set(session.id, entry);
     return entry;
+  }
+
+  #currentAgentProfile(id = this.defaultAgentProfileId) {
+    const runtimeProfile = this.agentProfiles.get(id);
+    if (!runtimeProfile) throw new GatewayError(400, `Agent Profile 不可用：${id}`);
+    this.agentProfile = runtimeProfile.snapshot();
+    return this.agentProfile;
+  }
+
+  #selectAgentProfile(state, requested) {
+    assertResumeAgentProfile(state, requested);
+    const id = state?.agentProfile?.id;
+    if (id && this.agentProfiles.has(id)) return this.agentProfiles.get(id);
+    if (id && id !== "legacy-default") {
+      throw new GatewayError(409, `会话绑定的 Agent Profile 已不可用：${id}`);
+    }
+    const selected = this.agentProfiles.get(requested || this.defaultAgentProfileId);
+    if (!selected) throw new GatewayError(400, `Agent Profile 不可用：${requested}`);
+    return selected;
+  }
+
+  #runtimeProfileForState(state) {
+    return this.agentProfiles.get(state?.agentProfile?.id) || this.agentProfiles.get(this.defaultAgentProfileId);
   }
 
   #startRun(entry, content, options = {}) {
@@ -674,6 +787,158 @@ export class GatewaySessionManager {
     if (/未找到.*Memory mutation/.test(error.message)) return new GatewayError(404, error.message);
     return error instanceof GatewayError ? error : new GatewayError(400, error.message);
   }
+}
+
+function createRuntimeAgentProfiles({
+  catalog,
+  snapshot,
+  providerClient,
+  providerDescriptor,
+  providerBindings,
+  workspace,
+  systemPrompt,
+  toolSchemas,
+  permission,
+  execution,
+  memoryScope,
+  maxSteps,
+  maxTokensPerTurn,
+}) {
+  if (snapshot) {
+    const fixed = assertAgentProfileSnapshot(snapshot);
+    return {
+      defaultProfile: fixed.id,
+      profiles: [{
+        id: fixed.id,
+        label: fixed.id,
+        description: "",
+        permissionProfile: fixed.permission.defaultProfile,
+        maxSteps: runtimeLimit(fixed.budgets.maxSteps),
+        maxTokensPerTurn: runtimeLimit(fixed.budgets.maxTokensPerTurn),
+        memoryScope: fixed.memoryScope,
+        systemPrompt,
+        provider: providerClient,
+        providerDescriptor,
+        snapshot: () => assertAgentProfileSnapshot(fixed),
+      }],
+    };
+  }
+  const definitions = catalog?.profiles || [{
+    id: "default",
+    label: "default",
+    description: "",
+    instructions: "",
+    permissionProfile: permission.defaultProfile,
+    maxSteps,
+    maxTokensPerTurn,
+  }];
+  const defaultProfile = catalog?.defaultProfile || "default";
+  if (!definitions.some((item) => item.id === defaultProfile)) {
+    throw new Error(`默认 Agent Profile 不存在：${defaultProfile}`);
+  }
+  const seen = new Set();
+  const bindings = providerBindings instanceof Map
+    ? providerBindings
+    : new Map(Object.entries(providerBindings || {}));
+  const profiles = definitions.map((definition) => {
+    if (!definition?.id || seen.has(definition.id)) throw new Error(`Agent Profile id 重复或无效：${definition?.id || "未指定"}`);
+    seen.add(definition.id);
+    const profilePermission = definition.permissionProfile || permission.defaultProfile;
+    if (!permission.profiles.some((item) => item.name === profilePermission)) {
+      throw new Error(`Agent Profile ${definition.id} 的权限档位不可用：${profilePermission}`);
+    }
+    const profileMaxSteps = definition.maxSteps ?? maxSteps;
+    const profileMaxTokens = definition.maxTokensPerTurn ?? maxTokensPerTurn;
+    const profileMemoryScope = definition.id === "default"
+      ? memoryScope
+      : createMemoryScope({ ...memoryScope, agentId: definition.id });
+    const profileSystemPrompt = appendAgentInstructions(systemPrompt, definition.instructions);
+    const binding = bindings.get(definition.id) || { provider: providerClient, descriptor: providerDescriptor };
+    if (!binding?.provider || typeof binding.provider.complete !== "function") {
+      throw new Error(`Agent Profile ${definition.id} 缺少可用 Provider`);
+    }
+    const descriptor = binding.descriptor || {
+      name: binding.provider.name,
+      adapter: binding.provider.constructor?.name || "unknown",
+      model: binding.provider.model || binding.provider.name,
+      baseUrl: binding.provider.baseUrl || null,
+    };
+    const snapshotFactory = () => createAgentProfileSnapshot({
+      id: definition.id,
+      provider: descriptor,
+      workspace,
+      systemPrompt: profileSystemPrompt,
+      toolSchemas: toolSchemas(),
+      permission: { ...permission, defaultProfile: profilePermission },
+      execution,
+      memoryScope: profileMemoryScope,
+      budgets: {
+        maxSteps: profileMaxSteps,
+        maxTokensPerTurn: profileMaxTokens,
+      },
+    });
+    return {
+      id: definition.id,
+      label: definition.label || definition.id,
+      description: definition.description || "",
+      permissionProfile: profilePermission,
+      maxSteps: profileMaxSteps,
+      maxTokensPerTurn: profileMaxTokens,
+      memoryScope: profileMemoryScope,
+      systemPrompt: profileSystemPrompt,
+      provider: binding.provider,
+      providerDescriptor: descriptor,
+      snapshot: snapshotFactory,
+    };
+  });
+  return { defaultProfile, profiles };
+}
+
+function runtimeLimit(value) {
+  return value === "unlimited" ? Infinity : value;
+}
+
+function durableLimit(value) {
+  return value === Infinity ? "unlimited" : value;
+}
+
+function effectiveSessionBudgets(state, runtimeProfile) {
+  const profileBudgets = {
+    maxSteps: runtimeProfile.maxSteps,
+    maxTokensPerTurn: runtimeProfile.maxTokensPerTurn,
+  };
+  if (state?.lineage?.kind !== "delegation") return profileBudgets;
+  return {
+    maxSteps: stricterLimit(runtimeLimit(state.agentProfile.budgets.maxSteps), profileBudgets.maxSteps),
+    maxTokensPerTurn: stricterLimit(
+      runtimeLimit(state.agentProfile.budgets.maxTokensPerTurn),
+      profileBudgets.maxTokensPerTurn,
+    ),
+  };
+}
+
+function stricterLimit(left, right) {
+  if (left === Infinity) return right;
+  if (right === Infinity) return left;
+  return Math.min(left, right);
+}
+
+function assertResumeAgentProfile(state, requested) {
+  if (!state || !requested) return;
+  if (state.agentProfile?.id !== requested) {
+    throw new GatewayError(409, "恢复会话时不能覆盖其 Agent Profile");
+  }
+}
+
+function inspectPermissionConfiguration(toolHost) {
+  if (typeof toolHost.inspect === "function") return toolHost.inspect();
+  return {
+    defaultProfile: toolHost.policy?.profile?.name || "workspace-auto",
+    profiles: [{
+      name: toolHost.policy?.profile?.name || "workspace-auto",
+      policyVersion: toolHost.policy?.version || null,
+    }],
+  };
 }
 
 function resumedProfile(state, requested, fallback) {

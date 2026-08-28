@@ -60,7 +60,43 @@ npm run gateway:local
 
 如果需要主动设置成本边界，可通过 `NEXUS_MAX_STEPS=20` / `--max-steps=20` 限制循环次数，通过 `NEXUS_MAX_TOKENS_PER_TURN=500000` / `--max-tokens-per-turn=500000` 限制累计 Token；`unlimited` 或 `0` 恢复为不限制。模型自身单次 Context Window、工具超时、审批、取消和沙箱边界仍然生效。
 
-配置按以下顺序覆盖：内置默认值、工作区 `nexus.config.json`、本机 `.nexus/config.local.json`、环境变量/`.env.local`、命令行参数。共享的 `nexus.config.json` 不允许保存 API Key；私有 JSON 和 `.env.local` 均由 Git 忽略。为防止不可信 workspace 在启动时拉起任意子进程或降低权限边界，两个 workspace JSON 配置层都不能启用 MCP、选择执行环境或 Permission Profile；这些能力只能由受信任环境变量或显式 CLI 参数启用。
+配置按以下顺序覆盖：内置默认值、工作区 `nexus.config.json`、本机 `.nexus/config.local.json`、环境变量/`.env.local`、命令行参数。共享的 `nexus.config.json` 不允许保存 API Key；私有 JSON 和 `.env.local` 均由 Git 忽略。为防止不可信 workspace 在启动时拉起任意子进程或降低权限边界，两个 workspace JSON 配置层都不能启用 MCP、选择执行环境或全局 Permission Profile；这些能力只能由受信任环境变量或显式 CLI 参数启用。本机具名 Agent Profile 可以选择预先支持的安全权限档位，但不能配置 `danger-full-access`。
+
+本机 `.nexus/config.local.json` 还可以定义具名 Agent Profile。它们复用当前 Provider，但可分别设置附加指令、默认权限和预算；非默认 Profile 使用自己的 Memory `agentId`，不会与其他 Agent 的长期记忆混用：
+
+```json
+{
+  "provider": {
+    "type": "openai-compatible",
+    "apiKey": "你的本机密钥",
+    "baseUrl": "https://api.deepseek.com",
+    "model": "deepseek-v4-flash"
+  },
+  "agents": {
+    "default": "coding",
+    "profiles": {
+      "coding": {
+        "label": "开发 Agent",
+        "description": "连续实现与验证",
+        "instructions": "优先交付可运行实现",
+        "permissionProfile": "workspace-auto",
+        "provider": { "model": "deepseek-v4-flash" }
+      },
+      "review": {
+        "label": "审查 Agent",
+        "description": "只读检查与问题报告",
+        "instructions": "只报告问题，不修改文件",
+        "permissionProfile": "read-only",
+        "maxSteps": 20,
+        "maxTokensPerTurn": 50000,
+        "provider": { "model": "deepseek-reasoner" }
+      }
+    }
+  }
+}
+```
+
+Web 左侧的“新任务 Agent”用于显式选择；CLI 可使用 `--agent-profile=review` 或 `NEXUS_AGENT_PROFILE=review`。每个 Profile 的 `provider` 可覆盖 `type/apiKey/baseUrl/model`，未填写字段继承最终全局 Provider 配置，因此同一个 DeepSeek Key 通常只需配置一次。Profile 选择只在创建新 Session 时生效，恢复会话继续使用其 durable Profile；如果配置中已删除该 Profile，恢复会明确失败而不会静默换 Agent。`--print-config` 会脱敏所有 API Key，也不会打印指令正文。当前不根据任务内容自动选模型，不做 active turn 热切换或 Provider fallback。
 
 可用下面的命令查看最终生效配置及每个字段的来源；API Key 只会显示为 `[REDACTED]`：
 
@@ -121,11 +157,14 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 - Agent Loop：模型、工具、Observation 循环默认不限制步骤数和累计 Token；可按需显式设置边界。模型被要求持续执行到完成并验证、明确阻塞或需要用户输入。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
 - Objective 与计划：每个用户任务建立 durable Objective；复杂任务可通过内置 `update_plan` 维护有版本的步骤状态，Journal 恢复和 Web Client Projection 会保留同一计划。
-- 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
+- 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。Child 重启恢复时预算只能保持或继续收紧，不能被具名 Profile 默认值扩大。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
+- Agent Profile：每个 Session baseline 保存不含密钥的 Provider/model、提示词与工具 schema hash、Policy、Execution、Memory scope 和预算版本；恢复配置变化会留下带字段分类和影响等级的 durable diff。可在本地私有配置中定义具名 Profile，并在 Web/CLI 创建新任务时显式选择；Child 继承身份并单独收紧预算。
+- Artifact：长 Shell、MCP、文件读取等成功或失败工具输出在 Tool Host 统一脱敏后保存到 Session 专属 SQLite Artifact Store，消息只保留预览和引用；模型可用 `read_artifact` 分段读取，Web 工具卡可加载完整输出。Portable Journal 可携带 Artifact，Import 与 Branch 会复制到目标 Session scope，运行时仍禁止直接跨 Session 访问。
+- 文件变更：`write_file` 与 `run_shell` 执行后生成有界 File Change Manifest；Journal 保存新增/修改/删除摘要和哈希，脱敏文本 Diff 保存为 Artifact，Web 工具卡可按需查看。工作区内符号链接写入会追踪真实目标，Shell 创建、改指向或删除链接会记录链接变化。`.git/.nexus/node_modules/.env*` 不参与内容采集，超限会明确显示为不完整。
 - 模型上下文：只从 durable event 投影消息、记忆与 Skills；默认按 32,000 estimated input tokens 规划窗口，超限时只保留连续的最近完整 turn，运行指标、审批和 UI 状态不会进入模型输入。
 - 工具安全：`read-only` 提供不可被 Policy/Grant/Approval 提升的只读闭环；`workspace-auto` 自动执行普通工作区写入与沙箱内常规 Shell；工作区删除、动态解释器、网络/安装/Git 写入审批并支持 Session Grant；秘密、宿主逃逸和系统破坏硬拒绝；工具有超时与取消信号。
 - Workspace 与 Skills：读取 `AGENTS.md`、`SOUL.md`，按需加载 `.nexus/skills/*/SKILL.md`。
-- 持久化：SQLite 保存会话、消息、事件、短期记忆、已加载 Skills 和跨会话长期记忆；自动执行事务化 schema migration，并用带校验和的 checkpoint 加速长会话恢复。
+- 持久化：SQLite 保存会话、消息、事件、文本 Artifact、短期记忆、已加载 Skills 和跨会话长期记忆；自动执行事务化 schema migration，并用带校验和的 checkpoint 加速长会话恢复。
 - 恢复与迁移：按 ID 恢复会话，安全闭合中断的工具调用，并导入、导出可重放 Journal Archive。
 - 可观测性：记录模型/工具调用数、审批数、Token 用量以及模型、工具和单轮耗时。
 - 本地 Gateway：HTTP API、带游标的增量 SSE、远程审批、取消、记忆管理和同源 Web 控制台。

@@ -4,14 +4,19 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { createSessionBranch, migrateSessionState, reduceSession } from "../core/state.js";
+import { deriveAgentProfileSnapshot } from "../core/agent-profile.js";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createStatePatch } from "../state-patch.js";
 import { EVENT_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
 import { SQLiteMemoryAdapter } from "../memory/sqlite-adapter.js";
 import { createMemoryScope } from "../memory/scope.js";
+import { SQLiteArtifactAdapter } from "../artifacts/sqlite-adapter.js";
+import { artifactMetadata, MAX_ARTIFACT_BYTES } from "../artifacts/interface.js";
 
 const JOURNAL_FORMAT = "nexus.session-journal";
 const JOURNAL_FORMAT_VERSION = 1;
+const MAX_PORTABLE_ARTIFACTS = 256;
+const MAX_PORTABLE_ARTIFACT_BYTES = 64_000_000;
 
 export class SessionStore {
   constructor(file, { checkpointInterval = 100, workspace, memoryScope } = {}) {
@@ -40,6 +45,7 @@ export class SessionStore {
       db: this.db,
       defaultScope: this.memoryScope,
     });
+    this.artifacts = new SQLiteArtifactAdapter({ db: this.db });
     this.upsert = this.db.prepare(`
       INSERT INTO sessions (
         id, created_at, updated_at, provider, workspace, phase, message_count, state_json
@@ -77,16 +83,7 @@ export class SessionStore {
     const durableState = redactSensitiveValue(state);
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.save(durableState);
-      this.db.prepare(`
-        INSERT INTO session_events (session_id, seq, at, type, event_json, schema_version)
-        VALUES (?, 1, ?, 'SESSION_BASELINE', ?, ?)
-      `).run(
-        durableState.id,
-        durableState.createdAt,
-        JSON.stringify({ type: "SESSION_BASELINE", at: durableState.createdAt, state: durableState }),
-        EVENT_SCHEMA_VERSION,
-      );
+      this.#insertJournalBaseline(durableState);
       this.db.exec("COMMIT");
       return durableState;
     } catch (error) {
@@ -209,6 +206,7 @@ export class SessionStore {
     id = `session-${randomUUID().slice(0, 12)}`,
     provider,
     workspace,
+    agentProfile,
     branchedAt = new Date().toISOString(),
   }) {
     if (this.db.prepare("SELECT 1 AS found FROM sessions WHERE id = ?").get(id)) {
@@ -221,9 +219,25 @@ export class SessionStore {
       parentCursor: cursor,
       provider: provider || parent.provider,
       workspace: workspace || parent.workspace,
+      agentProfile,
       branchedAt,
     });
-    return this.ensureJournal(branch);
+    const artifactIds = referencedArtifactIds(parent);
+    const durableBranch = redactSensitiveValue(branch);
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.#insertJournalBaseline(durableBranch);
+      copySessionArtifacts(this.db, {
+        sourceSessionId: parentId,
+        targetSessionId: id,
+        artifactIds,
+      });
+      this.db.exec("COMMIT");
+      return durableBranch;
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
   }
 
   exportJournal(id, { exportedAt = new Date().toISOString() } = {}) {
@@ -232,6 +246,7 @@ export class SessionStore {
     if (this.latestSessionCursor(id) === 0) {
       state = this.ensureJournal(state);
     }
+    const artifacts = exportSessionArtifacts(this.db, id);
     const core = {
       format: "nexus.session-journal",
       formatVersion: 1,
@@ -246,6 +261,7 @@ export class SessionStore {
         lineage: state.lineage || null,
       },
       events: this.readSessionEvents(id),
+      ...(artifacts.length ? { artifacts } : {}),
     };
     return {
       ...core,
@@ -282,6 +298,7 @@ export class SessionStore {
           EVENT_SCHEMA_VERSION,
         );
       }
+      insertPortableArtifacts(this.db, validated.artifacts, targetId);
       if (imported.events.length % this.checkpointInterval === 0) {
         this.#writeCheckpoint(imported.state, imported.events.length, imported.state.updatedAt);
       }
@@ -362,6 +379,19 @@ export class SessionStore {
         checksum = excluded.checksum,
         created_at = excluded.created_at
     `).run(state.id, cursor, stateJson, checkpointChecksum(state.id, cursor, stateJson), createdAt);
+  }
+
+  #insertJournalBaseline(state) {
+    this.save(state);
+    this.db.prepare(`
+      INSERT INTO session_events (session_id, seq, at, type, event_json, schema_version)
+      VALUES (?, 1, ?, 'SESSION_BASELINE', ?, ?)
+    `).run(
+      state.id,
+      state.createdAt,
+      JSON.stringify({ type: "SESSION_BASELINE", at: state.createdAt, state }),
+      EVENT_SCHEMA_VERSION,
+    );
   }
 
   #latestValidCheckpoint(id, until = Number.MAX_SAFE_INTEGER) {
@@ -471,6 +501,7 @@ function validateJournalArchive(archive) {
     throw new Error("portable journal checksum 校验失败");
   }
   if (!archive.events.length) throw new Error("portable journal events 不能为空");
+  const artifacts = validatePortableArtifacts(archive.artifacts);
 
   const sourceId = validateImportTarget(archive.session.id, "archive session ID");
   let state = null;
@@ -524,7 +555,8 @@ function validateJournalArchive(archive) {
     throw new Error("portable journal session cursor 与 events 数量不一致");
   }
   validateArchiveMetadata(archive.session, state, sourceStateSchemaVersion);
-  return { events, state };
+  if (Object.hasOwn(archive, "artifacts")) validateArtifactReferences(state, artifacts, sourceId);
+  return { events, state, artifacts };
 }
 
 function adaptJournal(events, { id, workspace }) {
@@ -536,6 +568,10 @@ function adaptJournal(events, { id, workspace }) {
     id,
     workspace,
     memoryScope: createMemoryScope({ ...sourceBaseline.memoryScope, workspace }),
+    agentProfile: deriveAgentProfileSnapshot(sourceBaseline.agentProfile, {
+      workspace,
+      memoryScope: createMemoryScope({ ...sourceBaseline.memoryScope, workspace }),
+    }),
     pendingMemoryMutations: sourceBaseline.pendingMemoryMutations.map((mutation) => (
       adaptMemoryMutation(mutation, { sourceId, id, workspace })
     )),
@@ -543,6 +579,8 @@ function adaptJournal(events, { id, workspace }) {
       ...issue,
       mutation: adaptMemoryMutation(issue.mutation, { sourceId, id, workspace }),
     })),
+    toolGrants: sourceBaseline.toolGrants.map((grant) => adaptSessionGrant(grant, { id, workspace })),
+    events: adaptStateArtifactReferences(sourceBaseline.events, id),
   });
   let state = baseline;
   adaptedEvents.push({
@@ -556,9 +594,29 @@ function adaptJournal(events, { id, workspace }) {
 
   for (const event of events.slice(1)) {
     const action = redactSensitiveValue(structuredClone(event.action));
-    if (action.type === "RESUMED") action.workspace = workspace;
+    if (action.type === "RESUMED") {
+      action.workspace = workspace;
+      if (action.agentProfile) {
+        action.agentProfile = deriveAgentProfileSnapshot(action.agentProfile, {
+          workspace,
+          memoryScope: createMemoryScope({ ...action.agentProfile.memoryScope, workspace }),
+        });
+      }
+    }
     if (action.type === "MEMORY_MUTATION_REQUESTED") {
       action.mutation = adaptMemoryMutation(action.mutation, { sourceId, id, workspace });
+    }
+    if (action.type === "TOOL_GRANT_ISSUED") {
+      action.grant = adaptSessionGrant(action.grant, { id, workspace });
+    }
+    if (action.type === "TOOL_RESULT" && action.artifact) {
+      action.artifact = { ...action.artifact, sessionId: id };
+    }
+    if (action.type === "TOOL_RESULT" && action.fileChanges?.diffArtifact) {
+      action.fileChanges = {
+        ...action.fileChanges,
+        diffArtifact: { ...action.fileChanges.diffArtifact, sessionId: id },
+      };
     }
     if ([
       "MEMORY_MUTATION_APPLIED",
@@ -591,6 +649,10 @@ function adaptMemoryMutation(mutation, { sourceId, id, workspace }) {
   if (adapted.provenance?.sessionId === sourceId) adapted.provenance.sessionId = id;
   adapted.reconcilePolicy = "manual";
   return adapted;
+}
+
+function adaptSessionGrant(grant, { id, workspace }) {
+  return { ...structuredClone(grant), sessionId: id, workspace };
 }
 
 function adaptMutationId(value, sourceId, id) {
@@ -639,7 +701,152 @@ function journalCore(archive) {
     formatVersion: archive.formatVersion,
     session: archive.session,
     events: archive.events,
+    ...(Object.hasOwn(archive, "artifacts") ? { artifacts: archive.artifacts } : {}),
   };
+}
+
+function exportSessionArtifacts(db, sessionId) {
+  return db.prepare(`
+    SELECT id, call_id, kind, media_type, byte_size, sha256, content, created_at
+    FROM artifacts WHERE session_id = ? ORDER BY created_at, id
+  `).all(sessionId).map((row) => {
+    const bytes = Buffer.isBuffer(row.content) ? row.content : Buffer.from(row.content);
+    if (bytes.byteLength !== row.byte_size || artifactDigest(bytes) !== row.sha256) {
+      throw new Error(`Artifact ${row.id} 完整性校验失败，无法导出`);
+    }
+    return {
+      id: row.id,
+      callId: row.call_id,
+      kind: row.kind,
+      mediaType: row.media_type,
+      byteSize: row.byte_size,
+      sha256: row.sha256,
+      createdAt: row.created_at,
+      content: bytes.toString("utf8"),
+    };
+  });
+}
+
+function validatePortableArtifacts(value) {
+  if (value === undefined) return [];
+  if (!Array.isArray(value)) throw new Error("portable journal artifacts 必须是数组");
+  if (value.length > MAX_PORTABLE_ARTIFACTS) {
+    throw new Error(`portable journal Artifact 数量超过 ${MAX_PORTABLE_ARTIFACTS}`);
+  }
+  const ids = new Set();
+  let totalBytes = 0;
+  return value.map((source, index) => {
+    if (!source || typeof source !== "object" || Array.isArray(source)) {
+      throw new Error(`portable journal Artifact ${index + 1} 必须是对象`);
+    }
+    if (Object.hasOwn(source, "sessionId")) {
+      throw new Error(`portable journal Artifact ${index + 1} 不得绑定源 Session`);
+    }
+    if (typeof source.content !== "string") {
+      throw new Error(`portable journal Artifact ${index + 1} 首版只支持文本内容`);
+    }
+    const bytes = Buffer.from(source.content, "utf8");
+    if (bytes.byteLength > MAX_ARTIFACT_BYTES) {
+      throw new Error(`portable journal Artifact ${index + 1} 超过 ${MAX_ARTIFACT_BYTES} 字节上限`);
+    }
+    totalBytes += bytes.byteLength;
+    if (totalBytes > MAX_PORTABLE_ARTIFACT_BYTES) {
+      throw new Error(`portable journal Artifact 总量超过 ${MAX_PORTABLE_ARTIFACT_BYTES} 字节上限`);
+    }
+    const metadata = artifactMetadata({ ...source, sessionId: "portable-validation" });
+    if (metadata.byteSize !== bytes.byteLength || metadata.sha256 !== artifactDigest(bytes)) {
+      throw new Error(`portable journal Artifact ${metadata.id} 完整性校验失败`);
+    }
+    if (ids.has(metadata.id)) throw new Error(`portable journal Artifact ID 重复：${metadata.id}`);
+    ids.add(metadata.id);
+    return {
+      id: metadata.id,
+      callId: metadata.callId,
+      kind: metadata.kind,
+      mediaType: metadata.mediaType,
+      byteSize: metadata.byteSize,
+      sha256: metadata.sha256,
+      createdAt: metadata.createdAt,
+      content: source.content,
+    };
+  });
+}
+
+function validateArtifactReferences(state, artifacts, sourceId) {
+  const records = new Map(artifacts.map((artifact) => [artifact.id, artifact]));
+  for (const event of state.events || []) {
+    const references = [event.artifact, event.fileChanges?.diffArtifact].filter(Boolean);
+    for (const reference of references) {
+      const record = records.get(reference.id);
+      if (!record) throw new Error(`portable journal 缺少被事件引用的 Artifact：${reference.id}`);
+      const expected = artifactMetadata({ ...record, sessionId: sourceId });
+      const actual = artifactMetadata(reference);
+      if (stableStringify(expected) !== stableStringify(actual)) {
+        throw new Error(`portable journal Artifact ${reference.id} 元数据与事件引用不一致`);
+      }
+    }
+  }
+}
+
+function insertPortableArtifacts(db, artifacts, sessionId) {
+  if (!artifacts.length) return;
+  const insert = db.prepare(`
+    INSERT INTO artifacts (
+      id, session_id, call_id, kind, media_type, byte_size, sha256, content, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  for (const artifact of artifacts) {
+    insert.run(
+      artifact.id,
+      sessionId,
+      artifact.callId,
+      artifact.kind,
+      artifact.mediaType,
+      artifact.byteSize,
+      artifact.sha256,
+      Buffer.from(artifact.content, "utf8"),
+      artifact.createdAt,
+    );
+  }
+}
+
+function referencedArtifactIds(state) {
+  return [...new Set((state.events || []).flatMap((event) => [
+    event.artifact?.id,
+    event.fileChanges?.diffArtifact?.id,
+  ]).filter((id) => typeof id === "string" && id))];
+}
+
+function copySessionArtifacts(db, { sourceSessionId, targetSessionId, artifactIds }) {
+  if (!artifactIds.length) return;
+  const copy = db.prepare(`
+    INSERT INTO artifacts (
+      id, session_id, call_id, kind, media_type, byte_size, sha256, content, created_at
+    )
+    SELECT id, ?, call_id, kind, media_type, byte_size, sha256, content, created_at
+    FROM artifacts WHERE session_id = ? AND id = ?
+  `);
+  for (const artifactId of artifactIds) {
+    const result = copy.run(targetSessionId, sourceSessionId, artifactId);
+    if (result.changes !== 1) throw new Error(`Branch 引用的 Artifact 不存在：${artifactId}`);
+  }
+}
+
+function adaptStateArtifactReferences(events, sessionId) {
+  return (events || []).map((event) => ({
+    ...event,
+    ...(event.artifact ? { artifact: { ...event.artifact, sessionId } } : {}),
+    ...(event.fileChanges?.diffArtifact ? {
+      fileChanges: {
+        ...event.fileChanges,
+        diffArtifact: { ...event.fileChanges.diffArtifact, sessionId },
+      },
+    } : {}),
+  }));
+}
+
+function artifactDigest(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 function legacyArchiveChecksum(core) {

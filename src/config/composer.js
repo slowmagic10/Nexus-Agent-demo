@@ -11,6 +11,10 @@ import {
 } from "../runtime-options.js";
 import { normalizeDockerImage } from "../execution/docker-options.js";
 import { normalizeNetworkTargets } from "../execution/network-target.js";
+import {
+  inspectNamedAgentProfiles,
+  normalizeNamedAgentProfiles,
+} from "../core/named-agent-profiles.js";
 
 const PROFILE_FILE = "nexus.config.json";
 const LOCAL_FILE = path.join(".nexus", "config.local.json");
@@ -41,6 +45,7 @@ export async function composeRuntimeConfig({
     "execution.type": "native",
     "execution.dockerImage": null,
     "permission.profile": "workspace-auto",
+    "agents.default": "default",
     "network.targets": [],
     "mcp.file": null,
     "gateway.port": 4317,
@@ -57,6 +62,19 @@ export async function composeRuntimeConfig({
     values["provider.type"] = values["provider.apiKey"] ? "openai-compatible" : "demo";
     sources["provider.type"] = `derived:${sources["provider.apiKey"]}`;
   }
+
+  const agents = normalizeNamedAgentProfiles(local?.agentProfiles, {
+    defaultId: values["agents.default"],
+    defaultPermissionProfile: values["permission.profile"],
+    maxSteps: values["runtime.maxSteps"],
+    maxTokensPerTurn: values["runtime.maxTokensPerTurn"],
+    defaultProvider: {
+      type: values["provider.type"],
+      apiKey: values["provider.apiKey"],
+      baseUrl: values["provider.baseUrl"],
+      model: values["provider.model"],
+    },
+  });
 
   return {
     workspace,
@@ -75,6 +93,7 @@ export async function composeRuntimeConfig({
       dockerImage: values["execution.dockerImage"],
     },
     permission: { profile: values["permission.profile"] },
+    agents,
     network: { targets: values["network.targets"] },
     mcp: { file: values["mcp.file"] },
     gateway: { port: values["gateway.port"] },
@@ -89,12 +108,34 @@ export async function composeRuntimeConfig({
 }
 
 export function createConfiguredProvider(config) {
-  if (config.provider.type === "demo") return new DemoProvider();
+  return createProvider(config.provider);
+}
+
+export function createConfiguredAgentProviders(config) {
+  return new Map(config.agents.profiles.map((profile) => [profile.id, {
+    provider: createProvider(profile.provider),
+    descriptor: providerDescriptor(profile.provider),
+  }]));
+}
+
+function createProvider(provider) {
+  if (provider.type === "demo") return new DemoProvider();
   return new OpenAICompatibleProvider({
-    apiKey: config.provider.apiKey,
-    baseUrl: config.provider.baseUrl,
-    model: config.provider.model,
+    apiKey: provider.apiKey,
+    baseUrl: provider.baseUrl,
+    model: provider.model,
   });
+}
+
+function providerDescriptor(provider) {
+  return provider.type === "demo"
+    ? { name: "offline-demo", adapter: "demo", model: "offline-demo", baseUrl: null }
+    : {
+        name: `openai-compatible/${provider.model}`,
+        adapter: provider.type,
+        model: provider.model,
+        baseUrl: provider.baseUrl,
+      };
 }
 
 export function inspectRuntimeConfig(config) {
@@ -112,6 +153,7 @@ export function inspectRuntimeConfig(config) {
     },
     execution: { ...config.execution },
     permission: { ...config.permission },
+    agents: inspectNamedAgentProfiles(config.agents),
     network: { targets: [...config.network.targets] },
     mcp: { file: config.mcp.file },
     gateway: { port: config.gateway.port },
@@ -129,7 +171,7 @@ async function readConfigFile(file, { label, allowApiKey }) {
     throw new Error(`无法读取 ${label} ${file}：${error.message}`);
   }
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) throw new Error(`${label} 必须是 JSON 对象`);
-  assertKnownKeys(payload, new Set(["provider", "runtime", "mcp", "gateway"]), label);
+  assertKnownKeys(payload, new Set(["provider", "runtime", "mcp", "gateway", ...(allowApiKey ? ["agents"] : [])]), label);
   const values = {};
   if (payload.provider !== undefined) {
     assertObject(payload.provider, `${label}.provider`);
@@ -161,7 +203,14 @@ async function readConfigFile(file, { label, allowApiKey }) {
     assertKnownKeys(payload.gateway, new Set(["port"]), `${label}.gateway`);
     copyDefined(values, "gateway.port", payload.gateway.port);
   }
-  return { file, values };
+  let agentProfiles;
+  if (payload.agents !== undefined) {
+    assertObject(payload.agents, `${label}.agents`);
+    assertKnownKeys(payload.agents, new Set(["default", "profiles"]), `${label}.agents`);
+    copyDefined(values, "agents.default", payload.agents.default);
+    agentProfiles = payload.agents.profiles;
+  }
+  return { file, values, agentProfiles };
 }
 
 function applyEnvironment(values, sources, env, localEnvironment) {
@@ -175,6 +224,7 @@ function applyEnvironment(values, sources, env, localEnvironment) {
     NEXUS_EXECUTION: "execution.type",
     NEXUS_DOCKER_IMAGE: "execution.dockerImage",
     NEXUS_PERMISSION_PROFILE: "permission.profile",
+    NEXUS_AGENT_PROFILE: "agents.default",
     NEXUS_NETWORK_TARGETS: "network.targets",
     NEXUS_MCP_CONFIG: "mcp.file",
     NEXUS_GATEWAY_PORT: "gateway.port",
@@ -200,6 +250,7 @@ function applyCli(values, sources, args) {
     execution: "execution.type",
     "docker-image": "execution.dockerImage",
     "permission-profile": "permission.profile",
+    "agent-profile": "agents.default",
     mcp: "mcp.file",
     port: "gateway.port",
   };

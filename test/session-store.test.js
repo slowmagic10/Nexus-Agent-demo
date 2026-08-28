@@ -162,10 +162,20 @@ test("旧数据库会按顺序执行显式 schema migration", async () => {
     assert.ok(eventColumns.includes("schema_version"));
     assert.ok(memoryEventColumns.includes("schema_version"));
     assert.ok(mutationColumns.includes("request_hash"));
-    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5]);
+    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7]);
     assert.ok(store.db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_checkpoints'",
     ).get());
+    assert.ok(store.db.prepare(
+      "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'",
+    ).get());
+    assert.deepEqual(
+      store.db.prepare("PRAGMA table_info(artifacts)").all()
+        .filter((column) => column.pk)
+        .sort((left, right) => left.pk - right.pk)
+        .map((column) => column.name),
+      ["session_id", "id"],
+    );
     const [migratedMemory] = await store.searchMemories("旧版");
     assert.equal(migratedMemory.id, "memory-legacy");
     assert.equal(migratedMemory.scope.workspace, workspace);
@@ -187,7 +197,8 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 11);
+    assert.equal(restored.schemaVersion, 12);
+    assert.equal(restored.agentProfile.id, "legacy-default");
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
     assert.equal(restored.permissionProfile, "workspace-auto");
@@ -219,7 +230,8 @@ test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 11);
+  assert.equal(migrated.schemaVersion, 12);
+  assert.equal(migrated.agentProfile.id, "legacy-default");
   assert.equal(migrated.toolGrants[0].usage, "single_use");
   assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
   assert.equal(migrated.toolGrants[0].consumedByCallId, "call-legacy");

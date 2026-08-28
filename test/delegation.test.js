@@ -88,6 +88,9 @@ test("Gateway 单层委派只传显式上下文、继承受限预算并回填结
   assert.deepEqual(delegation.context, ["只传递这一条事实"]);
   assert.equal(child.lineage.parentSessionId, parent.id);
   assert.equal(child.objective.text, "检查独立模块");
+  assert.deepEqual(child.agentProfile.budgets, { maxSteps: 4, maxTokensPerTurn: 2_000 });
+  assert.equal(child.agentProfile.toolset.schemaHash, completed.agentProfile.toolset.schemaHash);
+  assert.deepEqual(child.agentProfile.permission, completed.agentProfile.permission);
   assert.match(child.messages[0].content, /只传递这一条事实/);
   assert.doesNotMatch(child.messages[0].content, /私有 transcript/);
   assert.match(completed.messages.at(-1).content, /父任务已合并 Child 结果/);
@@ -135,6 +138,57 @@ test("Child 的风险工具审批代理到 Parent 后继续执行", async (t) =>
   assert.ok(completed.events.some((event) => event.type === "agent.transfer_approval_granted"));
   assert.ok(child.events.some((event) => event.type === "approval.granted"));
   assert.match(child.messages.find((message) => message.role === "tool")?.content || "", /Child 动作完成/);
+});
+
+test("Gateway 重启恢复 Child 时保留收紧后的 durable 预算", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-child-resume-budget-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const host = { schemas: () => [], execute: async () => { throw new Error("不应执行"); } };
+  const provider = {
+    name: "child-budget-provider",
+    complete: async () => ({ text: "Child 完成", toolCalls: [] }),
+  };
+  const options = {
+    workspace,
+    provider,
+    toolHost: host,
+    permissionToolHosts: { "workspace-auto": host },
+    defaultPermissionProfile: "workspace-auto",
+    systemPrompt: () => "test",
+    store,
+    maxSteps: 6,
+    maxTokensPerTurn: 12_000,
+  };
+  let manager = new GatewaySessionManager(options);
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const parent = await manager.create();
+  await manager.delegate(parent.id, {
+    objective: "验证 Child 预算",
+    context: [],
+    budget: { maxSteps: 3, maxTokensPerTurn: 4_000 },
+  });
+  const childId = (await manager.get(parent.id)).delegations.at(-1).childSessionId;
+  const beforeRestart = await manager.get(childId);
+  assert.deepEqual(beforeRestart.agentProfile.budgets, { maxSteps: 3, maxTokensPerTurn: 4_000 });
+  await manager.close();
+
+  manager = new GatewaySessionManager(options);
+  const resumed = await manager.create({ resume: childId });
+  assert.deepEqual(resumed.agentProfile.budgets, { maxSteps: 3, maxTokensPerTurn: 4_000 });
+  assert.equal(manager.sessions.get(childId).runtime.maxSteps, 3);
+  assert.equal(manager.sessions.get(childId).runtime.maxTokensPerTurn, 4_000);
+
+  await manager.close();
+  manager = new GatewaySessionManager({ ...options, maxSteps: 2, maxTokensPerTurn: 3_000 });
+  const tightened = await manager.create({ resume: childId });
+  assert.deepEqual(tightened.agentProfile.budgets, { maxSteps: 2, maxTokensPerTurn: 3_000 });
+  assert.equal(manager.sessions.get(childId).runtime.maxSteps, 2);
+  assert.equal(manager.sessions.get(childId).runtime.maxTokensPerTurn, 3_000);
 });
 
 async function createDelegationFixture({ childResult = "完成", waitForChildAbort = false, childNeedsApproval = false } = {}) {

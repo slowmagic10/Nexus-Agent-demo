@@ -6,6 +6,8 @@ import {
 } from "/keyboard.js";
 import { grantViewModel } from "/grants.js";
 import { objectivePlanViewModel } from "/plan-view.js";
+import { profileDriftViewModel } from "/profile-view.js";
+import { artifactIdFromToolResult } from "/artifact-view.js";
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
@@ -14,6 +16,7 @@ const state = {
   cursor: 0,
   source: null,
   runtime: null,
+  selectedAgentProfileId: "default",
   selectedPermissionProfile: "workspace-auto",
   inspectorTab: "events",
   cancelling: false,
@@ -49,6 +52,7 @@ const elements = {
   dangerConfirm: $("#danger-confirm"),
   dangerConfirmBackdrop: $("#danger-confirm-backdrop"),
   dangerConfirmAccept: $("#danger-confirm-accept"),
+  agentProfileSelect: $("#agent-profile-select"),
 };
 
 applyTheme(savedTheme());
@@ -73,6 +77,7 @@ elements.export.addEventListener("click", exportSession);
 elements.themeToggle.addEventListener("click", toggleTheme);
 elements.permissionTrigger.addEventListener("click", togglePermissionMenu);
 elements.permissionMenu.addEventListener("click", choosePermissionMode);
+elements.agentProfileSelect.addEventListener("change", chooseAgentProfile);
 elements.dangerConfirmAccept.addEventListener("click", confirmDangerFullAccess);
 $("#danger-confirm-cancel").addEventListener("click", closeDangerConfirm);
 elements.dangerConfirmBackdrop.addEventListener("click", closeDangerConfirm);
@@ -140,6 +145,8 @@ async function checkHealth() {
 async function loadRuntime() {
   state.runtime = await api("/runtime");
   state.selectedPermissionProfile = state.runtime.permission.defaultProfile;
+  state.selectedAgentProfileId = state.runtime.agentProfiles?.defaultProfile || state.runtime.agentProfile?.id || "default";
+  renderAgentProfileControl();
   renderPermissionControl();
 }
 
@@ -174,6 +181,7 @@ async function createSession() {
   const { session } = await api("/sessions", {
     method: "POST",
     body: {
+      agentProfileId: state.selectedAgentProfileId,
       permissionProfile: state.selectedPermissionProfile,
       ...(state.selectedPermissionProfile === "danger-full-access" ? { permissionConfirmation: "danger-full-access" } : {}),
     },
@@ -242,7 +250,7 @@ function renderSession(session) {
   renderPermissionControl();
   setGrantActionAvailability(busy);
 
-  renderMessages(session.messages, session.pendingApproval, session.phase === "failed" ? session.lastError : null);
+  renderMessages(session.messages, session.pendingApproval, session.phase === "failed" ? session.lastError : null, session.events);
   renderObjectivePlan(session.objective, session.plan, session.delegations);
   renderEvents(session.events);
   updateSelectedSession(session, title);
@@ -250,20 +258,55 @@ function renderSession(session) {
 
 function renderStatus(session) {
   const metrics = session.metrics || {};
+  const drift = profileDriftViewModel((session.events || []).findLast((event) => event.type === "agent.profile_selected"));
   const parts = [
     [phaseLabel(session.phase), `status-chip phase ${phaseClass(session.phase)}`],
+    [agentProfileLabel(session.agentProfile?.id), "status-chip"],
     [session.provider || "本地模型", "status-chip"],
     [permissionLabel(session.permissionProfile), "status-chip"],
     [formatTokens(metrics.totalTokens || 0), "status-chip"],
   ];
+  if (drift) parts.push([`配置变化 ${drift.count}`, `status-chip profile-drift${drift.highImpact ? " high" : ""}`, drift.summary]);
   if (metrics.lastTurnDurationMs) parts.push([formatDuration(metrics.lastTurnDurationMs), "status-chip"]);
-  elements.meta.replaceChildren(...parts.map(([text, className]) => {
+  elements.meta.replaceChildren(...parts.map(([text, className, titleText]) => {
     const chip = document.createElement("span");
     chip.className = className;
     chip.textContent = text;
-    if (text === session.provider) chip.title = session.workspace;
+    if (titleText) chip.title = titleText;
+    if (text === session.provider) {
+      const profile = session.agentProfile;
+      chip.title = profile
+        ? `${session.workspace}\nProfile ${profile.id}@${profile.version.slice(0, 12)}`
+        : session.workspace;
+    }
     return chip;
   }));
+}
+
+function renderAgentProfileControl() {
+  const profiles = state.runtime?.agentProfiles?.profiles || [];
+  elements.agentProfileSelect.replaceChildren(...profiles.map((profile) => {
+    const option = document.createElement("option");
+    option.value = profile.id;
+    option.textContent = `${profile.label} · ${profile.provider?.model || "当前模型"}`;
+    option.title = [profile.description, profile.id, permissionLabel(profile.permissionProfile)].filter(Boolean).join(" · ");
+    return option;
+  }));
+  elements.agentProfileSelect.value = state.selectedAgentProfileId;
+  elements.agentProfileSelect.disabled = profiles.length < 2;
+}
+
+function chooseAgentProfile() {
+  const profile = state.runtime?.agentProfiles?.profiles.find((item) => item.id === elements.agentProfileSelect.value);
+  if (!profile) return;
+  state.selectedAgentProfileId = profile.id;
+  state.selectedPermissionProfile = profile.permissionProfile;
+  renderPermissionControl();
+  toast(`新任务将使用 ${profile.label}`);
+}
+
+function agentProfileLabel(id) {
+  return state.runtime?.agentProfiles?.profiles.find((profile) => profile.id === id)?.label || id || "Default";
 }
 
 function togglePermissionMenu(event) {
@@ -389,7 +432,7 @@ function updateSelectedSession(session, title) {
   item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
 }
 
-function renderMessages(messages, pendingApproval, terminalError) {
+function renderMessages(messages, pendingApproval, terminalError, events = []) {
   if (!messages.length) {
     elements.messages.replaceChildren(createWelcome());
     return;
@@ -400,6 +443,9 @@ function renderMessages(messages, pendingApproval, terminalError) {
       .filter((message) => message.role === "tool" && message.tool_call_id)
       .map((message) => [message.tool_call_id, message]),
   );
+  const fileChanges = new Map(events
+    .filter((event) => event.callId && event.fileChanges)
+    .map((event) => [event.callId, event.fileChanges]));
   const rendered = [];
   let approvalRendered = false;
 
@@ -418,7 +464,7 @@ function renderMessages(messages, pendingApproval, terminalError) {
       for (const call of message.tool_calls || []) {
         const normalized = normalizeToolCall(call);
         const pending = pendingApproval?.id === normalized.id ? pendingApproval : null;
-        body.append(toolCard(normalized, toolResults.get(normalized.id), pending));
+        body.append(toolCard(normalized, toolResults.get(normalized.id), pending, fileChanges.get(normalized.id)));
         approvalRendered ||= Boolean(pending);
       }
       row.append(avatar, body);
@@ -537,7 +583,7 @@ function renderObjectivePlan(objective, plan, delegations) {
   elements.planPanel.replaceChildren(header, ...(hasPlanDetails ? [body] : []));
 }
 
-function toolCard(call, result, pending) {
+function toolCard(call, result, pending, fileChanges = null) {
   const details = document.createElement("details");
   details.className = `tool-card ${pending ? "approval-needed" : result ? toolResultClass(result.content) : "running"}`;
   details.open = Boolean(pending);
@@ -569,10 +615,81 @@ function toolCard(call, result, pending) {
     const output = document.createElement("pre");
     output.textContent = result.content || "工具没有返回内容";
     content.append(outputLabel, output);
+    const artifactId = artifactIdFromToolResult(result.content);
+    if (artifactId && state.sessionId) {
+      const load = document.createElement("button");
+      load.type = "button";
+      load.className = "artifact-button";
+      load.textContent = "加载完整输出";
+      load.addEventListener("click", async () => {
+        load.disabled = true;
+        load.textContent = "加载中…";
+        try {
+          const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/artifacts/${encodeURIComponent(artifactId)}`);
+          output.textContent = payload.artifact.content;
+          load.textContent = `已加载完整输出 · ${payload.artifact.byteSize} 字节`;
+        } catch (error) {
+          load.disabled = false;
+          load.textContent = `加载失败：${error.message}`;
+        }
+      });
+      content.append(load);
+    }
+    if (fileChanges) content.append(fileChangePanel(fileChanges));
   }
   if (pending) content.append(approvalActions(pending));
   details.append(summary, content);
   return details;
+}
+
+function fileChangePanel(manifest) {
+  const panel = document.createElement("section");
+  panel.className = "file-change-panel";
+  const heading = document.createElement("strong");
+  const summary = manifest.summary || { created: 0, modified: 0, deleted: 0, total: 0 };
+  heading.textContent = `文件变更 · ${summary.total} 项`;
+  const detail = document.createElement("span");
+  detail.textContent = `新增 ${summary.created} · 修改 ${summary.modified} · 删除 ${summary.deleted}${manifest.complete ? "" : " · 采集不完整"}`;
+  panel.append(heading, detail);
+
+  if (manifest.changes?.length) {
+    const list = document.createElement("ul");
+    for (const change of manifest.changes.slice(0, 24)) {
+      const item = document.createElement("li");
+      item.className = change.operation;
+      const marker = document.createElement("i");
+      marker.textContent = ({ created: "+", modified: "~", deleted: "−" })[change.operation] || "·";
+      const path = document.createElement("code");
+      path.textContent = change.path;
+      item.append(marker, path);
+      list.append(item);
+    }
+    panel.append(list);
+  }
+
+  if (manifest.diffArtifact?.id && state.sessionId) {
+    const load = document.createElement("button");
+    load.type = "button";
+    load.className = "artifact-button";
+    load.textContent = manifest.diffTruncated ? "加载 Diff（已截断）" : "加载 Diff";
+    load.addEventListener("click", async () => {
+      load.disabled = true;
+      load.textContent = "加载中…";
+      try {
+        const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/artifacts/${encodeURIComponent(manifest.diffArtifact.id)}`);
+        const diff = document.createElement("pre");
+        diff.className = "file-diff";
+        diff.textContent = payload.artifact.content;
+        panel.append(diff);
+        load.textContent = `已加载 Diff · ${payload.artifact.byteSize} 字节`;
+      } catch (error) {
+        load.disabled = false;
+        load.textContent = `加载失败：${error.message}`;
+      }
+    });
+    panel.append(load);
+  }
+  return panel;
 }
 
 function approvalActions(call) {
@@ -639,7 +756,8 @@ function renderEvents(events) {
     const title = document.createElement("strong");
     title.textContent = eventLabel(event.type);
     const detail = document.createElement("span");
-    detail.textContent = [event.tool, new Date(event.at).toLocaleTimeString()].filter(Boolean).join(" · ");
+    const drift = profileDriftViewModel(event);
+    detail.textContent = [drift?.summary || event.tool, new Date(event.at).toLocaleTimeString()].filter(Boolean).join(" · ");
     const raw = document.createElement("code");
     raw.textContent = event.type;
     body.append(title, detail, raw);
@@ -1178,6 +1296,7 @@ function eventLabel(type) {
     "agent.transfer_approval_granted": "Parent 批准 Child 操作",
     "agent.transfer_approval_denied": "Parent 拒绝 Child 操作",
     "session.delegated": "创建 Child Session",
+    "agent.profile_selected": "选择 Agent Profile",
     "message.assistant": "Agent 回复",
     "model.requested": "请求模型",
     "model.completed": "模型返回",
@@ -1197,6 +1316,7 @@ function eventLabel(type) {
     "tool.execution_started": "开始执行工具",
     "tool.execution_unknown": "工具结果未知",
     "tool.completed": "工具完成",
+    "tool.file_changes_inherited": "继承文件变更",
     "approval.requested": "等待审批",
     "approval.granted": "审批通过",
     "approval.denied": "审批拒绝",

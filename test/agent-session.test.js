@@ -327,6 +327,8 @@ test("portable journal 可重定位 workspace、重映射 ID 并完整重放", a
     assert.equal(imported.id, "session-imported");
     assert.equal(imported.workspace, destination.workspace);
     assert.equal(imported.memoryScope.workspace, destination.workspace);
+    assert.equal(imported.agentProfile.workspace, destination.workspace);
+    assert.equal(imported.agentProfile.memoryScope.workspace, destination.workspace);
     assert.equal(imported.memoryScope.agentId, session.state.memoryScope.agentId);
     assert.equal(imported.memoryScope.userId, session.state.memoryScope.userId);
     assert.deepEqual(imported.messages, session.state.messages);
@@ -512,6 +514,8 @@ test("Session Branch 从指定 cursor 建立独立 lineage 并闭合未决工具
     assert.equal(branch.phase, "idle");
     assert.equal(branch.pendingApproval, null);
     assert.equal(branch.memoryScope.workspace, fixture.workspace);
+    assert.equal(branch.agentProfile.workspace, fixture.workspace);
+    assert.equal(branch.agentProfile.provider.name, "demo");
     assert.deepEqual(branch.pendingMemoryMutations, []);
     assert.deepEqual(branch.lineage, {
       parentSessionId: source.id,

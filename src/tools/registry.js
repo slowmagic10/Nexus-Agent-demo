@@ -5,6 +5,7 @@ import { CapabilityRuntime } from "../capabilities/runtime.js";
 import { assertWorkspaceExecution, createExecutionSpec } from "../execution/interface.js";
 import { LocalWorkspaceAdapter } from "../execution/local-workspace-adapter.js";
 import { assertMemoryInterface } from "../memory/interface.js";
+import { assertArtifactStore } from "../artifacts/interface.js";
 import { executeMemoryMutation } from "../memory/outbox.js";
 import { createPermissionProfile } from "./permission-profile.js";
 
@@ -16,6 +17,7 @@ export function createToolRegistry({
   bundledSkills,
   memory,
   memoryStore,
+  artifactStore = null,
   extraTools = [],
   capabilityRuntime = new CapabilityRuntime(),
   workspaceExecution = null,
@@ -36,6 +38,7 @@ export function createToolRegistry({
   const policyFor = (context) => permissionProfiles.get(context?.state?.permissionProfile) || permissionProfile;
   const configuredMemory = memory || memoryStore?.memory || memoryStore || null;
   const memoryAdapter = configuredMemory ? assertMemoryInterface(configuredMemory) : null;
+  const artifactAdapter = artifactStore ? assertArtifactStore(artifactStore) : null;
   const skillRoots = [path.join(root, ".nexus", "skills"), bundledSkills];
   assertCapabilityRuntime(capabilityRuntime);
   const define = (tool, owner = NATIVE_TOOL_OWNER) => {
@@ -166,9 +169,33 @@ export function createToolRegistry({
     execute: async ({ path: requested }, context) => {
       const target = safePath(root, requested);
       assertWorkspaceAccess(policyFor(context), root, target, "read");
-      return truncate(await fs.readFile(target, "utf8"), 12_000);
+      return truncate(await fs.readFile(target, "utf8"), 1_000_000);
     },
   });
+
+  if (artifactAdapter) {
+    define({
+      name: "read_artifact",
+      description: "分段读取当前 Session 中保存的文本 Artifact。只读，自动执行。",
+      approval: "never",
+      effects: ["read"],
+      idempotency: "safe",
+      capability: scopedCapability("session", "read", "R0", true),
+      parameters: objectSchema({
+        id: { type: "string", description: "Artifact ID" },
+        offset: { type: "integer", description: "起始字符位置，默认 0" },
+        limit: { type: "integer", description: "读取字符数，默认且最多 10000" },
+      }, ["id"]),
+      execute: async ({ id, offset = 0, limit = 10_000 }, context) => {
+        if (!Number.isSafeInteger(offset) || offset < 0) throw new Error("Artifact offset 必须是非负整数");
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) throw new Error("Artifact limit 必须是 1 到 10000 的整数");
+        const artifact = await artifactAdapter.get(id, { sessionId: context.state.id });
+        if (!artifact) throw new Error("Artifact 不存在或不属于当前 Session");
+        const end = Math.min(artifact.content.length, offset + limit);
+        return `Artifact ${offset}-${end} / ${artifact.content.length} 字符\n${artifact.content.slice(offset, end)}`;
+      },
+    });
+  }
 
   define({
     name: "search_files",
@@ -204,6 +231,7 @@ export function createToolRegistry({
     approval: "always",
     effects: ["write"],
     idempotency: "unknown",
+    changeTracking: { mode: "paths", arguments: ["path"] },
     capability: workspacePathCapability("path", "write", "R1", false),
     parameters: objectSchema({ path: { type: "string" }, content: { type: "string" } }, ["path", "content"]),
     execute: async ({ path: requested, content }, context) => {
@@ -221,6 +249,7 @@ export function createToolRegistry({
     approval: "always",
     effects: ["execute"],
     idempotency: "unknown",
+    changeTracking: { mode: "workspace" },
     timeoutMs: shellTimeoutMs,
     capability: {
       risk: "R2",
@@ -475,7 +504,7 @@ async function executeShell(execution, accessPolicy, command, signal) {
     ...(["read-only", "workspace-untrusted"].includes(accessPolicy.name) && classification.decision === "allow"
       ? { env: { PATH: SAFE_READ_PATH } }
       : {}),
-    maxOutputChars: 12_000,
+    maxOutputChars: 1_000_000,
   }), { signal });
   const summary = result.output.trim() || "（无输出）";
   if (result.exitCode === 0) return summary;

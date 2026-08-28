@@ -3,7 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CapabilityRuntime } from "./capabilities/runtime.js";
-import { composeRuntimeConfig, createConfiguredProvider, inspectRuntimeConfig } from "./config/composer.js";
+import { composeRuntimeConfig, createConfiguredAgentProviders, inspectRuntimeConfig } from "./config/composer.js";
 import { createToolRegistry } from "./tools/registry.js";
 import { loadWorkspacePolicy, WorkspacePolicy } from "./tools/authorization.js";
 import { ToolHost } from "./tools/host.js";
@@ -32,8 +32,11 @@ if (config.printConfig) {
 }
 const workspace = config.workspace;
 const memoryScope = createLocalMemoryScope(workspace);
-const provider = createConfiguredProvider(config);
+const agentProviders = createConfiguredAgentProviders(config);
+const defaultProviderBinding = agentProviders.get(config.agents.defaultProfile);
+const provider = defaultProviderBinding.provider;
 const context = await loadWorkspaceContext(workspace);
+const systemPrompt = buildSystemPrompt(context);
 const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace, memoryScope });
 const capabilityRuntime = new CapabilityRuntime();
 const workspaceExecution = createWorkspaceExecution(config, { environment: process.env });
@@ -56,6 +59,7 @@ const tools = createToolRegistry({
   workspace,
   bundledSkills: path.resolve(here, "../skills"),
   memory: store.memory,
+  artifactStore: store.artifacts,
   memoryScope,
   capabilityRuntime,
   workspaceExecution,
@@ -71,17 +75,20 @@ const workspacePolicy = await loadWorkspacePolicy(workspace, { profile: permissi
 const projectGrantStore = new ProjectGrantStore(defaultProjectGrantStoreFile(process.env));
 const permissionToolHosts = Object.fromEntries(Object.entries(permissionProfiles).map(([name, profile]) => {
   const policy = new WorkspacePolicy(workspacePolicy.config, { profile, allowElevation: false });
-  return [name, new ToolHost({ registry: tools, policy, projectGrantStore })];
+  return [name, new ToolHost({ registry: tools, policy, projectGrantStore, artifactStore: store.artifacts })];
 }));
 manager = new GatewaySessionManager({
   workspace,
   provider,
+  providerDescriptor: defaultProviderBinding.descriptor,
+  agentProviders,
   tools,
   permissionToolHosts,
   defaultPermissionProfile: config.permission.profile,
+  agentProfiles: config.agents,
   projectGrantStore,
   executionInfo: workspaceExecution.inspect?.() || { id: workspaceExecution.id },
-  systemPrompt: buildSystemPrompt(context),
+  systemPrompt,
   store,
   memory: store.memory,
   maxSteps: config.runtime.maxSteps,
@@ -106,6 +113,7 @@ console.log(`单次任务步骤上限：${formatMaxSteps(config.runtime.maxSteps
 console.log(`单次任务累计 Token 预算：${config.runtime.maxTokensPerTurn === Infinity ? "不限制" : config.runtime.maxTokensPerTurn}`);
 console.log(`Workspace 执行环境：${workspaceExecution.id}`);
 console.log(`权限档位：${permissionProfile.name}`);
+console.log(`默认 Agent Profile：${config.agents.defaultProfile}（共 ${config.agents.profiles.length} 个）`);
 if (config.network.targets.length) console.log(`可信网络目标：${config.network.targets.map(formatNetworkTarget).join(", ")}（支持本次或本会话审批）`);
 console.log("仅允许本机连接。按 Ctrl+C 安全退出。");
 

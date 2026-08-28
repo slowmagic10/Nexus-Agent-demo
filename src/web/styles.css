@@ -154,6 +154,8 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .status-chip.phase.attention { color: var(--warning); }
 .status-chip.phase.completed { color: var(--success); }
 .status-chip.phase.failed { color: var(--danger); }
+.status-chip.profile-drift { color: var(--warning); cursor: help; }
+.status-chip.profile-drift.high { color: var(--danger); }
 .actions { display: flex; gap: 5px; }
 .icon-button, .close-button {
   padding: 7px 10px;
@@ -262,6 +264,20 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .tool-content { padding: 0 11px 11px 39px; border-top: 1px solid #242831; }
 .tool-content pre { max-height: 280px; margin: 10px 0 0; }
 .tool-output-label { display: block; margin-top: 12px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.artifact-button { margin-top: 9px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--surface-soft); color: var(--text-soft); padding: 7px 10px; cursor: pointer; }
+.artifact-button:hover:not(:disabled) { color: var(--text); border-color: var(--accent); }
+.artifact-button:disabled { cursor: default; opacity: .78; }
+.file-change-panel { margin-top: 12px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); display: grid; gap: 6px; }
+.file-change-panel > strong { font-size: 13px; }
+.file-change-panel > span { color: var(--text-muted); font-size: 12px; }
+.file-change-panel ul { margin: 2px 0 0; padding: 0; list-style: none; display: grid; gap: 4px; }
+.file-change-panel li { display: grid; grid-template-columns: 18px minmax(0, 1fr); align-items: center; font-size: 12px; }
+.file-change-panel li i { font-style: normal; font-weight: 700; }
+.file-change-panel li.created i { color: var(--success); }
+.file-change-panel li.modified i { color: var(--warning); }
+.file-change-panel li.deleted i { color: var(--danger); }
+.file-change-panel code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.file-change-panel .file-diff { max-height: 420px; margin-top: 3px; }
 .approval-copy { margin: 12px 0 9px; color: #c8b989; font-size: 11px; }
 .approval-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .approval-actions button { padding: 7px 10px; border-radius: 7px; cursor: pointer; font-size: 11px; font-weight: 650; }
@@ -297,6 +313,10 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .composer:focus-within { border-color: #555d69; box-shadow: 0 14px 50px rgb(0 0 0 / 26%); }
 .composer textarea { width: 100%; min-height: 62px; max-height: 180px; resize: vertical; padding: 14px 15px 7px; color: var(--text); background: transparent; border: 0; outline: 0; font-size: 13px; line-height: 1.55; }
 .composer textarea::placeholder { color: #6d737e; }
+.agent-profile-picker { margin: 8px 8px 2px; display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
+.agent-profile-picker select { width: 100%; min-height: 31px; padding: 0 8px; color: var(--text-soft); background: var(--surface-raised); border: 1px solid var(--line); border-radius: 7px; outline: 0; font: inherit; }
+.agent-profile-picker select:focus { border-color: var(--accent); }
+.agent-profile-picker select:disabled { opacity: .65; }
 .composer-foot { min-height: 38px; padding: 4px 7px 7px 13px; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .composer-context { min-width: 0; display: flex; align-items: center; gap: 12px; color: var(--muted); font-size: 9px; }
 .composer-context span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

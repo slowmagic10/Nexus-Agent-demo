@@ -8,9 +8,33 @@ Nexus Agent 是一个本地优先、可执行、可恢复的 Agent Harness。本
 一次可持久化、可重放的 Agent 执行连续体；它拥有 durable event、状态投影和单调事件游标。
 _Avoid_: Conversation, chat state
 
+**Agent Profile Snapshot**:
+Session 当前绑定的无密钥运行身份，包含 Provider/model、System Prompt 与工具 schema hash、Permission/Policy、Execution、Memory Scope 和预算，并以内容 SHA-256 版本进入 Journal。恢复时运行身份变化必须写 `agent.profile_selected`；snapshot 用于审计和漂移检测，不是假装可以复活已删除 Adapter 的冻结执行包。
+_Avoid_: Profile ID only, raw secret config, implicit runtime overwrite, serialized adapter instance
+
+**Profile Drift**:
+旧 Agent Profile Snapshot 与当前 runtime snapshot 的结构化安全差异；按 provider、context、capability、policy、execution、scope 和 budget 分类并标注影响等级。Drift 是解释与未来路由输入，本地模式下不自动升级为阻塞审批。
+_Avoid_: Version mismatch without explanation, raw prompt diff, implicit permission decision
+
+**Named Agent Profile**:
+由本机私有配置定义、由用户在新 Session 创建时显式选择的 Agent 预设；覆盖 Provider/model、附加指令、默认 Permission Profile、Turn Budget 和隔离的 Memory `agentId`。Session 保存完整 Profile Snapshot，恢复时不能用另一个具名 Profile 覆盖。
+_Avoid_: UI-only persona, implicit routing, switching an active Session
+
+**Explicit Agent Router**:
+根据用户在创建 Session 时选择的 Named Agent Profile，解析并绑定对应 Provider Adapter 的确定性入口。路由决定进入 baseline，Branch 与 Child 继承，恢复按同一 Profile 重新构造 Provider 并记录 Drift。它不根据任务文本自动选模，也不在 active turn 中切换或故障转移。
+_Avoid_: Auto router, model fallback, mid-turn switch, provider hidden behind global singleton
+
 **Durable Session Event**:
 已经原子写入 session journal、可用于恢复和审计的事实；只有 durable event 才能推进投影或对外发布。
 _Avoid_: Log line, transient callback
+
+**Artifact**:
+不适合直接放进 Model Context 或 Journal event 主体的大型结果对象。首版只保存不超过 4 MB 的脱敏 UTF-8 文本，以 Session ID 作为读取边界，并记录 media type、byte size 和 SHA-256；成功、失败、取消、超时等 Tool 终态共享同一 Artifact policy，Adapter 不得在 Tool Host 前提前截断。Tool Result 只携带预览与引用，模型通过 `read_artifact` 分段读取。Portable Journal 可携带完整内容并在 Import 时重绑定目标 Session；Branch 只复制指定 cursor 已引用的内容到自己的 scope。Child 不隐式继承 Parent Artifact。
+_Avoid_: Truncated-away output, unscoped blob URL, raw secret payload, inline large event body
+
+**File Change Manifest**:
+有副作用工具执行前后的有界工作区快照差异。durable event 只保存 created/modified/deleted、相对路径、文件类型、大小、SHA-256 和 Diff Artifact 引用；秘密与内部目录不参与内容采集，超过边界时必须标记不完整。路径工具通过工作区内符号链接写入时审计 canonical 真实目标；Shell 扫描把链接目标本身作为 `symlink` 记录。它描述观察到的变化，不等同于 Git commit，也不保证并发外部写入一定来自当前工具。
+_Avoid_: Full workspace snapshot in Journal, implicit Git staging, secret file diff, claiming atomic provenance under concurrent writes
 
 **Model Context**:
 由 durable session event 投影得到、允许模型看到的消息、短期记忆、相关长期记忆和已加载 Skills。
@@ -33,7 +57,7 @@ _Avoid_: Prompt-only goal, workflow definition, untracked task text
 _Avoid_: Assistant prose checklist, workflow DAG, UI-only todo list
 
 **Single-level Delegation**:
-Parent Session 通过内置 `delegate_task` 创建一个拥有独立 Journal 的 Child Session，并只传显式 context subset、受 Parent 上限约束的子预算和单一 Objective。Parent 等待 Child 终态并通过工具结果归并；Child 的 Approval 代理到 Parent，Parent 取消会级联取消 Child。Child 不暴露 `delegate_task`，恢复时未闭合委派标记为 interrupted 且不自动重放。
+Parent Session 通过内置 `delegate_task` 创建一个拥有独立 Journal 的 Child Session，并只传显式 context subset、受 Parent 上限约束的子预算和单一 Objective。Parent 等待 Child 终态并通过工具结果归并；Child 的 Approval 代理到 Parent，Parent 取消会级联取消 Child。Child 不暴露 `delegate_task`，恢复时未闭合委派标记为 interrupted 且不自动重放。Child 的 durable Profile 预算也是恢复上限；有效预算取 durable Child 与当前同名 Profile 的更严格值，重启只能保持或收紧，不能扩张。
 _Avoid_: Copying parent transcript, nested delegation, hidden child approval, automatic replay after interruption
 
 **Client Projection**:

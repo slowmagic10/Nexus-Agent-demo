@@ -165,8 +165,7 @@ function formatToolResult(result) {
     else parts.push(JSON.stringify(item));
   }
   if (result?.structuredContent !== undefined) parts.push(JSON.stringify(result.structuredContent, null, 2));
-  const raw = parts.filter(Boolean).join("\n\n") || "（MCP 工具无输出）";
-  const output = raw.length > 12_000 ? `${raw.slice(0, 12_000)}\n…（已截断）` : raw;
+  const output = parts.filter(Boolean).join("\n\n") || "（MCP 工具无输出）";
   if (result?.isError) throw new Error(output);
   return output;
 }

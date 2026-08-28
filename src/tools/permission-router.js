@@ -20,6 +20,16 @@ export class PermissionToolHostRouter {
     return this.hosts.has(profile);
   }
 
+  inspect() {
+    return {
+      defaultProfile: this.defaultProfile,
+      profiles: [...this.hosts.entries()].map(([name, host]) => ({
+        name,
+        policyVersion: host.policy?.version || null,
+      })),
+    };
+  }
+
   schemas({ session } = {}) {
     return this.#resolve(session?.state?.permissionProfile).schemas({ session });
   }

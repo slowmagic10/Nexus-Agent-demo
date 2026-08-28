@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/keyboard.js", "/grants.js", "/plan-view.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/keyboard.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);
@@ -105,6 +105,7 @@ async function route(request, response, manager, staticRoot) {
     const body = await readJson(request);
     const state = await manager.create({
       resume: body.resume,
+      agentProfileId: body.agentProfileId,
       permissionProfile: body.permissionProfile,
       permissionConfirmation: body.permissionConfirmation,
     });
@@ -132,6 +133,14 @@ async function route(request, response, manager, staticRoot) {
     }
     if (request.method === "GET" && parts[2] === "export" && parts.length === 3) {
       sendJson(response, 200, await manager.exportSession(id));
+      return;
+    }
+    if (request.method === "GET" && parts[2] === "artifacts" && parts.length === 3) {
+      sendJson(response, 200, { artifacts: await manager.listArtifacts(id) });
+      return;
+    }
+    if (request.method === "GET" && parts[2] === "artifacts" && parts[3] && parts.length === 4) {
+      sendJson(response, 200, { artifact: await manager.getArtifact(id, parts[3]) });
       return;
     }
     if (request.method === "GET" && parts[2] === "events" && parts.length === 3) {

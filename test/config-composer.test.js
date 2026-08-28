@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import {
   composeRuntimeConfig,
+  createConfiguredAgentProviders,
   createConfiguredProvider,
   inspectRuntimeConfig,
 } from "../src/config/composer.js";
@@ -69,6 +70,62 @@ test("配置按 profile、local、environment、CLI 的确定顺序覆盖", asyn
   assert.equal(config.sources["provider.model"], "cli");
   assert.equal(config.sources["provider.baseUrl"], "workspace_profile");
   assert.equal(config.sources["gateway.port"], "cli");
+});
+
+test("本地私有配置可定义具名 Agent Profile 并由 CLI 显式选择", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-agents-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    agents: {
+      default: "coding",
+      profiles: {
+        coding: { label: "开发", instructions: "专注实现", maxSteps: 30 },
+        review: { label: "审查", permissionProfile: "read-only", maxTokensPerTurn: 4_000 },
+      },
+    },
+  }), "utf8");
+
+  const config = await composeRuntimeConfig({ root: workspace, env: {}, args: ["--agent-profile=review"] });
+  assert.equal(config.agents.defaultProfile, "review");
+  assert.equal(config.agents.profiles.find((profile) => profile.id === "coding").maxSteps, 30);
+  assert.equal(config.agents.profiles.find((profile) => profile.id === "review").permissionProfile, "read-only");
+  const inspected = inspectRuntimeConfig(config);
+  assert.equal(inspected.agents.defaultProfile, "review");
+  assert.doesNotMatch(JSON.stringify(inspected), /专注实现/);
+
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({ agents: { profiles: {} } }), "utf8");
+  await assert.rejects(composeRuntimeConfig({ root: workspace, env: {} }), /未知字段 agents/);
+});
+
+test("具名 Agent Profile 可显式绑定不同模型且 inspection 不暴露密钥", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-agent-router-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    provider: {
+      type: "openai-compatible",
+      apiKey: "shared-router-secret",
+      baseUrl: "https://router.example/v1",
+      model: "base-model"
+    },
+    agents: {
+      default: "fast",
+      profiles: {
+        fast: { provider: { model: "fast-model" } },
+        deep: { provider: { model: "deep-model", apiKey: "deep-router-secret" } }
+      }
+    }
+  }), "utf8");
+
+  const config = await composeRuntimeConfig({ root: workspace, env: {} });
+  const providers = createConfiguredAgentProviders(config);
+  assert.equal(providers.get("fast").provider.name, "openai-compatible/fast-model");
+  assert.equal(providers.get("deep").provider.name, "openai-compatible/deep-model");
+  assert.equal(providers.get("deep").provider.apiKey, "deep-router-secret");
+  const inspected = JSON.stringify(inspectRuntimeConfig(config));
+  assert.doesNotMatch(inspected, /shared-router-secret|deep-router-secret/);
+  assert.match(inspected, /fast-model|deep-model/);
 });
 
 test("共享 profile 禁止 API Key，未知字段和无效值 fail closed", async (t) => {

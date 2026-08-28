@@ -2,12 +2,30 @@
 import { randomUUID } from "node:crypto";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createMemoryScope } from "../memory/scope.js";
+import {
+  assertAgentProfileSnapshot,
+  compareAgentProfileSnapshots,
+  createAgentProfileSnapshot,
+  createLegacyAgentProfileSnapshot,
+  deriveAgentProfileSnapshot,
+} from "./agent-profile.js";
 
-export const SESSION_SCHEMA_VERSION = 11;
+export const SESSION_SCHEMA_VERSION = 12;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
-export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", id, createdAt }) {
+export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", agentProfile, id, createdAt }) {
   const now = createdAt || new Date().toISOString();
+  const resolvedMemoryScope = createMemoryScope(memoryScope || { workspace });
+  const resolvedProfile = agentProfile
+    ? assertAgentProfileSnapshot(agentProfile)
+    : createAgentProfileSnapshot({
+        id: "default",
+        provider: { name: provider, adapter: "unspecified", model: provider },
+        workspace,
+        permission: { defaultProfile: permissionProfile, profiles: [permissionProfile] },
+        memoryScope: resolvedMemoryScope,
+      });
+  assertProfileSessionBinding(resolvedProfile, { provider, workspace, memoryScope: resolvedMemoryScope });
   return {
     schemaVersion: SESSION_SCHEMA_VERSION,
     id: id || `session-${randomUUID().slice(0, 12)}`,
@@ -16,8 +34,9 @@ export function createSession({ provider, workspace, memoryScope, permissionProf
     phase: "idle",
     provider,
     workspace,
+    agentProfile: resolvedProfile,
     permissionProfile,
-    memoryScope: createMemoryScope(memoryScope || { workspace }),
+    memoryScope: resolvedMemoryScope,
     objective: null,
     plan: null,
     delegations: [],
@@ -312,6 +331,8 @@ export function reduceSession(state, action) {
         status: action.status || (action.ok ? "completed" : "failed"),
         durationMs: action.durationMs || 0,
         preview: action.result.slice(0, 160),
+        ...(action.artifact ? { artifact: action.artifact } : {}),
+        ...(action.fileChanges ? { fileChanges: action.fileChanges } : {}),
       });
       break;
     case "MEMORY_ADDED":
@@ -656,6 +677,28 @@ export function reduceSession(state, action) {
             : "会话恢复：该工具调用在进程中断时没有结果，执行状态未知，出于安全考虑不会自动重放。",
         });
       }
+      const reboundProfile = action.agentProfile
+        ? assertAgentProfileSnapshot(action.agentProfile)
+        : deriveProfileForResume(next.agentProfile, action.provider, action.workspace, next.memoryScope);
+      assertProfileSessionBinding(reboundProfile, {
+        provider: action.provider,
+        workspace: action.workspace,
+        memoryScope: createMemoryScope({ ...next.memoryScope, workspace: action.workspace }),
+      });
+      if (reboundProfile.version !== next.agentProfile.version) {
+        const previousProfile = next.agentProfile;
+        const changes = compareAgentProfileSnapshots(previousProfile, reboundProfile);
+        next.agentProfile = reboundProfile;
+        emit("agent.profile_selected", {
+          profileId: reboundProfile.id,
+          profileVersion: reboundProfile.version,
+          previousProfileVersion: previousProfile.version,
+          provider: reboundProfile.provider.name,
+          reason: action.profileReason || "runtime_rebound",
+          changes,
+          changeCategories: [...new Set(changes.map((change) => change.category))],
+        });
+      }
       next.phase = "idle";
       next.provider = action.provider;
       next.workspace = action.workspace;
@@ -699,14 +742,19 @@ export function reduceSession(state, action) {
 
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
-  if (state.schemaVersion === SESSION_SCHEMA_VERSION) return state;
-  if ([2, 3, 4, 5, 6, 7, 8, 9, 10].includes(state.schemaVersion)) {
+  if (state.schemaVersion === SESSION_SCHEMA_VERSION) {
+    assertAgentProfileSnapshot(state.agentProfile);
+    return state;
+  }
+  if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(state.schemaVersion)) {
+    const migratedMemoryScope = createMemoryScope(state.memoryScope || { workspace: state.workspace });
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
       lineage: state.lineage || null,
       permissionProfile: state.permissionProfile || "workspace-auto",
-      memoryScope: createMemoryScope(state.memoryScope || { workspace: state.workspace }),
+      memoryScope: migratedMemoryScope,
+      agentProfile: createLegacyAgentProfileSnapshot({ ...state, memoryScope: migratedMemoryScope }),
       objective: state.objective || null,
       plan: state.plan || null,
       delegations: state.delegations || [],
@@ -727,6 +775,7 @@ export function createDelegatedSession(parentState, {
   parentCursor,
   provider,
   workspace,
+  agentProfile,
   delegatedAt = new Date().toISOString(),
 }) {
   const parent = migrateSessionState(parentState);
@@ -738,6 +787,15 @@ export function createDelegatedSession(parentState, {
     provider: provider || parent.provider,
     workspace: workspace || parent.workspace,
     memoryScope: { ...parent.memoryScope, workspace: workspace || parent.workspace },
+    agentProfile: agentProfile || deriveAgentProfileSnapshot(parent.agentProfile, {
+      provider: {
+        ...parent.agentProfile.provider,
+        name: provider || parent.provider,
+        model: provider && provider !== parent.provider ? provider : parent.agentProfile.provider.model,
+      },
+      workspace: workspace || parent.workspace,
+      memoryScope: { ...parent.memoryScope, workspace: workspace || parent.workspace },
+    }),
     permissionProfile: parent.permissionProfile,
     createdAt: delegatedAt,
   });
@@ -807,15 +865,44 @@ export function createSessionBranch(parentState, {
   parentCursor,
   provider,
   workspace,
+  agentProfile,
   branchedAt = new Date().toISOString(),
 }) {
   const parent = migrateSessionState(parentState);
+  const branchProfile = agentProfile || deriveAgentProfileSnapshot(parent.agentProfile, {
+    provider: {
+      ...parent.agentProfile.provider,
+      name: provider,
+      model: provider === parent.provider ? parent.agentProfile.provider.model : provider,
+    },
+    workspace,
+    memoryScope: { ...parent.memoryScope, workspace },
+  });
   const reconciled = reduceSession(parent, {
     type: "RESUMED",
     provider,
     workspace,
+    agentProfile: branchProfile,
+    profileReason: "session_branch",
     at: branchedAt,
   });
+  const inheritedFileChanges = parent.events
+    .filter((event) => event.callId && event.fileChanges)
+    .map((event, index) => ({
+      seq: index + 2,
+      at: branchedAt,
+      type: "tool.file_changes_inherited",
+      callId: event.callId,
+      tool: event.tool || null,
+      fileChanges: {
+        ...structuredClone(event.fileChanges),
+        ...(event.fileChanges.diffArtifact ? {
+          diffArtifact: { ...event.fileChanges.diffArtifact, sessionId: id },
+        } : {}),
+      },
+      parentSessionId: parent.id,
+      parentCursor,
+    }));
   return {
     ...reconciled,
     schemaVersion: SESSION_SCHEMA_VERSION,
@@ -825,13 +912,17 @@ export function createSessionBranch(parentState, {
     phase: "idle",
     provider,
     workspace,
-    events: [{
-      seq: 1,
-      at: branchedAt,
-      type: "session.branched",
-      parentSessionId: parent.id,
-      parentCursor,
-    }],
+    agentProfile: branchProfile,
+    events: [
+      {
+        seq: 1,
+        at: branchedAt,
+        type: "session.branched",
+        parentSessionId: parent.id,
+        parentCursor,
+      },
+      ...inheritedFileChanges,
+    ],
     contextMemory: [],
     memoryScope: createMemoryScope({ ...parent.memoryScope, workspace }),
     pendingMemoryMutations: [],
@@ -848,6 +939,29 @@ export function createSessionBranch(parentState, {
       branchedAt,
     },
   };
+}
+
+function deriveProfileForResume(profile, provider, workspace, memoryScope) {
+  if (profile.provider.name === provider && profile.workspace === workspace) return profile;
+  return deriveAgentProfileSnapshot(profile, {
+    provider: {
+      ...profile.provider,
+      name: provider,
+      model: provider === profile.provider.name ? profile.provider.model : provider,
+    },
+    workspace,
+    memoryScope: { ...memoryScope, workspace },
+  });
+}
+
+function assertProfileSessionBinding(profile, { provider, workspace, memoryScope }) {
+  if (profile.provider.name !== provider) throw new Error("Agent Profile provider 与 Session 不匹配");
+  if (profile.workspace !== workspace) throw new Error("Agent Profile workspace 与 Session 不匹配");
+  if (profile.memoryScope.workspace !== memoryScope.workspace
+    || profile.memoryScope.agentId !== memoryScope.agentId
+    || profile.memoryScope.userId !== memoryScope.userId) {
+    throw new Error("Agent Profile memoryScope 与 Session 不匹配");
+  }
 }
 
 function findUnresolvedToolCalls(messages) {
