@@ -6,6 +6,7 @@ import { normalizeNetworkTargets, resolveShellNetworkTargets } from "../executio
 const PROFILE_NAMES = new Set(["read-only", "workspace-auto", "workspace-confirm", "workspace-untrusted", "approval-required", "danger-full-access"]);
 const SANDBOXED_EXECUTIONS = new Set(["native", "docker"]);
 const USER_CONFIRM_SCOPES = Object.freeze(["once", "session"]);
+const AUTO_WORKSPACE_EDIT_TOOLS = new Set(["write_file", "edit_file"]);
 
 export class PermissionProfile {
   constructor({ name = "approval-required", workspace, executionType = "local", networkTargets = [] } = {}) {
@@ -19,7 +20,7 @@ export class PermissionProfile {
     this.workspace = path.resolve(workspace);
     this.executionType = executionType;
     this.networkTargets = normalizeNetworkTargets(networkTargets);
-    this.version = hashValue({ schemaVersion: 6, name, workspace: this.workspace, executionType, networkTargets: this.networkTargets });
+    this.version = hashValue({ schemaVersion: 7, name, workspace: this.workspace, executionType, networkTargets: this.networkTargets });
   }
 
   inspect() {
@@ -165,8 +166,8 @@ export class PermissionProfile {
     if (capability.readOnly && !capability.effects.some(isElevatedEffect)) {
       return profileDecision(this, "allow", "safe_read", "workspace-auto 允许普通工作区只读能力", "read");
     }
-    if (definition.name === "write_file" && resources.some((resource) => resource.kind === "workspace_path" && resource.access === "write")) {
-      return profileDecision(this, "allow", "workspace_write", "workspace-auto 自动允许普通工作区文件写入", "workspace_write");
+    if (AUTO_WORKSPACE_EDIT_TOOLS.has(definition.name) && resources.some((resource) => resource.kind === "workspace_path" && resource.access === "write")) {
+      return profileDecision(this, "allow", "workspace_write", "workspace-auto 自动允许普通工作区文件编辑", "workspace_write");
     }
     if (definition.name === "run_shell") return this.classifyShell(call.arguments.command);
     if (capability.effects.includes("network")) {
@@ -189,7 +190,7 @@ export class PermissionProfile {
     if (capability.readOnly && !capability.effects.some(isElevatedEffect)) {
       return profileDecision(this, "allow", "safe_read", "workspace-untrusted 允许普通工作区只读能力", "read");
     }
-    if (definition.name === "write_file" && resources.some((resource) => resource.kind === "workspace_path" && resource.access === "write")) {
+    if (AUTO_WORKSPACE_EDIT_TOOLS.has(definition.name) && resources.some((resource) => resource.kind === "workspace_path" && resource.access === "write")) {
       return profileDecision(this, "allow", "workspace_write", "workspace-untrusted 自动允许普通工作区文件编辑", "workspace_write");
     }
     if (definition.name === "run_shell") return this.classifyShell(call.arguments.command);

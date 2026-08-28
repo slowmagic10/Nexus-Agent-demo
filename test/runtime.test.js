@@ -115,6 +115,134 @@ test("运行时按预算压缩历史 turn 并留下 durable audit event", async 
   assert.equal(runtime.state.phase, "completed");
 });
 
+test("运行时在压缩前生成 durable semantic summary 并注入主模型请求", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "旧任务".repeat(1_200) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "旧任务已经完成" } });
+  let summarizedMessages;
+  let receivedMessages;
+  const runtime = createRuntime({
+    state,
+    maxInputTokens: 400,
+    summarizeContext: async ({ messages }) => {
+      summarizedMessages = messages;
+      return {
+        summary: {
+          objective: "继续开发 Nexus",
+          completed: ["旧任务已经完成"],
+          active: ["处理新任务"],
+          decisions: [],
+          files: ["src/core/agent.js"],
+          blockers: [],
+          nextMoves: ["完成验证"],
+        },
+        usage: { inputTokens: 10, outputTokens: 4, totalTokens: 14 },
+        model: "summary-test",
+      };
+    },
+    provider: {
+      complete: async ({ messages }) => {
+        receivedMessages = messages;
+        return { text: "新任务完成", toolCalls: [], usage: { inputTokens: 20, outputTokens: 2, totalTokens: 22 } };
+      },
+    },
+  });
+
+  await runtime.runTurn("开始新任务", async () => false);
+
+  assert.deepEqual(summarizedMessages.map((message) => message.role), ["user", "assistant"]);
+  assert.equal(runtime.state.contextSummary.revision, 1);
+  assert.equal(runtime.state.contextSummary.throughMessage, 2);
+  assert.equal(runtime.state.contextSummary.model, "summary-test");
+  assert.equal(receivedMessages[0].role, "assistant");
+  assert.match(receivedMessages[0].content, /历史会话语义摘要/);
+  assert.deepEqual(receivedMessages.at(-1), { role: "user", content: "开始新任务" });
+  assert.equal(runtime.state.metrics.modelCalls, 2);
+  assert.equal(runtime.state.metrics.totalTokens, 36);
+  assert.ok(runtime.state.events.some((event) => event.type === "context.summary_completed"));
+  assert.equal(runtime.state.events.findLast((event) => event.type === "model.context_compacted").summary.included, true);
+});
+
+test("滚动摘要只合并上次覆盖范围之后新省略的完整 turn", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "第一轮".repeat(900) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "第一轮完成" } });
+  state = reduceSession(state, {
+    type: "CONTEXT_SUMMARY_COMPLETED",
+    summary: {
+      objective: "完成全部轮次",
+      completed: ["第一轮完成"],
+      active: [],
+      decisions: [],
+      files: [],
+      blockers: [],
+      nextMoves: [],
+    },
+    fromMessage: 0,
+    throughMessage: 2,
+    sourceCursor: 2,
+    sourceComplete: true,
+    model: "summary-test",
+    usage: { inputTokens: 1, outputTokens: 1, totalTokens: 2 },
+  });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "第二轮".repeat(900) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "第二轮完成" } });
+  let input;
+  const runtime = createRuntime({
+    state,
+    maxInputTokens: 400,
+    summarizeContext: async (value) => {
+      input = value;
+      return {
+        summary: {
+          objective: "完成全部轮次",
+          completed: ["第一轮完成", "第二轮完成"],
+          active: ["第三轮"],
+          decisions: [],
+          files: [],
+          blockers: [],
+          nextMoves: ["继续"],
+        },
+        model: "summary-test",
+      };
+    },
+    provider: { complete: async () => ({ text: "完成", toolCalls: [] }) },
+  });
+
+  await runtime.runTurn("第三轮", async () => false);
+
+  assert.equal(input.previousSummary.revision, 1);
+  assert.deepEqual(input.messages.map((message) => message.content), ["第二轮".repeat(900), "第二轮完成"]);
+  assert.equal(runtime.state.contextSummary.revision, 2);
+  assert.equal(runtime.state.contextSummary.throughMessage, 4);
+});
+
+test("语义摘要失败时记录 degraded 并继续使用最近完整 turn", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "旧历史".repeat(1_200) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "旧回答" } });
+  let receivedMessages;
+  const runtime = createRuntime({
+    state,
+    maxInputTokens: 220,
+    summarizeContext: async () => { throw new Error("summary provider unavailable"); },
+    provider: {
+      complete: async ({ messages }) => {
+        receivedMessages = messages;
+        return { text: "降级后完成", toolCalls: [] };
+      },
+    },
+  });
+
+  await runtime.runTurn("继续", async () => false);
+
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(runtime.state.contextSummary, null);
+  assert.deepEqual(receivedMessages, [{ role: "user", content: "继续" }]);
+  const degraded = runtime.state.events.find((event) => event.type === "context.summary_degraded");
+  assert.match(degraded.error, /summary provider unavailable/);
+});
+
 test("当前 turn 超预算时运行时 fail closed 且不调用模型", async () => {
   let calls = 0;
   const runtime = createRuntime({
@@ -349,6 +477,8 @@ function createRuntime({
   memoryReconcileTimeoutMs,
   flushMemory,
   toolHost,
+  summarizeContext,
+  contextSummaryTimeoutMs,
 } = {}) {
   tools ||= { schemas: () => [], get: () => null };
   return new AgentRuntime({
@@ -365,6 +495,8 @@ function createRuntime({
     memorySearchTimeoutMs,
     memoryReconcileTimeoutMs,
     flushMemory,
+    summarizeContext,
+    contextSummaryTimeoutMs,
     maxInputTokens,
     maxSteps,
     maxTokensPerTurn,

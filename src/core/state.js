@@ -9,8 +9,9 @@ import {
   createLegacyAgentProfileSnapshot,
   deriveAgentProfileSnapshot,
 } from "./agent-profile.js";
+import { CONTEXT_SUMMARY_VERSION, normalizeSemanticSummary } from "./context-summary.js";
 
-export const SESSION_SCHEMA_VERSION = 12;
+export const SESSION_SCHEMA_VERSION = 13;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
 export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", agentProfile, id, createdAt }) {
@@ -44,6 +45,7 @@ export function createSession({ provider, workspace, memoryScope, permissionProf
     events: [],
     memory: [],
     contextMemory: [],
+    contextSummary: null,
     pendingMemoryMutations: [],
     memoryMutationIssues: [],
     loadedSkills: [],
@@ -105,6 +107,72 @@ export function reduceSession(state, action) {
     case "MODEL_CONTEXT_PREPARED":
       emit(action.plan.compacted ? "model.context_compacted" : "model.context_prepared", action.plan);
       break;
+    case "CONTEXT_SUMMARY_REQUESTED":
+      if (action.modelCall !== false) next.metrics.modelCalls += 1;
+      emit("context.summary_requested", {
+        fromMessage: action.fromMessage,
+        throughMessage: action.throughMessage,
+        sourceCursor: action.sourceCursor,
+        previousRevision: next.contextSummary?.revision || 0,
+      });
+      break;
+    case "CONTEXT_SUMMARY_COMPLETED": {
+      if (!Number.isSafeInteger(action.throughMessage) || action.throughMessage < 1 || action.throughMessage > next.messages.length) {
+        throw new Error("Context summary throughMessage 无效");
+      }
+      if (!Number.isSafeInteger(action.sourceCursor) || action.sourceCursor < 1) {
+        throw new Error("Context summary sourceCursor 无效");
+      }
+      const previousThrough = next.contextSummary?.throughMessage || 0;
+      if (action.fromMessage !== previousThrough) throw new Error("Context summary 必须从上次覆盖位置连续推进");
+      if (action.throughMessage <= previousThrough) throw new Error("Context summary 必须推进消息覆盖范围");
+      if (action.throughMessage < next.messages.length && next.messages[action.throughMessage]?.role !== "user") {
+        throw new Error("Context summary throughMessage 必须位于完整 turn 边界");
+      }
+      const summary = normalizeSemanticSummary(action.summary);
+      const usage = normalizeSummaryUsage(action.usage);
+      next.metrics.inputTokens += usage.inputTokens;
+      next.metrics.outputTokens += usage.outputTokens;
+      next.metrics.totalTokens += usage.totalTokens;
+      next.metrics.modelDurationMs += action.durationMs || 0;
+      next.contextSummary = {
+        summaryVersion: CONTEXT_SUMMARY_VERSION,
+        revision: (next.contextSummary?.revision || 0) + 1,
+        ...summary,
+        throughMessage: action.throughMessage,
+        sourceCursor: action.sourceCursor,
+        sourceComplete: action.sourceComplete !== false,
+        model: action.model || next.provider,
+        updatedAt: at,
+      };
+      emit("context.summary_completed", {
+        revision: next.contextSummary.revision,
+        throughMessage: next.contextSummary.throughMessage,
+        sourceCursor: next.contextSummary.sourceCursor,
+        sourceComplete: next.contextSummary.sourceComplete,
+        model: next.contextSummary.model,
+        durationMs: action.durationMs || 0,
+        usage,
+        preview: summary.objective || summary.active[0] || summary.completed[0] || "已更新滚动摘要",
+      });
+      break;
+    }
+    case "CONTEXT_SUMMARY_DEGRADED": {
+      const usage = normalizeSummaryUsage(action.usage);
+      next.metrics.inputTokens += usage.inputTokens;
+      next.metrics.outputTokens += usage.outputTokens;
+      next.metrics.totalTokens += usage.totalTokens;
+      next.metrics.modelDurationMs += action.durationMs || 0;
+      emit("context.summary_degraded", {
+        fromMessage: action.fromMessage,
+        throughMessage: action.throughMessage,
+        sourceCursor: action.sourceCursor,
+        durationMs: action.durationMs || 0,
+        usage,
+        error: action.error,
+      });
+      break;
+    }
     case "MODEL_COMPLETED":
       next.metrics.inputTokens += action.usage.inputTokens;
       next.metrics.outputTokens += action.usage.outputTokens;
@@ -746,6 +814,14 @@ export function migrateSessionState(state) {
     assertAgentProfileSnapshot(state.agentProfile);
     return state;
   }
+  if (state.schemaVersion === 12) {
+    assertAgentProfileSnapshot(state.agentProfile);
+    return {
+      ...state,
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      contextSummary: state.contextSummary || null,
+    };
+  }
   if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(state.schemaVersion)) {
     const migratedMemoryScope = createMemoryScope(state.memoryScope || { workspace: state.workspace });
     return {
@@ -758,6 +834,7 @@ export function migrateSessionState(state) {
       objective: state.objective || null,
       plan: state.plan || null,
       delegations: state.delegations || [],
+      contextSummary: null,
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
       toolGrants: migrateToolGrants(state.toolGrants || []),
@@ -924,6 +1001,7 @@ export function createSessionBranch(parentState, {
       ...inheritedFileChanges,
     ],
     contextMemory: [],
+    contextSummary: null,
     memoryScope: createMemoryScope({ ...parent.memoryScope, workspace }),
     pendingMemoryMutations: [],
     memoryMutationIssues: [],
@@ -978,6 +1056,15 @@ function findUnresolvedToolCalls(messages) {
 
 function elapsedSince(value, at) {
   return value ? Math.max(0, new Date(at).getTime() - new Date(value).getTime()) : 0;
+}
+
+function normalizeSummaryUsage(value = {}) {
+  const inputTokens = Number.isSafeInteger(value?.inputTokens) && value.inputTokens >= 0 ? value.inputTokens : 0;
+  const outputTokens = Number.isSafeInteger(value?.outputTokens) && value.outputTokens >= 0 ? value.outputTokens : 0;
+  const totalTokens = Number.isSafeInteger(value?.totalTokens) && value.totalTokens >= 0
+    ? value.totalTokens
+    : inputTokens + outputTokens;
+  return { inputTokens, outputTokens, totalTokens };
 }
 
 function emptyMetrics() {

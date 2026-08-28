@@ -1,10 +1,12 @@
 // FOUNDATION — event-derived projection of everything visible to the model.
 import { applyStatePatch } from "../state-patch.js";
+import { renderContextSummaryMessage } from "./context-summary.js";
 
 const MODEL_CONTEXT_DEFAULTS = {
   messages: [],
   memory: [],
   contextMemory: [],
+  contextSummary: null,
   loadedSkills: [],
   objective: null,
   plan: null,
@@ -14,6 +16,7 @@ const MODEL_CONTEXT_KEYS = Object.keys(MODEL_CONTEXT_DEFAULTS);
 const DEFAULT_MAX_INPUT_TOKENS = 32_000;
 const COMPACTION_MARKER = "[Model Context 已压缩：仅保留最近的完整会话轮次；更早事实仍保存在 durable journal 中。]";
 const CONTEXT_STRATEGY = "recent-complete-turns-v1";
+const SEMANTIC_CONTEXT_STRATEGY = "semantic-summary+recent-complete-turns-v1";
 
 export function projectModelContext(events, fallbackState) {
   if (!events.length || !events[0].baseline) return selectModelContext(fallbackState);
@@ -62,6 +65,7 @@ export function prepareModelRequest(context, {
       compacted: false,
       strategy: CONTEXT_STRATEGY,
       memoryHits,
+      summary: summaryPlan(promptContext.contextSummary),
     });
   }
 
@@ -71,33 +75,62 @@ export function prepareModelRequest(context, {
   if (fixed.fixedTokens > maxInputTokens) {
     throw new Error(`固定上下文预计 ${fixed.fixedTokens} tokens，超过 Model Context 预算 ${maxInputTokens}`);
   }
-  const latestTurn = turns.at(-1) || [];
-  const latest = measureRequest(compactedSystemPrompt, latestTurn, durableTools);
-  if (latest.estimatedInputTokens > maxInputTokens) {
-    throw new Error(`当前 turn 预计 ${latest.messageTokens} tokens，超过 Model Context 预算 ${maxInputTokens} 可容纳的消息空间`);
+  const recentOnly = selectCompactedTurns({
+    systemPrompt: compactedSystemPrompt,
+    turns,
+    tools: durableTools,
+    maxInputTokens,
+    prefixMessages: [],
+    strictLatest: true,
+  });
+  let selection = recentOnly;
+  let semanticMessage = null;
+  let summary = summaryPlan(promptContext.contextSummary, {
+    requiredThroughMessage: recentOnly.omittedMessages,
+  });
+  const availableSummary = promptContext.contextSummary;
+  if (availableSummary && availableSummary.throughMessage >= recentOnly.omittedMessages) {
+    const candidateMessage = renderContextSummaryMessage(availableSummary);
+    const withSummary = selectCompactedTurns({
+      systemPrompt: compactedSystemPrompt,
+      turns,
+      tools: durableTools,
+      maxInputTokens,
+      prefixMessages: [candidateMessage],
+      strictLatest: false,
+    });
+    if (!withSummary) {
+      summary = summaryPlan(availableSummary, {
+        requiredThroughMessage: availableSummary.throughMessage,
+        omittedReason: "budget",
+      });
+    } else if (availableSummary.throughMessage >= withSummary.omittedMessages) {
+      selection = withSummary;
+      semanticMessage = candidateMessage;
+      summary = summaryPlan(availableSummary, {
+        included: true,
+        requiredThroughMessage: withSummary.omittedMessages,
+      });
+    } else {
+      summary = summaryPlan(availableSummary, {
+        requiredThroughMessage: withSummary.omittedMessages,
+        omittedReason: "coverage",
+      });
+    }
   }
 
-  let firstIncludedTurn = turns.length - 1;
-  let selectedTurns = latestTurn.length ? [latestTurn] : [];
-  for (let index = turns.length - 2; index >= 0; index -= 1) {
-    const candidate = [turns[index], ...selectedTurns].flat();
-    if (measureRequest(compactedSystemPrompt, candidate, durableTools).estimatedInputTokens > maxInputTokens) break;
-    selectedTurns = [turns[index], ...selectedTurns];
-    firstIncludedTurn = index;
-  }
-
-  const selectedMessages = selectedTurns.flat();
-  const measured = measureRequest(compactedSystemPrompt, selectedMessages, durableTools);
-  return buildRequest(compactedSystemPrompt, selectedMessages, durableTools, {
+  const requestMessages = semanticMessage
+    ? [semanticMessage, ...selection.selectedMessages]
+    : selection.selectedMessages;
+  const measured = measureRequest(compactedSystemPrompt, requestMessages, durableTools);
+  return buildRequest(compactedSystemPrompt, requestMessages, durableTools, {
+    ...selection,
     ...measured,
     maxInputTokens,
-    includedMessages: selectedMessages.length,
-    omittedMessages: durableMessages.length - selectedMessages.length,
-    includedTurns: selectedTurns.length,
-    omittedTurns: Math.max(0, firstIncludedTurn),
     compacted: true,
-    strategy: CONTEXT_STRATEGY,
+    strategy: semanticMessage ? SEMANTIC_CONTEXT_STRATEGY : CONTEXT_STRATEGY,
     memoryHits,
+    summary,
   });
 }
 
@@ -135,7 +168,51 @@ function buildRequest(systemPrompt, messages, tools, contextPlan) {
       compacted: contextPlan.compacted,
       strategy: contextPlan.strategy,
       memoryHits: contextPlan.memoryHits || [],
+      summary: contextPlan.summary || summaryPlan(null),
     },
+  };
+}
+
+function selectCompactedTurns({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest }) {
+  const latestTurn = turns.at(-1) || [];
+  const latestMessages = [...prefixMessages, ...latestTurn];
+  const latest = measureRequest(systemPrompt, latestMessages, tools);
+  if (latest.estimatedInputTokens > maxInputTokens) {
+    if (!strictLatest) return null;
+    throw new Error(`当前 turn 预计 ${latest.messageTokens} tokens，超过 Model Context 预算 ${maxInputTokens} 可容纳的消息空间`);
+  }
+  let firstIncludedTurn = Math.max(0, turns.length - 1);
+  let selectedTurns = latestTurn.length ? [latestTurn] : [];
+  for (let index = turns.length - 2; index >= 0; index -= 1) {
+    const candidate = [...prefixMessages, turns[index], ...selectedTurns].flat();
+    if (measureRequest(systemPrompt, candidate, tools).estimatedInputTokens > maxInputTokens) break;
+    selectedTurns = [turns[index], ...selectedTurns];
+    firstIncludedTurn = index;
+  }
+  const selectedMessages = selectedTurns.flat();
+  return {
+    selectedMessages,
+    includedMessages: selectedMessages.length,
+    omittedMessages: turns.flat().length - selectedMessages.length,
+    includedTurns: selectedTurns.length,
+    omittedTurns: Math.max(0, firstIncludedTurn),
+  };
+}
+
+function summaryPlan(summary, {
+  included = false,
+  requiredThroughMessage = 0,
+  omittedReason = null,
+} = {}) {
+  return {
+    available: Boolean(summary),
+    included,
+    revision: summary?.revision || null,
+    throughMessage: summary?.throughMessage || 0,
+    requiredThroughMessage,
+    sourceCursor: summary?.sourceCursor || null,
+    sourceComplete: summary?.sourceComplete ?? null,
+    omittedReason,
   };
 }
 

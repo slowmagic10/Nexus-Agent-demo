@@ -166,7 +166,7 @@ test("模型请求只暴露 durable context，并与展示状态隔离", async (
       tools: [{ type: "function", function: { name: "read_file" } }],
     });
 
-    assert.deepEqual(Object.keys(promptContext).sort(), ["contextMemory", "delegations", "loadedSkills", "memory", "messages", "objective", "plan"]);
+    assert.deepEqual(Object.keys(promptContext).sort(), ["contextMemory", "contextSummary", "delegations", "loadedSkills", "memory", "messages", "objective", "plan"]);
     assert.deepEqual(request.messages.map((message) => message.content), ["真实消息"]);
     assert.equal(request.systemPrompt, "记忆 1，技能 1");
     assert.equal(request.tools[0].function.name, "read_file");
@@ -184,6 +184,59 @@ test("模型请求只暴露 durable context，并与展示状态隔离", async (
     const restoredRequest = restored.prepareModelRequest({ systemPrompt: () => "恢复", tools: [] });
     assert.deepEqual(restoredRequest.messages.map((message) => message.content), ["真实消息"]);
     assert.equal(restoredRequest.systemPrompt, "恢复");
+  } finally {
+    fixture.close();
+  }
+});
+
+test("durable semantic summary 可从 Journal 恢复并继续进入压缩上下文", async () => {
+  const fixture = createFixture();
+  try {
+    const session = new AgentSession({
+      state: createSession({ provider: "demo", workspace: fixture.workspace, id: "session-summary-restore" }),
+      reducer: reduceSession,
+      journal: fixture.store,
+    });
+    await session.dispatch({ type: "USER_MESSAGE", content: "旧历史".repeat(1_000) });
+    await session.dispatch({ type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "旧工作完成" } });
+    const sourceCursor = session.cursor;
+    await session.dispatch({
+      type: "CONTEXT_SUMMARY_COMPLETED",
+      summary: {
+        objective: "继续 Nexus 开发",
+        completed: ["旧工作完成"],
+        active: ["恢复摘要"],
+        decisions: [],
+        files: [],
+        blockers: [],
+        nextMoves: ["继续执行"],
+      },
+      fromMessage: 0,
+      throughMessage: 2,
+      sourceCursor,
+      sourceComplete: true,
+      model: "test-summary",
+      usage: { inputTokens: 2, outputTokens: 1, totalTokens: 3 },
+      durationMs: 4,
+    });
+    await session.dispatch({ type: "USER_MESSAGE", content: "当前任务" });
+
+    const restored = new AgentSession({
+      state: { ...session.state, messages: [], contextSummary: null },
+      reducer: reduceSession,
+      journal: fixture.store,
+    });
+    const request = restored.prepareModelRequest({
+      systemPrompt: () => "恢复",
+      tools: [],
+      maxInputTokens: 260,
+    });
+
+    assert.equal(restored.state.contextSummary.revision, 1);
+    assert.equal(restored.state.contextSummary.throughMessage, 2);
+    assert.match(request.messages[0].content, /继续 Nexus 开发/);
+    assert.deepEqual(request.messages.at(-1), { role: "user", content: "当前任务" });
+    assert.equal(request.contextPlan.summary.included, true);
   } finally {
     fixture.close();
   }

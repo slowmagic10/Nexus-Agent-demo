@@ -57,6 +57,16 @@ test("超预算时只保留连续的最近完整 turn，不拆散工具协议", 
     compacted: true,
     strategy: "recent-complete-turns-v1",
     memoryHits: [],
+    summary: {
+      available: false,
+      included: false,
+      revision: null,
+      throughMessage: 0,
+      requiredThroughMessage: 2,
+      sourceCursor: null,
+      sourceComplete: null,
+      omittedReason: null,
+    },
   });
   assert.ok(request.contextPlan.estimatedInputTokens <= 180);
 });
@@ -122,11 +132,58 @@ test("Context Window Plan 记录长期记忆命中来源但不复制正文", () 
   assert.equal("content" in request.contextPlan.memoryHits[0], false);
 });
 
+test("覆盖范围完整的 durable semantic summary 与最近 turn 一起进入请求", () => {
+  const context = createContext([
+    { role: "user", content: "A".repeat(1_200) },
+    { role: "assistant", content: "已经完成旧模块" },
+    { role: "user", content: "继续当前任务" },
+  ]);
+  context.contextSummary = {
+    summaryVersion: "semantic-summary-v1",
+    revision: 1,
+    objective: "继续开发 Nexus",
+    completed: ["旧模块已经完成"],
+    active: ["实现上下文摘要"],
+    decisions: [],
+    files: ["src/core/model-context.js"],
+    blockers: [],
+    nextMoves: ["运行测试"],
+    throughMessage: 2,
+    sourceCursor: 8,
+    sourceComplete: true,
+    model: "test",
+    updatedAt: "2026-08-28T00:00:00.000Z",
+  };
+
+  const request = prepareModelRequest(context, {
+    systemPrompt: () => "系统提示",
+    tools: [],
+    maxInputTokens: 260,
+  });
+
+  assert.equal(request.messages[0].role, "assistant");
+  assert.match(request.messages[0].content, /历史会话语义摘要/);
+  assert.match(request.messages[0].content, /继续开发 Nexus/);
+  assert.deepEqual(request.messages.at(-1), { role: "user", content: "继续当前任务" });
+  assert.equal(request.contextPlan.strategy, "semantic-summary+recent-complete-turns-v1");
+  assert.deepEqual(request.contextPlan.summary, {
+    available: true,
+    included: true,
+    revision: 1,
+    throughMessage: 2,
+    requiredThroughMessage: 2,
+    sourceCursor: 8,
+    sourceComplete: true,
+    omittedReason: null,
+  });
+});
+
 function createContext(messages) {
   return {
     messages: structuredClone(messages),
     memory: [],
     contextMemory: [],
+    contextSummary: null,
     loadedSkills: [],
   };
 }

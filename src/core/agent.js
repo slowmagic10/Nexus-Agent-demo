@@ -1,5 +1,10 @@
 import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
 import { ToolHost } from "../tools/host.js";
+import {
+  createModelContextSummarizer,
+  normalizeSemanticSummary,
+  selectContextSummaryBatch,
+} from "./context-summary.js";
 
 export class AgentRuntime {
   constructor({
@@ -11,11 +16,13 @@ export class AgentRuntime {
     retrieveMemory = async () => [],
     reconcile = async () => [],
     flushMemory = async () => [],
+    summarizeContext,
     maxSteps = Infinity,
     maxTokensPerTurn = Infinity,
     maxInputTokens = 32_000,
     memorySearchTimeoutMs = 2_000,
     memoryReconcileTimeoutMs = 2_000,
+    contextSummaryTimeoutMs = 15_000,
   }) {
     if (!session) throw new Error("AgentRuntime 需要 AgentSession");
     if (!toolHost && !tools) throw new Error("AgentRuntime 需要 Tool Host");
@@ -30,6 +37,9 @@ export class AgentRuntime {
     }
     if (!Number.isSafeInteger(memoryReconcileTimeoutMs) || memoryReconcileTimeoutMs < 1) {
       throw new Error("AgentRuntime memoryReconcileTimeoutMs 必须是正整数");
+    }
+    if (!Number.isSafeInteger(contextSummaryTimeoutMs) || contextSummaryTimeoutMs < 1) {
+      throw new Error("AgentRuntime contextSummaryTimeoutMs 必须是正整数");
     }
     this.session = session;
     this.provider = provider;
@@ -46,11 +56,14 @@ export class AgentRuntime {
     this.retrieveMemory = retrieveMemory;
     this.reconcile = reconcile;
     this.flushMemory = flushMemory;
+    this.summarizeContext = summarizeContext || createModelContextSummarizer(provider);
+    if (typeof this.summarizeContext !== "function") throw new Error("AgentRuntime summarizeContext 必须是函数");
     this.maxSteps = maxSteps;
     this.maxTokensPerTurn = maxTokensPerTurn;
     this.maxInputTokens = maxInputTokens;
     this.memorySearchTimeoutMs = memorySearchTimeoutMs;
     this.memoryReconcileTimeoutMs = memoryReconcileTimeoutMs;
+    this.contextSummaryTimeoutMs = contextSummaryTimeoutMs;
     this.abortController = null;
   }
 
@@ -103,11 +116,12 @@ export class AgentRuntime {
       await this.dispatch({ type: "MEMORY_CONTEXT_SET", query: content, memories, retrieval });
       for (let index = 0; index < this.maxSteps; index += 1) {
         throwIfAborted(abortController.signal);
-        const prepared = this.session.prepareModelRequest({
+        let prepared = this.session.prepareModelRequest({
           systemPrompt: this.systemPrompt,
           tools: this.toolHost.schemas({ session: this.session }),
           maxInputTokens: this.maxInputTokens,
         });
+        prepared = await this.#prepareDurableSummary(prepared, abortController.signal);
         const { contextPlan, ...request } = prepared;
         await this.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
         await this.dispatch({ type: "MODEL_REQUESTED" });
@@ -183,6 +197,74 @@ export class AgentRuntime {
 
   cancel(reason = "用户取消了任务") {
     this.abortController?.abort(new Error(reason));
+  }
+
+  async #prepareDurableSummary(prepared, turnSignal) {
+    let current = prepared;
+    for (let attempt = 0; attempt < 2 && current.contextPlan.compacted; attempt += 1) {
+      const plan = current.contextPlan.summary;
+      const throughMessage = this.state.contextSummary?.throughMessage || 0;
+      if (!plan || plan.included || plan.requiredThroughMessage <= throughMessage) break;
+      const batch = selectContextSummaryBatch(this.state.messages, {
+        fromMessage: throughMessage,
+        throughMessage: plan.requiredThroughMessage,
+      });
+      const sourceCursor = this.session.cursor;
+      await this.dispatch({
+        type: "CONTEXT_SUMMARY_REQUESTED",
+        fromMessage: batch.fromMessage,
+        throughMessage: batch.throughMessage,
+        sourceCursor,
+        modelCall: this.summarizeContext.usesModel !== false,
+      });
+      const summarySignal = AbortSignal.any([
+        turnSignal,
+        AbortSignal.timeout(this.contextSummaryTimeoutMs),
+      ]);
+      const started = performance.now();
+      try {
+        const response = await raceWithSignal(Promise.resolve().then(() => this.summarizeContext({
+          previousSummary: this.state.contextSummary,
+          messages: batch.messages,
+          fromMessage: batch.fromMessage,
+          throughMessage: batch.throughMessage,
+          objective: this.state.objective,
+          plan: this.state.plan,
+          signal: summarySignal,
+        })), summarySignal);
+        const summary = normalizeSemanticSummary(response?.summary || response);
+        const usage = normalizeUsage(response?.usage, batch.messages, JSON.stringify(summary));
+        await this.dispatch({
+          type: "CONTEXT_SUMMARY_COMPLETED",
+          summary,
+          fromMessage: batch.fromMessage,
+          throughMessage: batch.throughMessage,
+          sourceCursor,
+          sourceComplete: batch.sourceComplete,
+          model: response?.model || this.provider.name || "unknown",
+          usage,
+          durationMs: Math.round(performance.now() - started),
+        });
+      } catch (error) {
+        if (turnSignal.aborted) throw error;
+        await this.dispatch({
+          type: "CONTEXT_SUMMARY_DEGRADED",
+          fromMessage: batch.fromMessage,
+          throughMessage: batch.throughMessage,
+          sourceCursor,
+          usage: normalizeUsage(error?.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, batch.messages, ""),
+          durationMs: Math.round(performance.now() - started),
+          error: redactSensitiveText(error?.message || "Context summary 失败"),
+        });
+        break;
+      }
+      current = this.session.prepareModelRequest({
+        systemPrompt: this.systemPrompt,
+        tools: this.toolHost.schemas({ session: this.session }),
+        maxInputTokens: this.maxInputTokens,
+      });
+    }
+    return current;
   }
 }
 

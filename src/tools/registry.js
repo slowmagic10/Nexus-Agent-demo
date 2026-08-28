@@ -244,6 +244,57 @@ export function createToolRegistry({
   });
 
   define({
+    name: "edit_file",
+    description: "精确编辑工作区内的 UTF-8 文本文件。old_text 必须按 expected_replacements 指定次数完整匹配；缺失或歧义时不写入。",
+    approval: "always",
+    effects: ["write"],
+    idempotency: "unknown",
+    changeTracking: { mode: "paths", arguments: ["path"] },
+    capability: workspacePathCapability("path", "write", "R1", false),
+    parameters: objectSchema({
+      path: { type: "string", description: "相对工作区路径" },
+      old_text: { type: "string", description: "要替换的完整原文本，必须精确匹配空格与换行" },
+      new_text: { type: "string", description: "替换后的文本；可为空字符串以删除原文本" },
+      expected_replacements: {
+        type: "integer",
+        minimum: 1,
+        maximum: 1000,
+        description: "预期匹配并替换的次数，默认 1；实际次数不一致时不写入",
+      },
+    }, ["path", "old_text", "new_text"]),
+    execute: async ({
+      path: requested,
+      old_text: oldText,
+      new_text: newText,
+      expected_replacements: expectedReplacements = 1,
+    }, context) => {
+      if (!oldText) throw new Error("edit_file old_text 不能为空");
+      if (!Number.isSafeInteger(expectedReplacements) || expectedReplacements < 1 || expectedReplacements > 1000) {
+        throw new Error("edit_file expected_replacements 必须是 1 到 1000 的整数");
+      }
+      if (oldText === newText) throw new Error("edit_file 的 old_text 与 new_text 相同，无需写入");
+      const target = safePath(root, requested);
+      assertWorkspaceAccess(policyFor(context), root, target, "write");
+      context.signal?.throwIfAborted?.();
+      const stat = await fs.stat(target);
+      if (!stat.isFile()) throw new Error("edit_file 只能编辑普通文件");
+      if (stat.size > 4 * 1024 * 1024) throw new Error("edit_file 首版仅支持不超过 4 MiB 的文本文件");
+      const source = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(await fs.readFile(target));
+      const actualReplacements = countOccurrences(source, oldText);
+      if (actualReplacements !== expectedReplacements) {
+        throw new Error(`edit_file 预期匹配 ${expectedReplacements} 处，实际匹配 ${actualReplacements} 处；文件未修改`);
+      }
+      const updated = source.split(oldText).join(newText);
+      if (Buffer.byteLength(updated) > 8 * 1024 * 1024) {
+        throw new Error("edit_file 替换结果超过 8 MiB，文件未修改");
+      }
+      context.signal?.throwIfAborted?.();
+      await fs.writeFile(target, updated, "utf8");
+      return `已精确编辑 ${path.relative(root, target)}（替换 ${actualReplacements} 处）`;
+    },
+  });
+
+  define({
     name: "run_shell",
     description: "在工作区执行 Shell 命令。read-only 仅允许沙箱内的最小只读检查；workspace-auto 可自动执行常规命令；网络、安装和外部路径需要审批，危险命令拒绝。",
     approval: "always",
@@ -523,6 +574,16 @@ function executionType(execution) {
 
 function truncate(value, length) {
   return value.length > length ? `${value.slice(0, length)}\n…（已截断）` : value;
+}
+
+function countOccurrences(source, target) {
+  let count = 0;
+  let offset = 0;
+  while ((offset = source.indexOf(target, offset)) !== -1) {
+    count += 1;
+    offset += target.length;
+  }
+  return count;
 }
 
 function formatMemories(memories) {

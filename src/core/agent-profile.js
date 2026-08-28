@@ -206,6 +206,7 @@ function renderPrompt(systemPrompt) {
     plan: null,
     delegations: [],
     contextMemory: [],
+    contextSummary: null,
     loadedSkills: [],
   }) || "");
 }
