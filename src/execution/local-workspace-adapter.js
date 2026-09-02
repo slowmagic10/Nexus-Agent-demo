@@ -79,6 +79,9 @@ export class LocalWorkspaceAdapter {
         detached: this.processGroupTermination,
         stdio: ["ignore", "pipe", "pipe"],
       });
+      // 使用流级 UTF-8 解码器维护跨 Buffer chunk 的多字节字符状态。
+      child.stdout.setEncoding("utf8");
+      child.stderr.setEncoding("utf8");
       const output = createOutputCollector(normalized.maxOutputChars);
       const notifications = createOutputNotifier(onOutput);
       let settled = false;

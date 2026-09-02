@@ -98,11 +98,22 @@ export class AgentSession {
     this.#modelContext = applyModelContextEvent(this.#modelContext, event, next);
     for (const subscription of this.#eventSubscribers) {
       if (event.cursor <= subscription.cursor) continue;
-      subscription.listener(structuredClone(event));
       subscription.cursor = event.cursor;
+      notifyObserver(subscription.listener, structuredClone(event));
     }
-    for (const listener of this.#subscribers) listener(structuredClone(next));
+    for (const listener of this.#subscribers) notifyObserver(listener, structuredClone(next));
     return this.state;
+  }
+}
+
+function notifyObserver(listener, value) {
+  try {
+    const result = listener(value);
+    if (result && typeof result.then === "function") {
+      Promise.resolve(result).catch(() => {});
+    }
+  } catch {
+    // Durable commit 已经完成；投影层异常不能将成功提交伪装成失败。
   }
 }
 

@@ -75,6 +75,26 @@ test("LocalWorkspaceAdapter 按 stdout/stderr 通道发布执行中输出", asyn
   assert.match(chunks.map((event) => event.chunk).join(""), /err/);
 });
 
+test("LocalWorkspaceAdapter 跨 Buffer chunk 保持 UTF-8 输出完整", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-local-exec-utf8-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const adapter = new LocalWorkspaceAdapter({ workspace, environment: {} });
+  const chunks = [];
+  const program = [
+    "process.stdout.write(Buffer.from([0xe4]));",
+    "setTimeout(() => process.stdout.write(Buffer.from([0xbd,0xa0,0xe5,0xa5,0xbd,0x0a])), 20);",
+  ].join("");
+
+  const result = await adapter.execute(createExecutionSpec({
+    program: process.execPath,
+    args: ["-e", program],
+  }), { onOutput: async (event) => chunks.push(event.chunk) });
+
+  assert.equal(result.stdout, "你好\n");
+  assert.equal(result.output, "你好\n");
+  assert.equal(chunks.join(""), "你好\n");
+});
+
 test("LocalWorkspaceAdapter 拒绝 workspace 外 cwd 和越界符号链接", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-local-exec-root-"));
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-local-exec-outside-"));

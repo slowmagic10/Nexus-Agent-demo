@@ -41,6 +41,60 @@ test("Tool Host 在审批和执行前校验参数", async () => {
   assert.ok(session.state.events.some((event) => event.type === "tool.validation_failed"));
 });
 
+test("Tool Host 执行前强制 JSON Schema 数值、字符串和 oneOf 约束", async () => {
+  let executions = 0;
+  const { host, session } = fixture({
+    name: "strict_schema",
+    description: "严格参数",
+    parameters: objectSchema({
+      count: { type: "integer", minimum: 1, maximum: 3 },
+      name: { type: "string", minLength: 3, pattern: "^[a-z]+$" },
+      mode: { oneOf: [{ const: "safe" }, { const: "review" }] },
+    }, ["count", "name", "mode"]),
+    approval: "never",
+    effects: ["read"],
+    idempotency: "safe",
+    capability: { risk: "R0", readOnly: true, resources: [{ kind: "session", access: "read" }] },
+    execute: async () => { executions += 1; return "ok"; },
+  });
+
+  for (const [id, argumentsValue] of [
+    ["below-min", { count: 0, name: "valid", mode: "safe" }],
+    ["short", { count: 1, name: "ab", mode: "safe" }],
+    ["pattern", { count: 1, name: "ABC", mode: "safe" }],
+    ["one-of", { count: 1, name: "valid", mode: "other" }],
+  ]) {
+    const result = await host.execute({ id, name: "strict_schema", arguments: argumentsValue }, { session });
+    assert.equal(result.status, "validation_failed");
+  }
+  assert.equal(executions, 0);
+});
+
+test("Tool Host 对未支持的 JSON Schema 关键字 fail closed", async () => {
+  let executions = 0;
+  const { host, session } = fixture({
+    name: "unsupported_schema",
+    description: "未支持 schema",
+    parameters: {
+      type: "object",
+      properties: { value: { type: "string", $ref: "#/$defs/value" } },
+      $defs: { value: { type: "string" } },
+    },
+    approval: "never",
+    effects: ["read"],
+    idempotency: "safe",
+    capability: { risk: "R0", readOnly: true, resources: [{ kind: "session", access: "read" }] },
+    execute: async () => { executions += 1; return "no"; },
+  });
+
+  assert.equal(host.schemas().some((schema) => schema.function.name === "unsupported_schema"), false);
+  const result = await host.execute({ id: "unsupported", name: "unsupported_schema", arguments: { value: "x" } }, { session });
+
+  assert.equal(result.status, "validation_failed");
+  assert.match(result.result, /未支持.*\$defs|未支持.*\$ref/);
+  assert.equal(executions, 0);
+});
+
 test("Tool Host 只在内层参数完整通过 schema 时恢复 Provider 双重 arguments 包装", async () => {
   let received;
   const { host, session } = fixture({

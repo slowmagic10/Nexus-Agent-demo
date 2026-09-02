@@ -3,18 +3,28 @@ import { spawn } from "node:child_process";
 import readline from "node:readline";
 
 const PROTOCOL_VERSION = "2025-06-18";
+const INHERITED_ENVIRONMENT_KEYS = new Set([
+  "PATH", "LANG", "TMPDIR", "TEMP", "TMP", "TERM", "NO_COLOR",
+  "LC_ALL", "LC_COLLATE", "LC_CTYPE", "LC_MESSAGES", "LC_MONETARY", "LC_NUMERIC", "LC_TIME",
+  "LC_ADDRESS", "LC_IDENTIFICATION", "LC_MEASUREMENT", "LC_NAME", "LC_PAPER", "LC_TELEPHONE",
+]);
 
 export class McpStdioClient {
-  constructor({ name, command, args = [], env = {}, cwd, timeout = 30_000 }) {
+  constructor({ name, command, args = [], env = {}, cwd, timeout = 30_000, closeGraceMs = 500 }) {
+    if (!Number.isSafeInteger(closeGraceMs) || closeGraceMs < 1) {
+      throw new Error("MCP closeGraceMs 必须是正整数");
+    }
     this.name = name;
     this.timeout = timeout;
     this.nextId = 1;
     this.pending = new Map();
     this.stderr = "";
     this.closed = false;
+    this.closeGraceMs = closeGraceMs;
+    this.closePromise = null;
     this.child = spawn(command, args, {
       cwd,
-      env: { ...process.env, ...env },
+      env: createMcpEnvironment(process.env, env),
       stdio: ["pipe", "pipe", "pipe"],
       shell: false,
     });
@@ -114,12 +124,32 @@ export class McpStdioClient {
   }
 
   async close() {
-    if (this.closed) return;
+    this.closePromise ||= this.shutdown();
+    await this.closePromise;
+  }
+
+  async shutdown() {
     this.closed = true;
     this.lines.close();
     this.child.stdin.end();
-    this.child.kill("SIGTERM");
     this.failAll(new Error(`MCP 服务器 ${this.name} 已关闭`));
+    if (childHasExited(this.child)) return;
+
+    const exited = waitForChildExit(this.child);
+    this.child.kill("SIGTERM");
+    let graceTimer;
+    const graceful = await Promise.race([
+      exited.then(() => true),
+      new Promise((resolve) => {
+        graceTimer = setTimeout(() => resolve(false), this.closeGraceMs);
+        graceTimer.unref?.();
+      }),
+    ]);
+    if (graceTimer) clearTimeout(graceTimer);
+    if (!graceful && !childHasExited(this.child)) {
+      this.child.kill("SIGKILL");
+      await exited;
+    }
   }
 
   send(message) {
@@ -165,4 +195,29 @@ export class McpStdioClient {
     }
     this.pending.clear();
   }
+}
+
+export function createMcpEnvironment(baseEnvironment = {}, explicitEnvironment = {}) {
+  const environment = {};
+  for (const [key, value] of Object.entries(baseEnvironment)) {
+    if (INHERITED_ENVIRONMENT_KEYS.has(key) && typeof value === "string") {
+      environment[key] = value;
+    }
+  }
+  for (const [key, value] of Object.entries(explicitEnvironment || {})) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || typeof value !== "string") {
+      throw new Error(`MCP 环境变量 ${key} 必须是合法名称和字符串值`);
+    }
+    environment[key] = value;
+  }
+  return environment;
+}
+
+function childHasExited(child) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+function waitForChildExit(child) {
+  if (childHasExited(child)) return Promise.resolve();
+  return new Promise((resolve) => child.once("exit", resolve));
 }

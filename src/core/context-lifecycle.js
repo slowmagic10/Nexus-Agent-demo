@@ -255,11 +255,21 @@ function normalizeUsage(usage, messages, text) {
   if (usage) {
     const inputTokens = usage.inputTokens ?? usage.prompt_tokens ?? 0;
     const outputTokens = usage.outputTokens ?? usage.completion_tokens ?? 0;
-    return { inputTokens, outputTokens, totalTokens: usage.totalTokens ?? usage.total_tokens ?? inputTokens + outputTokens };
+    assertTokenCount(inputTokens, "inputTokens");
+    assertTokenCount(outputTokens, "outputTokens");
+    const totalTokens = inputTokens + outputTokens;
+    assertTokenCount(totalTokens, "totalTokens");
+    return { inputTokens, outputTokens, totalTokens };
   }
   const inputTokens = Math.ceil(JSON.stringify(messages).length / 4);
   const outputTokens = Math.ceil(String(text || "").length / 4);
   return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+}
+
+function assertTokenCount(value, field) {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`Provider Token usage ${field} 必须是非负安全整数`);
+  }
 }
 
 function nextOverflowBudget(contextPlan, overflow) {

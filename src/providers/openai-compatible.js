@@ -37,10 +37,14 @@ export class OpenAICompatibleProvider {
     let reasoningContent = "";
     let finishReason = null;
     let usage = null;
+    let sawTerminal = false;
     const toolCalls = new Map();
 
     for await (const data of readSseData(response.body)) {
-      if (data === "[DONE]") break;
+      if (data === "[DONE]") {
+        sawTerminal = true;
+        break;
+      }
       let payload;
       try {
         payload = JSON.parse(data);
@@ -54,7 +58,10 @@ export class OpenAICompatibleProvider {
       if (payload.usage) usage = normalizeUsage(payload.usage);
       const choice = payload.choices?.[0];
       if (!choice) continue;
-      if (choice.finish_reason != null) finishReason = choice.finish_reason;
+      if (choice.finish_reason != null) {
+        finishReason = choice.finish_reason;
+        sawTerminal = true;
+      }
       const delta = choice.delta || {};
       if (typeof delta.content === "string" && delta.content) {
         text += delta.content;
@@ -63,6 +70,8 @@ export class OpenAICompatibleProvider {
       if (typeof delta.reasoning_content === "string") reasoningContent += delta.reasoning_content;
       appendToolCallDeltas(toolCalls, delta.tool_calls);
     }
+
+    if (!sawTerminal) throw new Error("模型输出流未返回明确终态（缺少 [DONE] 或 finish_reason）");
 
     yield {
       type: "completed",
@@ -182,9 +191,15 @@ function normalizeUsage(value) {
 }
 
 function parseArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("Tool Arguments JSON 无效：工具参数必须是 JSON 对象");
+  }
   try {
-    return JSON.parse(value || "{}");
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    return parsed;
   } catch {
-    return {};
+    throw new Error("Tool Arguments JSON 无效：无法解析工具参数");
   }
 }

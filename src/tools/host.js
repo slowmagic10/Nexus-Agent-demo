@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import { assertArtifactStore } from "../artifacts/interface.js";
 import { beginFileChangeCapture, finishFileChangeCapture } from "../artifacts/file-change-manifest.js";
 import { redactSensitiveText } from "../security/redact.js";
@@ -41,7 +42,9 @@ export class ToolHost {
       const tool = name ? this.registry.get(name) : null;
       if (!tool) return false;
       const definition = normalizeDefinition(tool, this.defaultTimeoutMs);
-      return definitionAvailable(definition, session?.state) && this.policy.canExpose(definition);
+      return definitionAvailable(definition, session?.state)
+        && this.policy.canExpose(definition)
+        && !validateSchemaSupport(definition.parameters, `工具 ${name} parameters`);
     });
   }
 
@@ -636,17 +639,148 @@ function validateCall(call) {
 }
 
 function validateArguments(schema, value, path = "arguments") {
-  if (!schema || typeof schema !== "object") return null;
-  if (Array.isArray(schema.enum) && !schema.enum.some((item) => JSON.stringify(item) === JSON.stringify(value))) {
+  const supportError = validateSchemaSupport(schema, path);
+  if (supportError) return supportError;
+  return validateSchemaValue(schema, value, path);
+}
+
+const SUPPORTED_SCHEMA_KEYWORDS = new Set([
+  "$schema", "$id", "title", "description", "default", "examples", "deprecated", "readOnly", "writeOnly",
+  "type", "enum", "const", "anyOf", "oneOf", "allOf", "not", "properties", "required",
+  "additionalProperties", "items", "minItems", "maxItems", "uniqueItems", "minProperties", "maxProperties",
+  "minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf", "minLength", "maxLength", "pattern",
+]);
+
+function validateSchemaSupport(schema, path) {
+  if (schema === true || schema === false) return null;
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return `${path} 的 JSON Schema 必须是对象或布尔值`;
+  const unsupported = Object.keys(schema).find((key) => !SUPPORTED_SCHEMA_KEYWORDS.has(key));
+  if (unsupported) return `${path} 使用了未支持的 JSON Schema 关键字 ${unsupported}`;
+
+  const allowedTypes = new Set(["null", "array", "object", "integer", "number", "string", "boolean"]);
+  const declaredTypes = Array.isArray(schema.type) ? schema.type : [schema.type];
+  if (schema.type !== undefined && (!declaredTypes.length || declaredTypes.some((type) => !allowedTypes.has(type)))) {
+    return `${path}.type 包含无效类型`;
+  }
+  if (schema.enum !== undefined && (!Array.isArray(schema.enum) || schema.enum.length === 0)) {
+    return `${path}.enum 必须是非空数组`;
+  }
+  if (schema.required !== undefined
+      && (!Array.isArray(schema.required) || schema.required.some((key) => typeof key !== "string")
+        || new Set(schema.required).size !== schema.required.length)) {
+    return `${path}.required 必须是不重复的字符串数组`;
+  }
+  for (const keyword of ["minItems", "maxItems", "minProperties", "maxProperties", "minLength", "maxLength"]) {
+    if (schema[keyword] !== undefined && (!Number.isSafeInteger(schema[keyword]) || schema[keyword] < 0)) {
+      return `${path}.${keyword} 必须是非负安全整数`;
+    }
+  }
+  for (const keyword of ["minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum"]) {
+    if (schema[keyword] !== undefined && (typeof schema[keyword] !== "number" || !Number.isFinite(schema[keyword]))) {
+      return `${path}.${keyword} 必须是有限数字`;
+    }
+  }
+  if (schema.multipleOf !== undefined
+      && (typeof schema.multipleOf !== "number" || !Number.isFinite(schema.multipleOf) || schema.multipleOf <= 0)) {
+    return `${path}.multipleOf 必须是正有限数字`;
+  }
+  if (schema.uniqueItems !== undefined && typeof schema.uniqueItems !== "boolean") {
+    return `${path}.uniqueItems 必须是布尔值`;
+  }
+
+  for (const keyword of ["anyOf", "oneOf", "allOf"]) {
+    if (schema[keyword] !== undefined) {
+      if (!Array.isArray(schema[keyword]) || schema[keyword].length === 0) return `${path}.${keyword} 必须是非空数组`;
+      for (const [index, child] of schema[keyword].entries()) {
+        const error = validateSchemaSupport(child, `${path}.${keyword}[${index}]`);
+        if (error) return error;
+      }
+    }
+  }
+  if (schema.not !== undefined) {
+    const error = validateSchemaSupport(schema.not, `${path}.not`);
+    if (error) return error;
+  }
+  if (schema.properties !== undefined) {
+    if (!schema.properties || typeof schema.properties !== "object" || Array.isArray(schema.properties)) {
+      return `${path}.properties 必须是对象`;
+    }
+    for (const [key, child] of Object.entries(schema.properties)) {
+      const error = validateSchemaSupport(child, `${path}.properties.${key}`);
+      if (error) return error;
+    }
+  }
+  if (schema.items !== undefined) {
+    const error = validateSchemaSupport(schema.items, `${path}.items`);
+    if (error) return error;
+  }
+  if (schema.additionalProperties !== undefined && typeof schema.additionalProperties !== "boolean") {
+    const error = validateSchemaSupport(schema.additionalProperties, `${path}.additionalProperties`);
+    if (error) return error;
+  }
+  if (schema.pattern !== undefined) {
+    if (typeof schema.pattern !== "string") return `${path}.pattern 必须是字符串`;
+    try {
+      new RegExp(schema.pattern);
+    } catch {
+      return `${path}.pattern 不是有效正则表达式`;
+    }
+  }
+  return null;
+}
+
+function validateSchemaValue(schema, value, path) {
+  if (schema === true) return null;
+  if (schema === false) return `${path} 被 JSON Schema 禁止`;
+  if (Array.isArray(schema.enum) && !schema.enum.some((item) => isDeepStrictEqual(item, value))) {
     return `${path} 不在允许值中`;
   }
+  if (Object.hasOwn(schema, "const") && !isDeepStrictEqual(schema.const, value)) {
+    return `${path} 必须等于声明的常量`;
+  }
   if (Array.isArray(schema.anyOf)) {
-    if (!schema.anyOf.some((item) => !validateArguments(item, value, path))) return `${path} 不匹配任何允许结构`;
-    return null;
+    if (!schema.anyOf.some((item) => !validateSchemaValue(item, value, path))) return `${path} 不匹配任何允许结构`;
+  }
+  if (Array.isArray(schema.oneOf)) {
+    const matches = schema.oneOf.filter((item) => !validateSchemaValue(item, value, path)).length;
+    if (matches !== 1) return `${path} 必须且只能匹配一个允许结构`;
+  }
+  if (Array.isArray(schema.allOf)) {
+    for (const child of schema.allOf) {
+      const error = validateSchemaValue(child, value, path);
+      if (error) return error;
+    }
+  }
+  if (schema.not && !validateSchemaValue(schema.not, value, path)) {
+    return `${path} 匹配了禁止结构`;
   }
   const type = schema.type;
   if (type && !matchesType(value, type)) return `${path} 必须是 ${typeLabel(type)}`;
-  if (type === "object" || schema.properties || schema.required) {
+
+  if (typeof value === "number" && Number.isFinite(value)) {
+    if (typeof schema.minimum === "number" && value < schema.minimum) return `${path} 不能小于 ${schema.minimum}`;
+    if (typeof schema.maximum === "number" && value > schema.maximum) return `${path} 不能大于 ${schema.maximum}`;
+    if (typeof schema.exclusiveMinimum === "number" && value <= schema.exclusiveMinimum) return `${path} 必须大于 ${schema.exclusiveMinimum}`;
+    if (typeof schema.exclusiveMaximum === "number" && value >= schema.exclusiveMaximum) return `${path} 必须小于 ${schema.exclusiveMaximum}`;
+    if (typeof schema.multipleOf === "number" && schema.multipleOf > 0) {
+      const quotient = value / schema.multipleOf;
+      if (Math.abs(quotient - Math.round(quotient)) > Number.EPSILON * Math.max(1, Math.abs(quotient))) {
+        return `${path} 必须是 ${schema.multipleOf} 的倍数`;
+      }
+    }
+  }
+
+  if (typeof value === "string") {
+    const length = [...value].length;
+    if (Number.isSafeInteger(schema.minLength) && length < schema.minLength) return `${path} 长度不能小于 ${schema.minLength}`;
+    if (Number.isSafeInteger(schema.maxLength) && length > schema.maxLength) return `${path} 长度不能大于 ${schema.maxLength}`;
+    if (typeof schema.pattern === "string" && !new RegExp(schema.pattern).test(value)) return `${path} 不匹配要求的格式`;
+  }
+
+  if (matchesType(value, "object")) {
+    const size = Object.keys(value).length;
+    if (Number.isSafeInteger(schema.minProperties) && size < schema.minProperties) return `${path} 字段数量不能小于 ${schema.minProperties}`;
+    if (Number.isSafeInteger(schema.maxProperties) && size > schema.maxProperties) return `${path} 字段数量不能大于 ${schema.maxProperties}`;
     if (!value || typeof value !== "object" || Array.isArray(value)) return `${path} 必须是对象`;
     for (const key of schema.required || []) {
       if (!Object.hasOwn(value, key)) return `${path} 缺少必填字段 ${key}`;
@@ -655,18 +789,32 @@ function validateArguments(schema, value, path = "arguments") {
       const unknown = Object.keys(value).find((key) => !Object.hasOwn(schema.properties || {}, key));
       if (unknown) return `${path} 包含未知字段 ${unknown}`;
     }
+    if (schema.additionalProperties && typeof schema.additionalProperties === "object") {
+      for (const key of Object.keys(value).filter((name) => !Object.hasOwn(schema.properties || {}, name))) {
+        const error = validateSchemaValue(schema.additionalProperties, value[key], `${path}.${key}`);
+        if (error) return error;
+      }
+    }
     for (const [key, child] of Object.entries(schema.properties || {})) {
       if (!Object.hasOwn(value, key)) continue;
-      const error = validateArguments(child, value[key], `${path}.${key}`);
+      const error = validateSchemaValue(child, value[key], `${path}.${key}`);
       if (error) return error;
     }
   }
-  if (type === "array" && schema.items) {
+
+  if (Array.isArray(value)) {
     if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) return `${path} 至少需要 ${schema.minItems} 项`;
     if (Number.isSafeInteger(schema.maxItems) && value.length > schema.maxItems) return `${path} 最多允许 ${schema.maxItems} 项`;
-    for (let index = 0; index < value.length; index += 1) {
-      const error = validateArguments(schema.items, value[index], `${path}[${index}]`);
-      if (error) return error;
+    if (schema.uniqueItems === true) {
+      if (value.some((item, index) => value.slice(0, index).some((seen) => isDeepStrictEqual(seen, item)))) {
+        return `${path} 不允许重复项`;
+      }
+    }
+    if (schema.items !== undefined) {
+      for (let index = 0; index < value.length; index += 1) {
+        const error = validateSchemaValue(schema.items, value[index], `${path}[${index}]`);
+        if (error) return error;
+      }
     }
   }
   return null;

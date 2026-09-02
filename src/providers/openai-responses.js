@@ -270,9 +270,15 @@ function normalizeArgumentsText(value) {
 }
 
 function parseArguments(value) {
+  if (value && typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string" || !value.trim()) {
+    throw new Error("Tool Arguments JSON 无效：工具参数必须是 JSON 对象");
+  }
   try {
-    return JSON.parse(value || "{}");
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not an object");
+    return parsed;
   } catch {
-    return {};
+    throw new Error("Tool Arguments JSON 无效：无法解析工具参数");
   }
 }

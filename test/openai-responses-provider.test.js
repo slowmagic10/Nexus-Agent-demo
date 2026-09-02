@@ -175,6 +175,28 @@ test("OpenAI Responses incomplete 即使携带函数调用也保留非正常终�
   assert.deepEqual(completed.toolCalls, [{ id: "partial-call", name: "write_file", arguments: { path: "partial.txt" } }]);
 });
 
+test("OpenAI Responses Adapter 拒绝非法 Tool Arguments JSON", async () => {
+  const provider = new OpenAIResponsesProvider({
+    apiKey: "test-key",
+    baseUrl: "https://api.openai.com/v1",
+    model: "gpt-test",
+    fetchImpl: async () => new Response(JSON.stringify({
+      status: "completed",
+      output: [{
+        type: "function_call",
+        call_id: "bad-call",
+        name: "dangerous_optional",
+        arguments: "{bad",
+      }],
+    }), { headers: { "content-type": "application/json" } }),
+  });
+
+  await assert.rejects(
+    provider.complete({ systemPrompt: "system", messages: [], tools: [] }),
+    /Tool Arguments/,
+  );
+});
+
 test("OpenAI Responses 流式失败事件规范化为 Provider 错误", async () => {
   const provider = new OpenAIResponsesProvider({
     apiKey: "test-key",

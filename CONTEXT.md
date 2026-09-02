@@ -5,7 +5,7 @@ Nexus Agent 是一个本地优先、可执行、可恢复的 Agent Harness。本
 ## Language
 
 **Agent Session**:
-一次可持久化、可重放的 Agent 执行连续体；它拥有 durable event、状态投影和单调事件游标。
+一次可持久化、可重放的 Agent 执行连续体；它拥有 durable event、状态投影和单调事件游标。durable commit 是事实边界，其后的同步或异步观察者失败都必须被隔离，不得伪装成提交失败或产生未处理拒绝。
 _Avoid_: Conversation, chat state
 
 **Agent Profile Snapshot**:
@@ -129,7 +129,7 @@ _Avoid_: Model extraction inside storage Adapter, auto-write active memory
 _Avoid_: Injecting unreviewed candidate into model context
 
 **Tool Host**:
-工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
+工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。参数 schema 只允许 Host 明确实现的 JSON Schema 关键字，约束递归执行；遇到 `$ref/$defs` 等未实现语义必须 fail closed，不能把部分校验伪装成完整校验。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
 _Avoid_: AgentRuntime reading tool approval or execute implementation
 
 **Tool Authorization Decision**:
@@ -182,11 +182,11 @@ _Avoid_: Browser-only terminal output, raw chunk per journal event, persisting i
 _Avoid_: Entrypoint-specific parsing, hidden precedence, printing raw secrets, process launch from workspace config
 
 **Runtime Assembly**:
-从规范化 RuntimeConfig 构造并拥有 Store、Provider bindings、Capability Runtime、WorkspaceExecution、Permission Profiles、Tool Registry、MCP、Tool Hosts 与 Project Grant Store 的 deep Module。基础阶段只打开 Session Store，使 CLI 的列表、Import 和离线流程不会隐式启动 Execution 或 MCP；显式 activate 后才创建可执行对象图。CLI 与 Gateway 是入口 Adapter，不重复知道对象创建顺序；所有 owner-scoped capability、MCP、私有 Grant Store 和 Session Store 由同一个幂等 close 生命周期逆序收敛。Gateway 的每个 AgentRuntime 也由该 Module 的 factory 创建，但 Session 路由、HTTP/SSE 和终端交互仍属于入口 Adapter。
+从规范化 RuntimeConfig 构造并拥有 Store、Provider bindings、Capability Runtime、WorkspaceExecution、Permission Profiles、Tool Registry、MCP、Tool Hosts 与 Project Grant Store 的 deep Module。基础阶段只打开 Session Store，使 CLI 的列表、Import 和离线流程不会隐式启动 Execution 或 MCP；显式 activate 后才创建可执行对象图。CLI 与 Gateway 是入口 Adapter，不重复知道对象创建顺序；所有 owner-scoped capability、MCP、私有 Grant Store 和 Session Store 由同一个幂等 close 生命周期逆序收敛。MCP 子进程只继承精确枚举的非秘密运行与标准 locale 环境，以及其本机配置显式环境；不允许通过环境变量名前缀扩大继承范围。close 时等待真实 exit、超时强制终止。Gateway 的每个 AgentRuntime 也由该 Module 的 factory 创建，但 Session 路由、HTTP/SSE 和终端交互仍属于入口 Adapter。
 _Avoid_: Entrypoint-owned object graphs, MCP during session listing, duplicated shutdown order, Runtime Assembly absorbing CLI commands or Gateway routing
 
 **Provider Output Stream**:
-真实 Provider Adapter 可选提供的增量输出能力。OpenAI-compatible Chat Completions 与原生 OpenAI Responses 两个 Adapter 都只向 Agent Runtime 暴露规范化 `text_delta` 和带完整 `text/toolCalls/usage/finishReason` 的 `completed`；共享代码只负责 SSE framing，原始事件语义、chunk 边界和工具参数碎片留在各 Adapter 内。Responses 的 encrypted reasoning item 和 OpenAI-compatible 的 `reasoning_content` 都规范化为 opaque `provider_items`，随 Assistant Message durable 保存并在对应 Adapter 的工具往返时原样续传，不解释、不展示，也不把可见推理文本加入状态。Runtime 把正文按完整行/句末合并、整段脱敏后写入 `modelStreamChunks` durable projection，Gateway 继续通过 Session Event SSE 发布。取消、失败、进程中断以及 `max_output_tokens/length/content_filter` 等非正常 Provider 终态都保留已持久化部分输出；非正常终态不得标记 Objective 完成，也不得启动其携带的 Tool Call。成功后由最终 Assistant Message 原子取代流投影。Provider 不返回 usage 时允许使用现有估算。
+真实 Provider Adapter 可选提供的增量输出能力。OpenAI-compatible Chat Completions 与原生 OpenAI Responses 两个 Adapter 都只向 Agent Runtime 暴露规范化 `text_delta` 和带完整 `text/toolCalls/usage/finishReason` 的 `completed`；共享代码只负责 SSE framing，原始事件语义、chunk 边界和工具参数碎片留在各 Adapter 内。兼容 SSE 只有收到 `[DONE]` 或 `finish_reason` 才能声明终态；非法 Tool Arguments JSON 必须阻止调用，不能降级为空对象。Responses 的 encrypted reasoning item 和 OpenAI-compatible 的 `reasoning_content` 都规范化为 opaque `provider_items`，随 Assistant Message durable 保存并在对应 Adapter 的工具往返时原样续传，不解释、不展示，也不把可见推理文本加入状态。Runtime 把正文按完整行/句末合并、整段脱敏后写入 `modelStreamChunks` durable projection，Gateway 继续通过 Session Event SSE 发布。取消、失败、进程中断以及 `max_output_tokens/length/content_filter` 等非正常 Provider 终态都保留已持久化部分输出；非正常终态不得标记 Objective 完成，也不得启动其携带的 Tool Call。成功后由最终 Assistant Message 原子取代流投影。Provider 不返回 usage 时允许使用现有估算；显式 usage 的分量、单次合计和 Session 累计都必须保持为非负安全整数，Runtime 重算 total 后才进入预算。
 _Avoid_: Token-per-event journal writes, raw Provider SSE in session state, browser-only deltas, persisting unredacted token fragments, treating partial tool arguments as executable calls
 
 **Capability Runtime**:
@@ -194,5 +194,5 @@ _Avoid_: Token-per-event journal writes, raw Provider SSE in session state, brow
 _Avoid_: Static global registries, silent replacement, dispose before visibility revocation, executing through stale capability references
 
 **WorkspaceExecution**:
-Tool 与实际执行环境之间的稳定接口。Tool 产生显式 ExecutionSpec，Native/Local/Docker/Remote Adapter 负责 cwd、环境、进程和输出；Tool Host 仍负责 Capability、Policy、Approval、deadline、取消与 unknown 副作用。macOS 默认使用 NativeSandboxAdapter/Seatbelt；LocalWorkspaceAdapter 仅为显式 trusted-local；Docker 是显式可选后端。原生沙箱依赖缺失或平台未实现时 fail closed，不允许回退到 unrestricted。
+Tool 与实际执行环境之间的稳定接口。Tool 产生显式 ExecutionSpec，Native/Local/Docker/Remote Adapter 负责 cwd、环境、进程和输出；stdout/stderr 各自维持流级 UTF-8 解码状态，实时 observation 和最终结果不得因 Buffer chunk 边界产生不同文本。Tool Host 仍负责 Capability、Policy、Approval、deadline、取消与 unknown 副作用。macOS 默认使用 NativeSandboxAdapter/Seatbelt；LocalWorkspaceAdapter 仅为显式 trusted-local；Docker 是显式可选后端。原生沙箱依赖缺失或平台未实现时 fail closed，不允许回退到 unrestricted。
 _Avoid_: child_process inside Tool Registry, full process.env inheritance, shell:true, project config selecting execution mode, silent sandbox fallback, treating OS sandbox or Docker as VM isolation

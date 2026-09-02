@@ -200,9 +200,7 @@ export function reduceSession(state, action) {
       }
       const summary = normalizeSemanticSummary(action.summary);
       const usage = normalizeSummaryUsage(action.usage);
-      next.metrics.inputTokens += usage.inputTokens;
-      next.metrics.outputTokens += usage.outputTokens;
-      next.metrics.totalTokens += usage.totalTokens;
+      addTokenUsage(next.metrics, usage);
       next.metrics.modelDurationMs += action.durationMs || 0;
       next.contextSummary = {
         summaryVersion: CONTEXT_SUMMARY_VERSION,
@@ -228,9 +226,7 @@ export function reduceSession(state, action) {
     }
     case "CONTEXT_SUMMARY_DEGRADED": {
       const usage = normalizeSummaryUsage(action.usage);
-      next.metrics.inputTokens += usage.inputTokens;
-      next.metrics.outputTokens += usage.outputTokens;
-      next.metrics.totalTokens += usage.totalTokens;
+      addTokenUsage(next.metrics, usage);
       next.metrics.modelDurationMs += action.durationMs || 0;
       emit("context.summary_degraded", {
         fromMessage: action.fromMessage,
@@ -243,9 +239,7 @@ export function reduceSession(state, action) {
       break;
     }
     case "MODEL_COMPLETED":
-      next.metrics.inputTokens += action.usage.inputTokens;
-      next.metrics.outputTokens += action.usage.outputTokens;
-      next.metrics.totalTokens += action.usage.totalTokens;
+      addTokenUsage(next.metrics, action.usage);
       next.metrics.modelDurationMs += action.durationMs;
       emit("model.completed", {
         durationMs: action.durationMs,
@@ -1228,6 +1222,24 @@ function normalizeSummaryUsage(value = {}) {
     ? value.totalTokens
     : inputTokens + outputTokens;
   return { inputTokens, outputTokens, totalTokens };
+}
+
+function addTokenUsage(metrics, usage = {}) {
+  const inputTokens = addTokenMetric(metrics.inputTokens, usage.inputTokens, "inputTokens");
+  const outputTokens = addTokenMetric(metrics.outputTokens, usage.outputTokens, "outputTokens");
+  const totalTokens = addTokenMetric(metrics.totalTokens, usage.totalTokens, "totalTokens");
+  metrics.inputTokens = inputTokens;
+  metrics.outputTokens = outputTokens;
+  metrics.totalTokens = totalTokens;
+}
+
+function addTokenMetric(current, increment, field) {
+  if (!Number.isSafeInteger(current) || current < 0 || !Number.isSafeInteger(increment) || increment < 0) {
+    throw new Error(`Token 指标 ${field} 必须是非负安全整数`);
+  }
+  const total = current + increment;
+  if (!Number.isSafeInteger(total)) throw new Error(`Token 指标 ${field} 累计越界`);
+  return total;
 }
 
 function emptyMetrics() {

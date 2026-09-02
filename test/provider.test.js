@@ -74,6 +74,41 @@ test("OpenAI-compatible Streaming 在兼容端返回 JSON 时安全降级为单�
   assert.equal(events.at(-1).response.usage.totalTokens, 5);
 });
 
+test("OpenAI-compatible Streaming 在 SSE 截断且没有明确终态时失败", async () => {
+  const provider = new OpenAICompatibleProvider({
+    apiKey: "test-key",
+    baseUrl: "https://example.com/v1",
+    model: "test-model",
+    fetchImpl: async () => sseResponse([
+      "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+    ]),
+  });
+
+  await assert.rejects(async () => {
+    for await (const _event of provider.stream({ systemPrompt: "system", messages: [], tools: [] })) {
+      // consume
+    }
+  }, /终态/);
+});
+
+test("OpenAI-compatible Provider 拒绝非法 Tool Arguments JSON", async () => {
+  const provider = new OpenAICompatibleProvider({
+    apiKey: "test-key",
+    baseUrl: "https://example.com/v1",
+    model: "test-model",
+    fetchImpl: async () => sseResponse([
+      "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"bad-call\",\"function\":{\"name\":\"dangerous_optional\",\"arguments\":\"{bad\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n",
+      "data: [DONE]\n\n",
+    ]),
+  });
+
+  await assert.rejects(async () => {
+    for await (const _event of provider.stream({ systemPrompt: "system", messages: [], tools: [] })) {
+      // consume
+    }
+  }, /Tool Arguments/);
+});
+
 test("OpenAI-compatible Provider 持久化并回传思考模式的 reasoning_content", async () => {
   const requests = [];
   let calls = 0;

@@ -104,6 +104,59 @@ test("Context Lifecycle 在 turn 开始前已取消时闭合 retrieval，不留�
   assert.match(retrieval.error, /立即取消/);
 });
 
+test("Context Lifecycle 拒绝非法 Provider Token usage，预算指标不被污染", async () => {
+  const session = createAgentSession(withMessages([
+    { type: "USER_MESSAGE", content: "usage test" },
+  ]));
+  const lifecycle = new ContextLifecycle({
+    session,
+    provider: { name: "context-test", complete: async () => ({}) },
+    systemPrompt: () => "system",
+    getTools: () => [],
+    retrieveMemory: async () => [],
+    requestModel: async () => ({
+      text: "不应完成",
+      toolCalls: [],
+      finishReason: "stop",
+      usage: { inputTokens: "not-a-number", outputTokens: -5, totalTokens: "NaN" },
+    }),
+  });
+  const turn = await lifecycle.startTurn({ query: "usage test", signal: new AbortController().signal });
+
+  await assert.rejects(turn.completeModelStep(), /Token usage/);
+
+  assert.deepEqual(
+    Object.fromEntries(["inputTokens", "outputTokens", "totalTokens"].map((key) => [key, session.state.metrics[key]])),
+    { inputTokens: 0, outputTokens: 0, totalTokens: 0 },
+  );
+  assert.equal(session.state.events.some((event) => event.type === "model.completed"), false);
+});
+
+test("Context Lifecycle 拒绝分量求和后越过安全整数的 Token usage", async () => {
+  const session = createAgentSession(withMessages([
+    { type: "USER_MESSAGE", content: "usage overflow test" },
+  ]));
+  const lifecycle = new ContextLifecycle({
+    session,
+    provider: { name: "context-test", complete: async () => ({}) },
+    systemPrompt: () => "system",
+    getTools: () => [],
+    retrieveMemory: async () => [],
+    requestModel: async () => ({
+      text: "不应完成",
+      toolCalls: [],
+      finishReason: "stop",
+      usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 1 },
+    }),
+  });
+  const turn = await lifecycle.startTurn({ query: "usage overflow test", signal: new AbortController().signal });
+
+  await assert.rejects(turn.completeModelStep(), /Token usage totalTokens/);
+
+  assert.equal(session.state.metrics.totalTokens, 0);
+  assert.equal(session.state.events.some((event) => event.type === "model.completed"), false);
+});
+
 function createAgentSession(state) {
   return new AgentSession({ state, reducer: reduceSession });
 }

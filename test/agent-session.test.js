@@ -85,6 +85,65 @@ test("持久化失败时不推进内存状态，也不通知订阅者", async ()
   assert.equal(notifications, 0);
 });
 
+test("订阅者异常不改变 durable dispatch 结果且不阻断其他订阅者", async () => {
+  const session = new AgentSession({
+    state: createSession({ provider: "demo", workspace: "/tmp" }),
+    reducer: reduceSession,
+  });
+  let notified = 0;
+  session.subscribeEvents(() => { throw new Error("event observer failed"); });
+  session.subscribe(() => { throw new Error("state observer failed"); });
+  session.subscribe(() => { notified += 1; });
+
+  const committed = await session.dispatch({ type: "USER_MESSAGE", content: "只提交一次" });
+
+  assert.equal(committed.messages.at(-1).content, "只提交一次");
+  assert.equal(session.cursor, 1);
+  assert.equal(notified, 1);
+});
+
+test("异步订阅者拒绝不会逃逸为 unhandledRejection", async () => {
+  const session = new AgentSession({
+    state: createSession({ provider: "demo", workspace: "/tmp" }),
+    reducer: reduceSession,
+  });
+  const escaped = [];
+  const onUnhandled = (error) => escaped.push(error);
+  process.on("unhandledRejection", onUnhandled);
+  try {
+    session.subscribe(async () => { throw new Error("async observer failed"); });
+
+    const committed = await session.dispatch({ type: "USER_MESSAGE", content: "异步订阅" });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(committed.messages.at(-1).content, "异步订阅");
+    assert.deepEqual(escaped, []);
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("Session 拒绝 Token 指标累计越过安全整数边界", async () => {
+  const session = new AgentSession({
+    state: createSession({ provider: "demo", workspace: "/tmp" }),
+    reducer: reduceSession,
+  });
+  await session.dispatch({
+    type: "MODEL_COMPLETED",
+    usage: { inputTokens: Number.MAX_SAFE_INTEGER, outputTokens: 0, totalTokens: Number.MAX_SAFE_INTEGER },
+    durationMs: 0,
+  });
+
+  await assert.rejects(session.dispatch({
+    type: "MODEL_COMPLETED",
+    usage: { inputTokens: 1, outputTokens: 0, totalTokens: 1 },
+    durationMs: 0,
+  }), /Token 指标 inputTokens 累计越界/);
+
+  assert.equal(session.state.metrics.inputTokens, Number.MAX_SAFE_INTEGER);
+  assert.equal(session.state.metrics.totalTokens, Number.MAX_SAFE_INTEGER);
+});
+
 test("事件游标支持增量读取、断点订阅和客户端投影", async () => {
   const fixture = createFixture();
   try {
