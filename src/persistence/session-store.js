@@ -18,6 +18,15 @@ const JOURNAL_FORMAT_VERSION = 1;
 const MAX_PORTABLE_ARTIFACTS = 256;
 const MAX_PORTABLE_ARTIFACT_BYTES = 64_000_000;
 
+export function validateAndReplayJournalArchive(archive) {
+  const validated = validateJournalArchive(archive);
+  return {
+    state: structuredClone(validated.state),
+    events: structuredClone(validated.events),
+    artifactCount: validated.artifacts.length,
+  };
+}
+
 export class SessionStore {
   constructor(file, { checkpointInterval = 100, workspace, memoryScope } = {}) {
     if (!Number.isInteger(checkpointInterval) || checkpointInterval < 1) {

@@ -41,6 +41,39 @@ test("Tool Host 在审批和执行前校验参数", async () => {
   assert.ok(session.state.events.some((event) => event.type === "tool.validation_failed"));
 });
 
+test("Tool Host 只在内层参数完整通过 schema 时恢复 Provider 双重 arguments 包装", async () => {
+  let received;
+  const { host, session } = fixture({
+    name: "wrapped_arguments",
+    description: "兼容参数恢复",
+    parameters: objectSchema({ content: { type: "string" } }, ["content"]),
+    approval: "never",
+    effects: ["read"],
+    idempotency: "safe",
+    capability: { risk: "R0", readOnly: true, resources: [{ kind: "session", access: "read" }] },
+    execute: async (argumentsValue) => { received = argumentsValue; return "ok"; },
+  });
+
+  const recovered = await host.execute({
+    id: "call-wrapped-valid",
+    name: "wrapped_arguments",
+    arguments: { arguments: JSON.stringify({ content: "value" }) },
+  }, { session });
+  assert.equal(recovered.status, "completed");
+  assert.deepEqual(received, { content: "value" });
+  const requested = session.state.events.find((event) => event.callId === "call-wrapped-valid" && event.type === "tool.requested");
+  assert.equal(requested.argumentsRecovered, true);
+  assert.deepEqual(requested.args, { content: "value" });
+
+  const invalid = await host.execute({
+    id: "call-wrapped-invalid",
+    name: "wrapped_arguments",
+    arguments: { arguments: JSON.stringify({ wrong: true }) },
+  }, { session });
+  assert.equal(invalid.status, "validation_failed");
+  assert.equal(received.content, "value");
+});
+
 test("Tool Host 将 Approval 绑定 args hash，并统一脱敏执行结果", async () => {
   let pending;
   const { host, session } = fixture({

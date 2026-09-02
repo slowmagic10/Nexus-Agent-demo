@@ -6,7 +6,7 @@ import { normalizeNetworkTargets, resolveShellNetworkTargets } from "../executio
 const PROFILE_NAMES = new Set(["read-only", "workspace-auto", "workspace-confirm", "workspace-untrusted", "approval-required", "danger-full-access"]);
 const SANDBOXED_EXECUTIONS = new Set(["native", "docker"]);
 const USER_CONFIRM_SCOPES = Object.freeze(["once", "session"]);
-const AUTO_WORKSPACE_EDIT_TOOLS = new Set(["write_file", "edit_file"]);
+const AUTO_WORKSPACE_EDIT_TOOLS = new Set(["write_file", "edit_file", "apply_patch"]);
 
 export class PermissionProfile {
   constructor({ name = "approval-required", workspace, executionType = "local", networkTargets = [] } = {}) {

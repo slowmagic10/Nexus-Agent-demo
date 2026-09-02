@@ -75,6 +75,23 @@ test("Gateway 显式选择具名 Agent Profile 并持久绑定运行上下文", 
   assert.deepEqual(review.agentProfile.budgets, { maxSteps: 20, maxTokensPerTurn: 3_000 });
   assert.equal(manager.sessions.get(review.id).runtime.maxTokensPerTurn, 3_000);
 
+  const reviewMemory = await manager.addSessionMemory(review.id, "只属于审查 Agent 的记忆", ["review"]);
+  assert.equal(reviewMemory.scope.agentId, "review");
+  assert.deepEqual((await manager.listSessionMemories(review.id)).map((item) => item.id), [reviewMemory.id]);
+  assert.deepEqual(await manager.listMemories("审查 Agent"), []);
+  await manager.deleteSessionMemory(review.id, reviewMemory.id, "审查 Agent 删除自己的记忆");
+  assert.deepEqual(await manager.listSessionMemories(review.id), []);
+
+  const candidate = await store.memory.add({
+    content: "审查 Agent 的候选记忆",
+    status: "candidate",
+  }, {
+    scope: review.memoryScope,
+    provenance: { origin: "auto_extract", actor: "review" },
+  });
+  assert.deepEqual((await manager.listSessionMemoryCandidates(review.id)).map((item) => item.id), [candidate.id]);
+  assert.deepEqual(await manager.listMemoryCandidates(), []);
+
   await manager.sendMessage(review.id, "检查项目");
   await waitFor(async () => (await manager.get(review.id)).phase === "completed");
   assert.match(reviewRequests[0].systemPrompt, /base prompt/);

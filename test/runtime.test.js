@@ -3,6 +3,8 @@ import test from "node:test";
 import { AgentRuntime } from "../src/core/agent.js";
 import { AgentSession } from "../src/core/session.js";
 import { createSession, reduceSession } from "../src/core/state.js";
+import { evaluateSession } from "../src/evaluation/session-evaluation.js";
+import { createProviderHttpError } from "../src/providers/errors.js";
 import { redactSensitiveText, redactSensitiveValue } from "../src/security/redact.js";
 
 test("模型用量和耗时进入状态指标", async () => {
@@ -16,6 +18,197 @@ test("模型用量和耗时进入状态指标", async () => {
   assert.equal(runtime.state.metrics.totalTokens, 14);
   assert.equal(runtime.state.metrics.modelCalls, 1);
   assert.equal(runtime.state.events.find((event) => event.type === "model.completed").finishReason, "stop");
+});
+
+test("非正常模型终态保留部分回答但不会把任务判为成功", async () => {
+  for (const finishReason of ["max_output_tokens", "length", "content_filter"]) {
+    const runtime = createRuntime({
+      provider: {
+        complete: async () => ({
+          text: `部分回答-${finishReason}`,
+          toolCalls: [],
+          finishReason,
+          usage: { inputTokens: 3, outputTokens: 2, totalTokens: 5 },
+        }),
+      },
+    });
+
+    await runtime.runTurn("生成完整回答", async () => false);
+
+    assert.equal(runtime.state.phase, "failed", finishReason);
+    assert.equal(runtime.state.objective.status, "failed", finishReason);
+    assert.equal(runtime.state.messages.at(-1).content, `部分回答-${finishReason}`);
+    assert.match(runtime.state.lastError, new RegExp(finishReason));
+    const report = evaluateSession(runtime.state);
+    assert.equal(report.status, "failed");
+    assert.deepEqual(report.issues.map((issue) => issue.code), ["session_failed"]);
+  }
+});
+
+test("截断的模型工具调用不会启动 Tool Host Adapter", async () => {
+  let executions = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => ({
+        text: "工具参数可能不完整",
+        finishReason: "max_output_tokens",
+        toolCalls: [{ id: "truncated-call", name: "write_file", arguments: { path: "partial.txt", content: "partial" } }],
+      }),
+    },
+    toolHost: {
+      schemas: () => [],
+      execute: async () => { executions += 1; },
+    },
+  });
+
+  await runtime.runTurn("写入文件", async () => true);
+
+  assert.equal(executions, 0);
+  assert.equal(runtime.state.phase, "failed");
+  assert.ok(runtime.state.messages.some((message) => message.role === "assistant" && message.content === "工具参数可能不完整"));
+  assert.ok(runtime.state.messages.some((message) => message.role === "tool"
+    && message.tool_call_id === "truncated-call"
+    && /没有执行/.test(message.content)));
+});
+
+test("Streaming Provider 增量正文 durable 合并后完成，工具调用保持现有协议", async () => {
+  let completeCalled = false;
+  const providerDeltas = [..."正在处理很多很细的模型 token，最终会合并写入。\n"];
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        completeCalled = true;
+        throw new Error("不应调用 complete");
+      },
+      async *stream() {
+        for (const delta of providerDeltas) yield { type: "text_delta", delta };
+        yield {
+          type: "completed",
+          response: {
+            text: providerDeltas.join(""),
+            finishReason: "stop",
+            toolCalls: [],
+            usage: { inputTokens: 9, outputTokens: 7, totalTokens: 16 },
+          },
+        };
+      },
+    },
+  });
+
+  await runtime.runTurn("流式完成", async () => false);
+
+  assert.equal(completeCalled, false);
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(runtime.state.messages.at(-1).content, providerDeltas.join(""));
+  assert.equal(runtime.state.modelStream, null);
+  assert.deepEqual(runtime.state.modelStreamChunks, []);
+  const durableDeltas = runtime.state.events.filter((event) => event.type === "model.stream_delta");
+  assert.ok(durableDeltas.length <= 2);
+  assert.ok(durableDeltas.length < providerDeltas.length);
+  assert.ok(runtime.state.events.some((event) => event.type === "model.stream_started"));
+  assert.ok(runtime.state.events.some((event) => event.type === "model.stream_completed"));
+  assert.equal(runtime.state.metrics.totalTokens, 16);
+});
+
+test("取消 Streaming 模型请求会保留已脱敏的部分输出并立即闭合状态", async () => {
+  let started;
+  const streaming = new Promise((resolve) => { started = resolve; });
+  const secret = "sk-1234567890abcdefghijkl";
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => { throw new Error("不应调用 complete"); },
+      async *stream({ signal }) {
+        yield { type: "text_delta", delta: `已生成部分内容 ${secret}` };
+        started();
+        await new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+        yield { type: "completed", response: { text: "", toolCalls: [] } };
+      },
+    },
+  });
+
+  const turn = runtime.runTurn("等待后取消", async () => false);
+  await streaming;
+  runtime.cancel("中途停止");
+  await turn;
+
+  assert.equal(runtime.state.phase, "cancelled");
+  assert.equal(runtime.state.modelStream.status, "cancelled");
+  assert.equal(runtime.state.modelStreamChunks.join(""), "已生成部分内容 sk-[REDACTED]");
+  assert.equal(JSON.stringify(runtime.state).includes(secret), false);
+  assert.ok(runtime.state.events.some((event) => event.type === "model.stream_delta"));
+});
+
+test("Streaming Provider Context overflow 会丢弃旧增量投影并只重试一次", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "可省略旧历史".repeat(400) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "旧历史完成" } });
+  let calls = 0;
+  const runtime = createRuntime({
+    state,
+    maxInputTokens: 32_000,
+    provider: {
+      complete: async () => { throw new Error("不应调用 complete"); },
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          throw createProviderHttpError(400, JSON.stringify({
+            error: { code: "context_length_exceeded", message: "maximum context length is 800 tokens" },
+          }));
+        }
+        yield { type: "text_delta", delta: "缩减后完成。" };
+        yield { type: "completed", response: { text: "缩减后完成。", toolCalls: [], finishReason: "stop" } };
+      },
+    },
+  });
+
+  await runtime.runTurn("自动缩减", async () => false);
+
+  assert.equal(calls, 2, runtime.state.lastError);
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(runtime.state.messages.at(-1).content, "缩减后完成。");
+  assert.equal(runtime.state.events.filter((event) => event.type === "model.stream_started").length, 2);
+  assert.equal(runtime.state.events.filter((event) => event.type === "model.stream_discarded").length, 1);
+});
+
+test("Provider opaque items 随 Assistant Message durable 保存并进入下一工具轮", async () => {
+  const requests = [];
+  let calls = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => { throw new Error("不应调用 complete"); },
+      async *stream({ messages }) {
+        requests.push(messages);
+        calls += 1;
+        yield calls === 1
+          ? {
+              type: "completed",
+              response: {
+                text: "",
+                toolCalls: [{ id: "opaque-call", name: "noop", arguments: {} }],
+                providerItems: [{ type: "reasoning", id: "rs-1", encrypted_content: "cipher", summary: [] }],
+              },
+            }
+          : { type: "completed", response: { text: "完成", toolCalls: [] } };
+      },
+    },
+    toolHost: {
+      schemas: () => [],
+      execute: async (call, context) => {
+        await context.session.dispatch({ type: "TOOL_REQUESTED", call });
+        await context.session.dispatch({ type: "TOOL_RESULT", call, ok: true, result: "ok", durationMs: 1 });
+      },
+    },
+  });
+
+  await runtime.runTurn("保持 Provider 状态", async () => false);
+
+  assert.equal(runtime.state.phase, "completed");
+  assert.deepEqual(requests[1][1].provider_items, [
+    { type: "reasoning", id: "rs-1", encrypted_content: "cipher", summary: [] },
+  ]);
+  assert.deepEqual(runtime.state.messages[1].provider_items, requests[1][1].provider_items);
 });
 
 test("默认无限步骤与累计 Token 预算允许持续工具循环直到模型完成", async () => {
@@ -112,7 +305,112 @@ test("运行时按预算压缩历史 turn 并留下 durable audit event", async 
   const audit = runtime.state.events.find((event) => event.type === "model.context_compacted");
   assert.equal(audit.compacted, true);
   assert.equal(audit.omittedTurns, 1);
+  assert.match(audit.contextHash, /^sha256:[a-f0-9]{64}$/);
+  assert.equal(audit.contextHashVersion, "model-request-sha256-v1");
+  assert.equal(audit.estimatorVersion, "utf8-bytes-div3-v1");
   assert.equal(runtime.state.phase, "completed");
+});
+
+test("Provider Context overflow 会缩减完整 turn 并自动重试一次", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "旧历史".repeat(400) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "旧历史完成" } });
+  let calls = 0;
+  const requests = [];
+  const runtime = createRuntime({
+    state,
+    maxInputTokens: 2_000,
+    provider: {
+      complete: async ({ messages }) => {
+        calls += 1;
+        requests.push(messages);
+        if (calls === 1) {
+          return {
+            text: "执行工具",
+            toolCalls: [{ id: "overflow-tool", name: "noop", arguments: {} }],
+            usage: { inputTokens: 10, outputTokens: 2, totalTokens: 12 },
+          };
+        }
+        if (calls === 2) {
+          throw createProviderHttpError(400, JSON.stringify({
+            error: { code: "context_length_exceeded", message: "maximum context length is 800 tokens" },
+          }));
+        }
+        return { text: "缩减后完成", toolCalls: [], usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 } };
+      },
+    },
+    toolHost: {
+      schemas: () => [],
+      execute: async (call, context) => {
+        await context.session.dispatch({ type: "TOOL_REQUESTED", call });
+        await context.session.dispatch({ type: "TOOL_RESULT", call, ok: true, result: "工具完成", durationMs: 1 });
+      },
+    },
+  });
+
+  await runtime.runTurn("当前任务", async () => false);
+
+  assert.equal(calls, 3);
+  assert.equal(runtime.state.phase, "completed");
+  assert.deepEqual(requests[2].map((message) => message.role), ["user", "assistant", "tool"]);
+  assert.equal(requests[2][1].tool_calls[0].id, "overflow-tool");
+  assert.equal(requests[2][2].tool_call_id, "overflow-tool");
+  const requested = runtime.state.events.find((event) => event.type === "context.replan_requested");
+  const replanned = runtime.state.events.find((event) => event.type === "context.replanned");
+  assert.equal(requested.overflow.providerCode, "context_length_exceeded");
+  assert.equal(requested.overflow.contextLimit, 800);
+  assert.ok(requested.nextMaxInputTokens < requested.maxInputTokens);
+  assert.notEqual(replanned.fromContextHash, replanned.toContextHash);
+  assert.ok(replanned.omittedTurns >= 1);
+  assert.equal(runtime.state.metrics.modelCalls, 3);
+});
+
+test("非 Context overflow 的 Provider 错误不会自动重试", async () => {
+  let calls = 0;
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        calls += 1;
+        throw createProviderHttpError(429, JSON.stringify({
+          error: { code: "rate_limit_exceeded", message: "Too many requests" },
+        }));
+      },
+    },
+  });
+
+  await runtime.runTurn("不要误重试", async () => false);
+
+  assert.equal(calls, 1);
+  assert.equal(runtime.state.phase, "failed");
+  assert.equal(runtime.state.events.some((event) => event.type.startsWith("context.replan")), false);
+});
+
+test("Context overflow 自动重试仍失败时停止且不进行第三次请求", async () => {
+  let state = createSession({ provider: "test", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "可省略旧历史".repeat(200) });
+  state = reduceSession(state, { type: "ASSISTANT_MESSAGE", message: { role: "assistant", content: "旧历史完成" } });
+  let calls = 0;
+  const runtime = createRuntime({
+    state,
+    maxInputTokens: 2_000,
+    provider: {
+      complete: async () => {
+        calls += 1;
+        throw createProviderHttpError(400, JSON.stringify({
+          error: { code: "context_length_exceeded", message: "maximum context length is 800 tokens" },
+        }));
+      },
+    },
+  });
+
+  await runtime.runTurn("当前任务", async () => false);
+
+  assert.equal(calls, 2);
+  assert.equal(runtime.state.phase, "failed");
+  assert.match(runtime.state.lastError, /自动缩减并重试一次后仍然超限/);
+  assert.equal(runtime.state.events.filter((event) => event.type === "context.replan_requested").length, 1);
+  assert.equal(runtime.state.events.filter((event) => event.type === "context.replan_exhausted").length, 1);
+  assert.equal(runtime.state.metrics.modelCalls, 2);
 });
 
 test("运行时在压缩前生成 durable semantic summary 并注入主模型请求", async () => {
@@ -305,7 +603,7 @@ test("敏感凭据会从工具日志文本中脱敏", () => {
   );
 });
 
-test("Assistant 正文中的高熵引号凭据会在持久化前脱敏", async () => {
+test("Assistant 正文中的明确密码语境会在持久化前脱敏", async () => {
   const runtime = createRuntime({
     provider: {
       complete: async () => ({
@@ -320,6 +618,46 @@ test("Assistant 正文中的高熵引号凭据会在持久化前脱敏", async (
   const content = runtime.state.messages.at(-1).content;
   assert.equal(content.includes("FakePass@4321"), false);
   assert.match(content, /\[REDACTED\]/);
+});
+
+test("普通代码和测试描述不会被高熵启发式误判为凭据", () => {
+  const source = [
+    'throw new RangeError("p must be between 0 and 100");',
+    'test("percentile([1, 2, 3], 100) returns the maximum", () => {});',
+    'const command = "node --test test/statistics.test.js";',
+  ].join("\n");
+
+  assert.equal(redactSensitiveText(source), source);
+});
+
+test("普通代码型 Tool 参数经过 Runtime 后保持逐字不变", async () => {
+  const content = 'throw new RangeError("p must be between 0 and 100");';
+  let modelCalls = 0;
+  let receivedContent = null;
+  const toolHost = {
+    schemas: () => [],
+    execute: async (call, { session }) => {
+      receivedContent = call.arguments.content;
+      await session.dispatch({ type: "TOOL_REQUESTED", call });
+      await session.dispatch({ type: "TOOL_RESULT", call, ok: true, result: "完成", durationMs: 1 });
+    },
+  };
+  const runtime = createRuntime({
+    provider: {
+      complete: async () => {
+        modelCalls += 1;
+        return modelCalls === 1
+          ? { text: "", toolCalls: [{ id: "write-code", name: "write_file", arguments: { path: "x.js", content } }] }
+          : { text: "完成", toolCalls: [] };
+      },
+    },
+    toolHost,
+  });
+
+  await runtime.runTurn("写入代码", async () => false);
+
+  assert.equal(receivedContent, content);
+  assert.equal(runtime.state.phase, "completed");
 });
 
 test("无限步骤模式允许单次任务执行超过默认八步", async () => {

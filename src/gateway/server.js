@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/keyboard.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/keyboard.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);
@@ -135,8 +135,30 @@ async function route(request, response, manager, staticRoot) {
       sendJson(response, 200, await manager.exportSession(id));
       return;
     }
+    if (request.method === "GET" && parts[2] === "evaluation" && parts.length === 3) {
+      sendJson(response, 200, { evaluation: await manager.evaluate(id) });
+      return;
+    }
     if (request.method === "GET" && parts[2] === "artifacts" && parts.length === 3) {
       sendJson(response, 200, { artifacts: await manager.listArtifacts(id) });
+      return;
+    }
+    if (request.method === "GET" && parts[2] === "memories" && parts.length === 3) {
+      sendJson(response, 200, { memories: await manager.listSessionMemories(id, url.searchParams.get("query") || "") });
+      return;
+    }
+    if (request.method === "POST" && parts[2] === "memories" && parts.length === 3) {
+      const body = await readJson(request);
+      sendJson(response, 201, { memory: await manager.addSessionMemory(id, body.content, body.tags || []) });
+      return;
+    }
+    if (request.method === "DELETE" && parts[2] === "memories" && parts[3] && parts.length === 4) {
+      await manager.deleteSessionMemory(id, parts[3], url.searchParams.get("reason") || "用户通过 Gateway 请求删除");
+      sendJson(response, 200, { deleted: true });
+      return;
+    }
+    if (request.method === "GET" && parts[2] === "memory-candidates" && parts.length === 3) {
+      sendJson(response, 200, { candidates: await manager.listSessionMemoryCandidates(id) });
       return;
     }
     if (request.method === "GET" && parts[2] === "artifacts" && parts[3] && parts.length === 4) {
@@ -171,6 +193,11 @@ async function route(request, response, manager, staticRoot) {
       } else {
         throw new GatewayError(404, "未知候选记忆操作");
       }
+      return;
+    }
+    if (request.method === "POST" && parts[2] === "memories" && parts[3] && parts[4] === "pin" && parts.length === 5) {
+      const body = await readJson(request);
+      sendJson(response, 200, { memory: await manager.setMemoryPinned(id, parts[3], body.pinned) });
       return;
     }
     if (request.method === "POST" && parts[2] === "messages" && parts.length === 3) {

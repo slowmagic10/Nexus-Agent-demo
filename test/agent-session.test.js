@@ -189,6 +189,34 @@ test("模型请求只暴露 durable context，并与展示状态隔离", async (
   }
 });
 
+test("Context Hash 随 Model Context audit event 持久化并可从 Journal 恢复", async () => {
+  const fixture = createFixture();
+  try {
+    const session = new AgentSession({
+      state: createSession({ provider: "demo", workspace: fixture.workspace, id: "session-context-hash" }),
+      reducer: reduceSession,
+      journal: fixture.store,
+    });
+    await session.dispatch({ type: "USER_MESSAGE", content: "记录模型上下文身份" });
+    const request = session.prepareModelRequest({
+      systemPrompt: () => "稳定系统提示",
+      tools: [{ type: "function", function: { name: "read_file" } }],
+    });
+    await session.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: request.contextPlan });
+
+    const restored = fixture.store.load(session.id);
+    const audit = restored.events.findLast((event) => event.type === "model.context_prepared");
+    assert.equal(audit.contextHash, request.contextPlan.contextHash);
+    assert.equal(audit.contextHashVersion, "model-request-sha256-v1");
+    assert.equal(audit.estimatorVersion, "utf8-bytes-div3-v1");
+    assert.equal("messages" in audit, false);
+    assert.equal("systemPrompt" in audit, false);
+    assert.equal("tools" in audit, false);
+  } finally {
+    fixture.close();
+  }
+});
+
 test("durable semantic summary 可从 Journal 恢复并继续进入压缩上下文", async () => {
   const fixture = createFixture();
   try {

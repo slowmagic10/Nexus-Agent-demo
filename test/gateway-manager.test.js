@@ -74,6 +74,40 @@ test("Gateway 可在模型运行中由用户显式打断任务", async (t) => {
   await assert.rejects(manager.cancel(session.id), /当前没有正在运行/);
 });
 
+test("Gateway 可按 Session 返回不含正文的确定性诊断报告", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-evaluation-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: {
+      name: "evaluation-provider",
+      complete: async () => ({
+        text: "私密回答正文不应进入诊断",
+        toolCalls: [],
+        usage: { inputTokens: 8, outputTokens: 2, totalTokens: 10 },
+      }),
+    },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "私密 System Prompt",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const session = await manager.create();
+  await manager.sendMessage(session.id, "私密用户任务");
+  await waitFor(async () => (await manager.get(session.id)).phase === "completed");
+  const report = await manager.evaluate(session.id);
+
+  assert.equal(report.status, "healthy");
+  assert.equal(report.metrics.totalTokens, 10);
+  assert.ok(report.cursor > 0);
+  assert.equal(JSON.stringify(report).includes("私密"), false);
+});
+
 test("Gateway 审批只接受当前卡片公开的 Grant scope", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-approval-scope-"));
   const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
@@ -395,6 +429,39 @@ test("Gateway 可列出、批准和拒绝候选记忆", async (t) => {
   const finalState = await manager.get(state.id);
   assert.ok(finalState.events.some((event) => event.type === "memory.candidate_approved"));
   assert.ok(finalState.events.some((event) => event.type === "memory.candidate_rejected"));
+});
+
+test("Gateway 通过 Session durable outbox 固定和取消固定长期记忆", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-pinned-memory-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: { name: "pinned-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const session = await manager.create();
+  const memory = await manager.addMemory("始终使用中文回答");
+
+  const pinned = await manager.setMemoryPinned(session.id, memory.id, true);
+  assert.equal(pinned.pinned, true);
+  assert.equal((await manager.listMemories())[0].id, memory.id);
+  assert.equal((await manager.listSessionMemories(session.id))[0].pinned, true);
+  let state = await manager.get(session.id);
+  assert.ok(state.events.some((event) => event.type === "memory.pin_changed" && event.pinned === true));
+  assert.ok(state.events.some((event) => event.type === "memory.mutation_applied"));
+
+  const unpinned = await manager.setMemoryPinned(session.id, memory.id, false);
+  assert.equal(unpinned.pinned, false);
+  state = await manager.get(session.id);
+  assert.equal(state.events.filter((event) => event.type === "memory.pin_changed").length, 2);
+  await assert.rejects(manager.setMemoryPinned(session.id, memory.id, "yes"), /pinned 必须是布尔值/);
 });
 
 test("Gateway 权限菜单按会话持久切换且运行中禁止变化", async (t) => {

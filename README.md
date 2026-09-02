@@ -39,8 +39,24 @@ Nexus 不绑定特定模型厂商。仓库提供通用的 `.env.local.example`�
 OPENAI_API_KEY=你的API密钥
 OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_MODEL=deepseek-v4-flash
+NEXUS_PROVIDER_THINKING=disabled
 NEXUS_MAX_STEPS=unlimited
 ```
+
+`NEXUS_PROVIDER_THINKING` 支持 `provider-default / enabled / disabled`。`provider-default` 不向服务端发送思考开关，保持 Provider 自身默认行为；[DeepSeek 当前文档](https://api-docs.deepseek.com/guides/thinking_mode/)说明思考默认启用且默认 effort 为 high，因此本地连续工具任务优先使用 `disabled`，复杂分析 Profile 可显式使用 `enabled`。该开关只对 OpenAI-compatible Adapter 生效；原生 Responses Adapter 若收到显式开关会在启动时拒绝配置，而不会静默忽略。CLI 也可使用 `--provider-thinking=disabled`。
+
+`--demo` 是强制离线模式：它会把 Thinking 重置为 `provider-default`，并忽略所有具名 Profile 的真实 Provider 覆盖，但保留 Profile 的指令、权限和预算。`--demo` 不能与显式 `--provider` 或 `--provider-thinking` 同时使用；环境文件中的真实 Provider 配置不会妨碍 Demo 启动。
+
+如果要使用 OpenAI 原生 Responses API，需要显式选择对应 Adapter；`auto` 仍保持 OpenAI-compatible 行为，不会改变现有 DeepSeek 配置：
+
+```dotenv
+NEXUS_PROVIDER=openai-responses
+OPENAI_API_KEY=你的OpenAI密钥
+OPENAI_BASE_URL=https://api.openai.com/v1
+OPENAI_MODEL=你的OpenAI模型ID
+```
+
+也可以在本机 `.nexus/config.local.json` 的全局 `provider` 或具名 Agent Profile 中设置 `"type": "openai-responses"`。原生 Adapter 使用 Responses 的 `instructions/input/function_call/function_call_output` 结构，主 turn 支持流式正文、工具调用和用量统计；工具往返需要的加密 reasoning item 会进入 durable Session，但不会作为可见思维文本展示。Context Summary 与 Memory Flush 继续调用同一个 Adapter 的非流式入口。
 
 启动本地模型 CLI：
 
@@ -70,7 +86,8 @@ npm run gateway:local
     "type": "openai-compatible",
     "apiKey": "你的本机密钥",
     "baseUrl": "https://api.deepseek.com",
-    "model": "deepseek-v4-flash"
+    "model": "deepseek-v4-flash",
+    "thinking": "disabled"
   },
   "agents": {
     "default": "coding",
@@ -89,14 +106,14 @@ npm run gateway:local
         "permissionProfile": "read-only",
         "maxSteps": 20,
         "maxTokensPerTurn": 50000,
-        "provider": { "model": "deepseek-reasoner" }
+        "provider": { "model": "deepseek-reasoner", "thinking": "enabled" }
       }
     }
   }
 }
 ```
 
-Web 左侧的“新任务 Agent”用于显式选择；CLI 可使用 `--agent-profile=review` 或 `NEXUS_AGENT_PROFILE=review`。每个 Profile 的 `provider` 可覆盖 `type/apiKey/baseUrl/model`，未填写字段继承最终全局 Provider 配置，因此同一个 DeepSeek Key 通常只需配置一次。Profile 选择只在创建新 Session 时生效，恢复会话继续使用其 durable Profile；如果配置中已删除该 Profile，恢复会明确失败而不会静默换 Agent。`--print-config` 会脱敏所有 API Key，也不会打印指令正文。当前不根据任务内容自动选模型，不做 active turn 热切换或 Provider fallback。
+Web 左侧的“新任务 Agent”用于显式选择；CLI 可使用 `--agent-profile=review` 或 `NEXUS_AGENT_PROFILE=review`。每个 Profile 的 `provider` 可覆盖 `type/apiKey/baseUrl/model/thinking`，未填写字段继承最终全局 Provider 配置，因此同一个 DeepSeek Key 通常只需配置一次。Profile 选择只在创建新 Session 时生效，恢复会话继续使用其 durable Profile；如果配置中已删除该 Profile，恢复会明确失败而不会静默换 Agent。`thinking` 会进入 durable Agent Profile Snapshot，恢复时的变化可在 Web 配置漂移中看到。`--print-config` 会脱敏所有 API Key，也不会打印指令正文。当前不根据任务内容自动选模型，不做 active turn 热切换、Provider fallback 或模型名/Endpoint 猜测。
 
 可用下面的命令查看最终生效配置及每个字段的来源；API Key 只会显示为 `[REDACTED]`：
 
@@ -155,19 +172,21 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 ## 基础能力
 
 - Agent Loop：模型、工具、Observation 循环默认不限制步骤数和累计 Token；可按需显式设置边界。模型被要求持续执行到完成并验证、明确阻塞或需要用户输入。
+- 模型流式输出：OpenAI-compatible/DeepSeek 与原生 OpenAI Responses 两个真实 Adapter 都把各自的 SSE 方言规范化为 `text_delta/completed`；Runtime 合并并脱敏正文片段后写入 durable Session Event，Web 可实时显示，刷新或 Gateway 重启后仍能恢复已生成部分。取消会直接中止模型请求并保留部分输出；Context overflow 重试前不会复用旧增量。普通 JSON 兼容端会安全降级，Context Summary 与 Memory Flush 继续使用非流式调用。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
 - Objective 与计划：每个用户任务建立 durable Objective；复杂任务可通过内置 `update_plan` 维护有版本的步骤状态，Journal 恢复和 Web Client Projection 会保留同一计划。
 - 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。Child 重启恢复时预算只能保持或继续收紧，不能被具名 Profile 默认值扩大。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
 - Agent Profile：每个 Session baseline 保存不含密钥的 Provider/model、提示词与工具 schema hash、Policy、Execution、Memory scope 和预算版本；恢复配置变化会留下带字段分类和影响等级的 durable diff。可在本地私有配置中定义具名 Profile，并在 Web/CLI 创建新任务时显式选择；Child 继承身份并单独收紧预算。
 - Artifact：长 Shell、MCP、文件读取等成功或失败工具输出在 Tool Host 统一脱敏后保存到 Session 专属 SQLite Artifact Store，消息只保留预览和引用；模型可用 `read_artifact` 分段读取，Web 工具卡可加载完整输出。Portable Journal 可携带 Artifact，Import 与 Branch 会复制到目标 Session scope，运行时仍禁止直接跨 Session 访问。
-- 精确编辑：`edit_file` 通过唯一旧文本完成局部替换，默认只接受恰好一次匹配；缺失或歧义时不会写入，避免为了改几行而重写整个文件。
-- 文件变更：`write_file`、`edit_file` 与 `run_shell` 执行后生成有界 File Change Manifest；Journal 保存新增/修改/删除摘要和哈希，脱敏文本 Diff 保存为 Artifact，Web 工具卡可按需查看。工作区内符号链接写入会追踪真实目标，Shell 创建、改指向或删除链接会记录链接变化。`.git/.nexus/node_modules/.env*` 不参与内容采集，超限会明确显示为不完整。
-- 模型上下文：只从 durable event 投影消息、记忆与 Skills；默认按 32,000 estimated input tokens 规划窗口。超限时生成带覆盖位置的滚动结构化语义摘要，并与连续的最近完整 turn 一起进入模型；摘要失败会降级为 recent-turn 策略，原始 Journal 永不删除。
+- 精确编辑：`edit_file` 通过唯一旧文本完成单文件局部替换；`apply_patch` 用一个结构化批次新增、精确更新或删除多个文件，同一路径可按顺序执行多个 update。批次先校验全部目标、权限、匹配次数和大小，再开始写入；符号链接别名造成的重复真实目标会拒绝，预检失败不修改文件，提交失败会回滚已经尝试的文件。它是进程内文件级补偿回滚，不承诺主机崩溃时的事务原子性。
+- 文件变更：`write_file`、`edit_file`、`apply_patch` 与 `run_shell` 执行后生成有界 File Change Manifest；Journal 保存新增/修改/删除摘要和哈希，脱敏文本 Diff 保存为 Artifact，Web 工具卡可按需查看。工作区内符号链接写入会追踪真实目标，Shell 创建、改指向或删除链接会记录链接变化。`.git/.nexus/node_modules/.env*` 不参与内容采集，超限会明确显示为不完整。
+- 模型上下文：Context Lifecycle deep Module 从 durable event 投影消息、记忆与 Skills，并在每个用户 turn 内统一管理历史/活动工具投影、Memory retrieval、窗口规划、语义摘要、模型审计与 overflow replan；Agent Loop 不再编排这些细节。已完成旧 turn 的工具协议会成对改写为有界历史记录；长任务的当前 turn 始终逐字保留最近两个完整工具轮，只在确实节省 Token 时精简更早、已经闭合的工具轮。完整内容继续保存在 Journal，用户目标、普通正文和最近 Observation 不变。默认按 32,000 estimated input tokens 规划窗口，超限时生成带覆盖位置的滚动结构化语义摘要，并与连续的最近完整 turn 一起进入模型；摘要失败会降级为 recent-turn 策略，原始 Journal 永不删除。每个最终 Provider 请求都计算确定性的 SHA-256 `contextHash`，durable audit 分开记录历史与活动工具投影节省和规划元数据，不复制 System Prompt、消息或工具正文。若 Provider 明确返回 Context overflow，Lifecycle 会进一步缩减完整旧 turn 并自动重试一次，且在本 turn 后续工具轮继续沿用收紧后的预算；认证、限流、网络和普通模型错误不会进入该重试路径。
+- 长期记忆：Pinned 与 Relevant Memory 按 Session scope 独立检索和预算，固定记忆优先进入 Context；两类都按不可信事实数据处理，不会提升为策略指令。Web 记忆面板的列表、新增、删除、固定、候选列表与候选处理全部绑定当前 Session/Profile 的 Memory Scope，不会落入默认 Agent 的全局 scope；固定状态经 durable outbox 修改并保留 Session 审计。
 - 工具安全：`read-only` 提供不可被 Policy/Grant/Approval 提升的只读闭环；`workspace-auto` 自动执行普通工作区写入与沙箱内常规 Shell；工作区删除、动态解释器、网络/安装/Git 写入审批并支持 Session Grant；秘密、宿主逃逸和系统破坏硬拒绝；工具有超时与取消信号。
 - Workspace 与 Skills：读取 `AGENTS.md`、`SOUL.md`，按需加载 `.nexus/skills/*/SKILL.md`。
 - 持久化：SQLite 保存会话、消息、事件、文本 Artifact、短期记忆、已加载 Skills 和跨会话长期记忆；自动执行事务化 schema migration，并用带校验和的 checkpoint 加速长会话恢复。
 - 恢复与迁移：按 ID 恢复会话，安全闭合中断的工具调用，并导入、导出可重放 Journal Archive。
-- 可观测性：记录模型/工具调用数、审批数、Token 用量以及模型、工具和单轮耗时。
+- 可观测性：记录模型/工具调用数、审批数、Token 用量以及模型、工具和单轮耗时；Web “上下文”面板解释 Token 预算、历史省略、Memory 命中、摘要 revision 与 Context overflow 自动缩减，“诊断”面板从 Session Journal 确定性派生任务健康、工具可靠性、审批和委派信号，不展示消息、工具参数或原始错误正文。离线 Replay Harness 可验证 Journal Archive、重复 reducer 重放并比较 state/event 指纹、Context Hash、指标与问题分类，全程不调用 Provider 或工具 Adapter。
 - 本地 Gateway：HTTP API、带游标的增量 SSE、远程审批、取消、记忆管理和同源 Web 控制台。
 - MCP stdio：支持 Tools、Resources、Resource Templates 和 Prompts；能力名称隔离并统一审批。
 - Capability Runtime：Native/MCP 工具有明确 owner；MCP 关闭或能力撤销后 schema 立即消失，旧调用不会启动 Adapter。
@@ -189,22 +208,48 @@ npm run demo -- --resume=session-xxxxxxxxxxxx
 # 导入归档到当前工作区；可选映射为新 ID
 npm run demo -- --import=/绝对路径/session.journal.json
 npm run demo -- --import=/绝对路径/session.journal.json --import-as=session-new-id
+
+# 离线校验和评测归档；可选与另一份归档比较
+npm run demo -- --evaluate-archive=/绝对路径/session.journal.json
+npm run demo -- --evaluate-archive=/绝对路径/baseline.json --compare-archive=/绝对路径/candidate.json
+
+# 使用脚本化 Provider/Tool Adapter 重跑固定场景，不访问真实模型或外部工具
+npm run demo -- --evaluate-scenario=/绝对路径/scenario.json
+
+# 运行目录中的全部 Scenario；可选按任一标签筛选
+npm run demo -- --evaluate-suite=/绝对路径/scenarios
+npm run demo -- --evaluate-suite=/绝对路径/scenarios --suite-tags=smoke,tools
+
+# 保存一份原始 Suite 报告作为基线
+npm run --silent demo -- --evaluate-suite=/绝对路径/scenarios > /绝对路径/baseline.json
+
+# 与基线比较；可选允许每个场景最多 10% Token 增长
+npm run demo -- --evaluate-suite=/绝对路径/scenarios --suite-baseline=/绝对路径/baseline.json
+npm run demo -- --evaluate-suite=/绝对路径/scenarios --suite-baseline=/绝对路径/baseline.json --suite-token-tolerance=10
 ```
+
+Scenario JSON 声明固定的 `prompt`、Provider 响应序列、无副作用工具结果、可选取消点和期望指标。Harness 会通过真实 `AgentRuntime + ToolHost` 独立运行两次，比较去除时间波动后的 State/Event 指纹、Context Hash、Token/调用计数、问题 code 与工具结果分类；断言不匹配时 CLI 以退出码 `2` 结束。脚本只接受结构化响应和 `success/failure/wait_for_cancel` 工具结果，不解释代码、不启动 Shell，也不读写业务 Session。
+
+Suite 目录只读取第一层普通 `.json` 文件，按文件名排序，忽略子目录、符号链接和非 JSON 文件；每个 Scenario 可声明 `tags`。汇总报告包含通过率、确定性计数、Token/工具总量、状态/问题/标签分布和失败断言，不返回 prompt、响应或工具参数。Suite 全部通过返回退出码 `0`，任一断言或确定性检查失败返回 `2`，目录或 fixture 无效返回 `1`。
+
+Baseline 必须是一次未带 `--suite-baseline` 的原始 `scenario-suite-evaluation-v1` JSON 报告。比较会阻止：旧场景缺失、通过变失败、确定性下降、状态恶化、新增问题代码、Context Hash 改变及超出容差的逐场景 Token 增长；新增且自身通过的场景允许加入。State/Event 指纹变化会记录为 change，但不会单独阻断，方便区分内部实现调整与模型可见上下文回归。旧报告的 score、results 和 Token 汇总不一致时会被拒绝。
 
 CLI 中可用：
 
 - `/help`：查看命令与演示任务。
 - `/long-memory`：查看长期记忆。
+- `/pin=ID`、`/unpin=ID`：固定或取消固定 active 长期记忆。
+- `/evaluation`：查看当前 Session 的确定性健康报告，不调用模型、不修改任务。
 - `/export`：导出当前会话到 `.nexus/exports/`。
 - `/quit`：保存并退出。
 
 如果进程在审批或工具执行期间中断，恢复时会为未闭合调用补充“执行状态未知”的安全结果，不会自动重放可能有副作用的操作。
 
-Model Context 不会按单条消息硬截断。assistant tool call 与对应 tool result 属于同一个完整 turn；如果当前 turn 或 system prompt、Skills、工具 schema 的固定成本自身超过预算，本轮会在调用模型前进入 `failed`。每次窗口规划都会产生 `model.context_prepared` 或 `model.context_compacted` durable audit event。
+Model Context 不会按单条消息硬截断。assistant tool call 与对应 tool result 属于同一个完整 turn；如果当前 turn 或 system prompt、Skills、工具 schema 的固定成本自身超过预算，本轮会在调用模型前进入 `failed`。每次窗口规划都会产生 `model.context_prepared` 或 `model.context_compacted` durable audit event，其中 `contextHash` 对实际发送的 System Prompt、消息和 Tool Schema 做规范化摘要，可用于识别两次请求的模型可见内容是否完全一致。Provider overflow 的自动缩减会写入 `context.replan_requested/replanned`；重试仍超限时写入 `context.replan_exhausted` 并结束任务，不会形成无界重试。
 
 ## Web 控制台与 Gateway API
 
-Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web 控制台提供会话列表、消息发送、实时状态、运行指标、会话级权限菜单、审批、取消、长期记忆和会话导出。运行期间 Composer 的发送按钮会切换成红色停止按钮，点击或按 `Esc` 都会中断模型请求、审批等待和工具进程组；停止完成后恢复发送。Runtime 失败时会在消息流底部直接显示停止原因，不再表现为无声结束。消息输入框支持中日韩输入法组合态：确认候选时的 Enter 不会发送，普通 Enter 发送，Shift+Enter 换行。
+Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web 控制台提供会话列表、消息发送、实时状态、运行指标、Context 可观测性、Journal 派生的任务诊断、会话级权限菜单、审批、取消、长期记忆和会话导出。运行期间 Composer 的发送按钮会切换成红色停止按钮，点击或按 `Esc` 都会中断模型请求、审批等待和工具进程组；停止完成后恢复发送。Runtime 失败时会在消息流底部直接显示停止原因，不再表现为无声结束。消息输入框支持中日韩输入法组合态：确认候选时的 Enter 不会发送，普通 Enter 发送，Shift+Enter 换行。
 
 常用 API：
 
@@ -215,6 +260,11 @@ GET    /sessions
 POST   /sessions
 POST   /sessions/imports
 GET    /sessions/:id
+GET    /sessions/:id/evaluation
+GET    /sessions/:id/memories
+POST   /sessions/:id/memories
+DELETE /sessions/:id/memories/:memoryId
+GET    /sessions/:id/memory-candidates
 POST   /sessions/:id/messages
 POST   /sessions/:id/permission-profile
 GET    /sessions/:id/events
@@ -225,6 +275,8 @@ GET    /sessions/:id/export
 GET    /memories?query=关键词
 POST   /memories
 DELETE /memories/:id
+GET    /sessions/:id/memories?query=关键词
+POST   /sessions/:id/memories/:memoryId/pin
 ```
 
 示例：

@@ -26,27 +26,74 @@ test("Config Composition 默认生成可运行的 Demo 配置", async () => {
   assert.equal(createConfiguredProvider(config).name, "offline-demo");
 });
 
+test("--demo 清除 Thinking 并强制所有具名 Profile 保持离线", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-demo-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    agents: {
+      profiles: {
+        review: { provider: { thinking: "enabled" } },
+        remote: {
+          provider: {
+            type: "openai-compatible",
+            apiKey: "remote-secret",
+            baseUrl: "https://example.com/v1",
+            model: "remote-model",
+          },
+        },
+      },
+    },
+  }), "utf8");
+
+  const config = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_PROVIDER_THINKING: "disabled" },
+    args: ["--demo"],
+  });
+
+  assert.equal(config.provider.type, "demo");
+  assert.equal(config.provider.thinking, "provider-default");
+  assert.equal(config.sources["provider.type"], "cli");
+  assert.equal(config.sources["provider.thinking"], "cli");
+  assert.ok(config.agents.profiles.every((profile) => profile.provider.type === "demo"));
+  assert.ok(config.agents.profiles.every((profile) => profile.provider.thinking === "provider-default"));
+  assert.doesNotMatch(JSON.stringify(inspectRuntimeConfig(config)), /remote-secret|remote-model|example\.com/);
+
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: {}, args: ["--demo", "--provider-thinking=enabled"] }),
+    /不能与 --provider-thinking/,
+  );
+});
+
 test("配置按 profile、local、environment、CLI 的确定顺序覆盖", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-compose-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
   await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
-    provider: { type: "openai-compatible", model: "profile-model", baseUrl: "https://profile.example/v1" },
+    provider: {
+      type: "openai-compatible",
+      model: "profile-model",
+      baseUrl: "https://profile.example/v1",
+      thinking: "enabled",
+    },
     runtime: { maxSteps: 10 },
     gateway: { port: 4100 },
   }), "utf8");
   await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
-    provider: { apiKey: "local-secret", model: "local-model" },
+    provider: { apiKey: "local-secret", model: "local-model", thinking: "disabled" },
     runtime: { maxSteps: 20 },
   }), "utf8");
   const env = {
     OPENAI_MODEL: "environment-model",
+    NEXUS_PROVIDER_THINKING: "enabled",
     NEXUS_MAX_STEPS: "30",
     NEXUS_GATEWAY_PORT: "4200",
   };
   const args = [
     `--workspace=${workspace}`,
     "--model=cli-model",
+    "--provider-thinking=disabled",
     "--max-steps=unlimited",
     "--mcp=cli-mcp.json",
     "--port=4300",
@@ -63,12 +110,14 @@ test("配置按 profile、local、environment、CLI 的确定顺序覆盖", asyn
   assert.equal(config.provider.apiKey, "local-secret");
   assert.equal(config.provider.model, "cli-model");
   assert.equal(config.provider.baseUrl, "https://profile.example/v1");
+  assert.equal(config.provider.thinking, "disabled");
   assert.equal(config.runtime.maxSteps, Infinity);
   assert.equal(config.mcp.file, "cli-mcp.json");
   assert.equal(config.gateway.port, 4300);
   assert.equal(config.sources["provider.apiKey"], "local_private");
   assert.equal(config.sources["provider.model"], "cli");
   assert.equal(config.sources["provider.baseUrl"], "workspace_profile");
+  assert.equal(config.sources["provider.thinking"], "cli");
   assert.equal(config.sources["gateway.port"], "cli");
 });
 
@@ -107,13 +156,14 @@ test("具名 Agent Profile 可显式绑定不同模型且 inspection 不暴露�
       type: "openai-compatible",
       apiKey: "shared-router-secret",
       baseUrl: "https://router.example/v1",
-      model: "base-model"
+      model: "base-model",
+      thinking: "disabled"
     },
     agents: {
       default: "fast",
       profiles: {
         fast: { provider: { model: "fast-model" } },
-        deep: { provider: { model: "deep-model", apiKey: "deep-router-secret" } }
+        deep: { provider: { model: "deep-model", apiKey: "deep-router-secret", thinking: "enabled" } }
       }
     }
   }), "utf8");
@@ -123,9 +173,41 @@ test("具名 Agent Profile 可显式绑定不同模型且 inspection 不暴露�
   assert.equal(providers.get("fast").provider.name, "openai-compatible/fast-model");
   assert.equal(providers.get("deep").provider.name, "openai-compatible/deep-model");
   assert.equal(providers.get("deep").provider.apiKey, "deep-router-secret");
+  assert.equal(providers.get("fast").provider.thinking, "disabled");
+  assert.equal(providers.get("deep").provider.thinking, "enabled");
   const inspected = JSON.stringify(inspectRuntimeConfig(config));
   assert.doesNotMatch(inspected, /shared-router-secret|deep-router-secret/);
   assert.match(inspected, /fast-model|deep-model/);
+});
+
+test("本机配置可显式选择原生 OpenAI Responses Adapter", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-openai-responses-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    provider: {
+      type: "openai-responses",
+      apiKey: "responses-secret",
+      baseUrl: "https://api.openai.com/v1",
+      model: "gpt-test",
+    },
+    agents: {
+      profiles: {
+        responses: { provider: { type: "openai-responses", model: "gpt-responses" } },
+      },
+    },
+  }), "utf8");
+
+  const config = await composeRuntimeConfig({ root: workspace, env: {}, args: ["--agent-profile=responses"] });
+  const provider = createConfiguredProvider(config);
+  const profiles = createConfiguredAgentProviders(config);
+  const inspected = JSON.stringify(inspectRuntimeConfig(config));
+
+  assert.equal(provider.name, "openai-responses/gpt-test");
+  assert.equal(profiles.get("responses").provider.name, "openai-responses/gpt-responses");
+  assert.equal(profiles.get("responses").descriptor.adapter, "openai-responses");
+  assert.doesNotMatch(inspected, /responses-secret/);
+  assert.match(inspected, /openai-responses/);
 });
 
 test("共享 profile 禁止 API Key，未知字段和无效值 fail closed", async (t) => {
@@ -141,6 +223,18 @@ test("共享 profile 禁止 API Key，未知字段和无效值 fail closed", asy
   await fs.writeFile(path.join(workspace, "nexus.config.json"), "{}", "utf8");
   await assert.rejects(composeRuntimeConfig({ root: workspace, env: {}, args: ["--port=70000"] }), /0 到 65535/);
   await assert.rejects(composeRuntimeConfig({ root: workspace, env: {}, args: ["--demo", "--provider=openai-compatible"] }), /不能与 --provider/);
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: {}, args: ["--provider-thinking=sometimes"] }),
+    /provider\.thinking/,
+  );
+  await assert.rejects(
+    composeRuntimeConfig({
+      root: workspace,
+      env: { OPENAI_API_KEY: "test", NEXUS_PROVIDER: "openai-responses" },
+      args: ["--provider-thinking=disabled"],
+    }),
+    /只支持 openai-compatible/,
+  );
 });
 
 test("共享 profile 不能启用会启动本地进程的 MCP", async (t) => {

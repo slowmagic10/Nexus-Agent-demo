@@ -30,8 +30,9 @@ export class TerminalUI {
     console.log(`${bold}记忆/技能${reset} ${state.memory.length} / ${state.loadedSkills.length}`);
     console.log(`${bold}最新事件${reset}  ${event ? `${event.seq} ${event.type}` : "（无）"}`);
     if (state.lastError) console.log(`${bold}错误${reset}      ${state.lastError}`);
-    console.log(`\n${bold}最近回答${reset}\n${this.lastAnswer}`);
-    console.log(`\n${dim}/help 帮助  /state 状态  /events 事件  /memory 会话记忆  /long-memory 长期记忆  /memory-issues 异常写入  /sessions 会话  /export 导出  /quit 退出${reset}`);
+    const streamingAnswer = (state.modelStreamChunks || []).join("");
+    console.log(`\n${bold}最近回答${reset}\n${streamingAnswer || this.lastAnswer}`);
+    console.log(`\n${dim}/help 帮助  /state 状态  /events 事件  /evaluation 诊断  /memory 会话记忆  /long-memory 长期记忆  /pin 固定记忆  /unpin 取消固定  /memory-issues 异常写入  /sessions 会话  /export 导出  /quit 退出${reset}`);
   }
 
   question(prompt) {
@@ -80,5 +81,5 @@ export class TerminalUI {
 }
 
 export function helpText() {
-  return `离线演示可尝试：\n- 查看工作区有哪些文件\n- 读取 AGENTS.md\n- 搜索：Agent Loop\n- 记住：我偏好本地模型\n- 查看记忆\n- 查看技能\n- 创建 nexus-output.txt 内容：hello nexus（workspace-auto 自动执行）\n- 运行：pwd（Native/Docker 沙箱内自动执行）\n- 运行：npm install（需要审批）\n- 使用 demo:mcp 启动后输入 MCP 回显：hello（需要审批）\n\n会话：/sessions 查看；长期记忆：/long-memory；来源审计：/memory-info=ID；软删除：/forget=ID；异常写入：/memory-issues、/memory-retry=ID、/memory-discard=ID、/memory-resolve=ID,MEMORY_ID；导出：/export。\n退出后用 --resume=latest 或 --resume=会话ID 恢复。\n真实模型：设置 OPENAI_API_KEY、OPENAI_MODEL；可选 OPENAI_BASE_URL。`;
+  return `离线演示可尝试：\n- 查看工作区有哪些文件\n- 读取 AGENTS.md\n- 搜索：Agent Loop\n- 记住：我偏好本地模型\n- 查看记忆\n- 查看技能\n- 创建 nexus-output.txt 内容：hello nexus（workspace-auto 自动执行）\n- 运行：pwd（Native/Docker 沙箱内自动执行）\n- 运行：npm install（需要审批）\n- 使用 demo:mcp 启动后输入 MCP 回显：hello（需要审批）\n\n会话：/sessions 查看；运行诊断：/evaluation；长期记忆：/long-memory；固定/取消固定：/pin=ID、/unpin=ID；来源审计：/memory-info=ID；软删除：/forget=ID；异常写入：/memory-issues、/memory-retry=ID、/memory-discard=ID、/memory-resolve=ID,MEMORY_ID；导出：/export。\n退出后用 --resume=latest 或 --resume=会话ID 恢复。\n真实模型：设置 OPENAI_API_KEY、OPENAI_MODEL；可选 OPENAI_BASE_URL。`;
 }

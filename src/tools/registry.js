@@ -7,6 +7,7 @@ import { LocalWorkspaceAdapter } from "../execution/local-workspace-adapter.js";
 import { assertMemoryInterface } from "../memory/interface.js";
 import { assertArtifactStore } from "../artifacts/interface.js";
 import { executeMemoryMutation } from "../memory/outbox.js";
+import { applyWorkspacePatch } from "./apply-patch.js";
 import { createPermissionProfile } from "./permission-profile.js";
 
 const NATIVE_TOOL_OWNER = "nexus:native-tools";
@@ -295,6 +296,53 @@ export function createToolRegistry({
   });
 
   define({
+    name: "apply_patch",
+    description: "以一个原子预检批次新增、精确更新或删除多个工作区 UTF-8 文本文件。同一路径可按顺序声明多个 update；任一操作校验失败时所有文件保持不变。",
+    approval: "always",
+    effects: ["write"],
+    idempotency: "unknown",
+    changeTracking: { mode: "paths", arguments: ["operations"], pathField: "path" },
+    capability: workspacePathArrayCapability("operations", "path", "write", "R1", false),
+    parameters: objectSchema({
+      operations: {
+        type: "array",
+        minItems: 1,
+        maxItems: 50,
+        items: {
+          anyOf: [
+            objectSchema({
+              operation: { type: "string", enum: ["add"] },
+              path: { type: "string", description: "相对工作区路径" },
+              content: { type: "string", description: "新文件的完整 UTF-8 内容" },
+            }, ["operation", "path", "content"]),
+            objectSchema({
+              operation: { type: "string", enum: ["update"] },
+              path: { type: "string", description: "相对工作区路径" },
+              old_text: { type: "string", description: "必须精确匹配的旧文本" },
+              new_text: { type: "string", description: "替换后的文本，可为空" },
+              expected_replacements: { type: "integer", minimum: 1, maximum: 1000 },
+            }, ["operation", "path", "old_text", "new_text"]),
+            objectSchema({
+              operation: { type: "string", enum: ["delete"] },
+              path: { type: "string", description: "相对工作区路径" },
+              expected_sha256: { type: "string", description: "通常省略；仅当用户或工具结果提供准确值时填写，禁止猜测删除前 SHA-256" },
+            }, ["operation", "path"]),
+          ],
+        },
+      },
+    }, ["operations"]),
+    execute: async ({ operations }, context) => {
+      const result = await applyWorkspacePatch({
+        workspace: root,
+        operations,
+        accessPolicy: policyFor(context),
+        signal: context.signal,
+      });
+      return `已应用多文件 Patch：新增 ${result.added}、更新 ${result.updated}、删除 ${result.deleted}\n${result.paths.join("\n")}`;
+    },
+  });
+
+  define({
     name: "run_shell",
     description: "在工作区执行 Shell 命令。read-only 仅允许沙箱内的最小只读检查；workspace-auto 可自动执行常规命令；网络、安装和外部路径需要审批，危险命令拒绝。",
     approval: "always",
@@ -484,6 +532,14 @@ function workspacePathCapability(argument, access, risk, readOnly, defaultValue)
       access,
       ...(defaultValue !== undefined ? { default: defaultValue } : {}),
     }],
+  };
+}
+
+function workspacePathArrayCapability(argument, pathField, access, risk, readOnly) {
+  return {
+    risk,
+    readOnly,
+    resources: [{ kind: "workspace_path", argument, pathField, access }],
   };
 }
 

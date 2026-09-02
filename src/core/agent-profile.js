@@ -94,6 +94,14 @@ export function compareAgentProfileSnapshots(previousProfile, currentProfile) {
   compareScalar(changes, "provider.name", "provider", "high", previous.provider.name, current.provider.name);
   compareScalar(changes, "provider.adapter", "provider", "high", previous.provider.adapter, current.provider.adapter);
   compareScalar(changes, "provider.model", "provider", "high", previous.provider.model, current.provider.model);
+  compareScalar(
+    changes,
+    "provider.thinking",
+    "provider",
+    "high",
+    previous.provider.thinking || "provider-default",
+    current.provider.thinking || "provider-default",
+  );
   compareScalar(changes, "provider.endpoint", "provider", "high", previous.provider.endpointHash, current.provider.endpointHash);
   compareScalar(changes, "workspace", "scope", "high", previous.workspace, current.workspace);
   compareScalar(changes, "systemPrompt", "context", "medium", previous.systemPromptHash, current.systemPromptHash);
@@ -125,10 +133,17 @@ function normalizeProvider(provider) {
     name,
     adapter: normalizeText(source.adapter || source.type || "unknown", "Agent Profile provider.adapter"),
     model: normalizeText(source.model || name, "Agent Profile provider.model"),
+    thinking: normalizeProviderThinking(source.thinking),
     endpointHash: source.endpointHash == null && source.baseUrl == null
       ? null
       : normalizeEndpointHash(source.endpointHash || hashValue(String(source.baseUrl))),
   };
+}
+
+function normalizeProviderThinking(value) {
+  if (value === undefined || value === null || value === "provider-default") return "provider-default";
+  if (value === "enabled" || value === "disabled") return value;
+  throw new Error("Agent Profile provider.thinking 必须是 provider-default、enabled 或 disabled");
 }
 
 function compareScalar(changes, field, category, impact, previous, current) {

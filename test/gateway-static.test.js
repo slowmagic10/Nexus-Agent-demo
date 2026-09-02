@@ -7,6 +7,7 @@ test("Gateway 静态资源白名单包含 Web 子模块且拒绝任意路径", (
   assert.equal(isGatewayStaticAsset("/plan-view.js"), true);
   assert.equal(isGatewayStaticAsset("/profile-view.js"), true);
   assert.equal(isGatewayStaticAsset("/artifact-view.js"), true);
+  assert.equal(isGatewayStaticAsset("/context-view.js"), true);
   assert.equal(isGatewayStaticAsset("/app.js"), true);
   assert.equal(isGatewayStaticAsset("/../package.json"), false);
   assert.equal(isGatewayStaticAsset("/unknown.js"), false);

@@ -43,6 +43,10 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       access.scope.agentId,
       access.scope.userId,
     ];
+    if (normalized.pinned !== null) {
+      where.push("pinned = ?");
+      params.push(normalized.pinned ? 1 : 0);
+    }
     let ranking = "updated_at DESC";
     if (needle) {
       where.push("(instr(lower(content), lower(?)) > 0 OR instr(lower(tags_json), lower(?)) > 0)");
@@ -84,6 +88,9 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     if (["superseded", "expired", "deleted"].includes(safeCandidate.status)) {
       throw new Error("新增长期记忆只能是 active 或 candidate 状态");
     }
+    if (safeCandidate.status !== "active" && safeCandidate.pinned) {
+      throw new Error("只有 active 长期记忆可以固定");
+    }
     const safeProvenance = redactSensitiveValue(access.provenance);
     const requestHash = mutationRequestHash("add", { candidate: safeCandidate }, access, safeProvenance);
     const replay = this.#readMutation(access, "add", requestHash);
@@ -96,6 +103,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
         ...existing,
         tags: normalizeTags([...existing.tags, ...safeCandidate.tags]),
         confidence: Math.max(existing.confidence, safeCandidate.confidence),
+        pinned: existing.pinned || safeCandidate.pinned,
         provenance: safeProvenance,
         provenanceValidated,
         sourceSession: safeProvenance.sessionId || existing.sourceSession,
@@ -120,6 +128,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       content: safeCandidate.content,
       status: safeCandidate.status,
       confidence: safeCandidate.confidence,
+      pinned: safeCandidate.pinned,
       sourceSession: safeProvenance.sessionId,
       sourceCursor: safeProvenance.sourceCursor,
       sourceToolCall: safeProvenance.toolCallId,
@@ -140,8 +149,8 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
           id, content, tags_json, source_session, created_at, updated_at,
           scope_workspace, scope_agent, scope_user, kind, status, confidence,
           source_event, provenance_json, observed_at, expires_at, version,
-          replacement_id, deleted_reason, source_cursor, source_tool_call, provenance_validated
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          replacement_id, deleted_reason, source_cursor, source_tool_call, provenance_validated, pinned
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(...recordValues(record));
       this.#appendEvent(record.id, "memory.added", safeProvenance, {
         kind: record.kind,
@@ -159,7 +168,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     const access = normalizeMemoryAccess(accessInput, this.defaultScope, { requireProvenance: true });
     const memoryId = validateId(id);
     if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("MemoryPatch 必须是对象");
-    const allowedFields = new Set(["content", "kind", "status", "confidence", "tags", "observedAt", "expiresAt"]);
+    const allowedFields = new Set(["content", "kind", "status", "confidence", "tags", "observedAt", "expiresAt", "pinned"]);
     const unsupported = Object.keys(patch).filter((field) => !allowedFields.has(field));
     if (unsupported.length) throw new Error(`MemoryPatch 包含不可修改字段：${unsupported.join(", ")}`);
     const safePatch = redactSensitiveValue({
@@ -182,6 +191,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     if (["superseded", "deleted"].includes(candidate.status)) {
       throw new Error("请使用 supersede/delete 修改长期记忆终态");
     }
+    if (candidate.status !== "active" && candidate.pinned) throw new Error("只有 active 长期记忆可以固定");
     const record = {
       ...current,
       ...candidate,
@@ -220,6 +230,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     const record = {
       ...current,
       status: "superseded",
+      pinned: false,
       replacementId: safeReplacementId,
       provenance: safeProvenance,
       provenanceValidated: this.#validateProvenance(safeProvenance, access.scope),
@@ -254,6 +265,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     const record = {
       ...current,
       status: "deleted",
+      pinned: false,
       deletedReason: safeReason,
       provenance: safeProvenance,
       provenanceValidated: this.#validateProvenance(safeProvenance, access.scope),
@@ -406,7 +418,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
         content = ?, tags_json = ?, source_session = ?, updated_at = ?,
         scope_workspace = ?, scope_agent = ?, scope_user = ?, kind = ?, status = ?, confidence = ?,
         provenance_json = ?, observed_at = ?, expires_at = ?, version = ?, replacement_id = ?,
-        deleted_reason = ?, source_cursor = ?, source_tool_call = ?, provenance_validated = ?
+        deleted_reason = ?, source_cursor = ?, source_tool_call = ?, provenance_validated = ?, pinned = ?
       WHERE id = ? AND scope_workspace IS ? AND scope_agent IS ? AND scope_user IS ?
     `).run(
       record.content,
@@ -428,6 +440,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       record.sourceCursor,
       record.sourceToolCall,
       record.provenanceValidated ? 1 : 0,
+      record.pinned ? 1 : 0,
       record.id,
       record.scope.workspace,
       record.scope.agentId,
@@ -468,6 +481,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       content: row.content,
       status: row.status || "active",
       confidence: Number(row.confidence ?? 1),
+      pinned: Boolean(row.pinned),
       sourceSession: row.source_session || null,
       sourceCursor: row.source_cursor ?? null,
       sourceToolCall: row.source_tool_call || null,
@@ -525,6 +539,7 @@ function recordValues(record) {
     record.sourceCursor,
     record.sourceToolCall,
     record.provenanceValidated ? 1 : 0,
+    record.pinned ? 1 : 0,
   ];
 }
 

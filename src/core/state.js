@@ -11,7 +11,7 @@ import {
 } from "./agent-profile.js";
 import { CONTEXT_SUMMARY_VERSION, normalizeSemanticSummary } from "./context-summary.js";
 
-export const SESSION_SCHEMA_VERSION = 13;
+export const SESSION_SCHEMA_VERSION = 14;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
 export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", agentProfile, id, createdAt }) {
@@ -42,6 +42,8 @@ export function createSession({ provider, workspace, memoryScope, permissionProf
     plan: null,
     delegations: [],
     messages: [],
+    modelStream: null,
+    modelStreamChunks: [],
     events: [],
     memory: [],
     contextMemory: [],
@@ -86,6 +88,8 @@ export function reduceSession(state, action) {
     case "USER_MESSAGE":
       next.phase = "thinking";
       next.turnStartedAt = at;
+      next.modelStream = null;
+      next.modelStreamChunks = [];
       next.messages.push({ role: "user", content: action.content });
       next.objective = {
         id: `objective-${next.events.length + 1}`,
@@ -104,8 +108,71 @@ export function reduceSession(state, action) {
       next.metrics.modelCalls += 1;
       emit("model.requested", { step: next.step });
       break;
+    case "MODEL_STREAM_STARTED":
+      next.modelStream = {
+        step: next.step,
+        status: "streaming",
+        startedAt: at,
+        updatedAt: at,
+      };
+      next.modelStreamChunks = [];
+      emit("model.stream_started", { step: next.step });
+      break;
+    case "MODEL_STREAM_DELTA":
+      if (next.modelStream?.status !== "streaming") throw new Error("当前没有可写入的模型输出流");
+      if (typeof action.delta !== "string" || !action.delta) throw new Error("模型输出增量必须是非空字符串");
+      next.modelStream.updatedAt = at;
+      next.modelStreamChunks.push(action.delta);
+      emit("model.stream_delta", { step: next.step, chars: action.delta.length });
+      break;
+    case "MODEL_STREAM_COMPLETED":
+      if (next.modelStream?.status !== "streaming") throw new Error("当前模型输出流尚未开始");
+      next.modelStream.status = "completed";
+      next.modelStream.updatedAt = at;
+      emit("model.stream_completed", {
+        step: next.step,
+        chunks: next.modelStreamChunks.length,
+        chars: next.modelStreamChunks.reduce((sum, chunk) => sum + chunk.length, 0),
+      });
+      break;
+    case "MODEL_STREAM_DISCARDED":
+      next.modelStream = null;
+      next.modelStreamChunks = [];
+      emit("model.stream_discarded", { step: next.step, reason: action.reason || "retry" });
+      break;
     case "MODEL_CONTEXT_PREPARED":
       emit(action.plan.compacted ? "model.context_compacted" : "model.context_prepared", action.plan);
+      break;
+    case "MODEL_CONTEXT_REPLAN_REQUESTED":
+      next.metrics.modelDurationMs += action.durationMs || 0;
+      emit("context.replan_requested", {
+        contextHash: action.contextHash,
+        maxInputTokens: action.maxInputTokens,
+        nextMaxInputTokens: action.nextMaxInputTokens,
+        durationMs: action.durationMs || 0,
+        overflow: normalizeContextOverflow(action.overflow),
+      });
+      break;
+    case "MODEL_CONTEXT_REPLANNED":
+      emit("context.replanned", {
+        fromContextHash: action.fromContextHash,
+        toContextHash: action.toContextHash,
+        fromMaxInputTokens: action.fromMaxInputTokens,
+        toMaxInputTokens: action.toMaxInputTokens,
+        omittedMessages: action.omittedMessages,
+        omittedTurns: action.omittedTurns,
+        strategy: action.strategy,
+        summaryIncluded: action.summaryIncluded === true,
+      });
+      break;
+    case "MODEL_CONTEXT_REPLAN_EXHAUSTED":
+      next.metrics.modelDurationMs += action.durationMs || 0;
+      emit("context.replan_exhausted", {
+        contextHash: action.contextHash,
+        maxInputTokens: action.maxInputTokens,
+        durationMs: action.durationMs || 0,
+        overflow: normalizeContextOverflow(action.overflow),
+      });
       break;
     case "CONTEXT_SUMMARY_REQUESTED":
       if (action.modelCall !== false) next.metrics.modelCalls += 1;
@@ -186,6 +253,8 @@ export function reduceSession(state, action) {
       break;
     case "ASSISTANT_MESSAGE":
       next.messages.push(action.message);
+      next.modelStream = null;
+      next.modelStreamChunks = [];
       emit("message.assistant", { preview: (action.message.content || "[工具调用]").slice(0, 120) });
       break;
     case "TOOL_REQUESTED":
@@ -199,6 +268,7 @@ export function reduceSession(state, action) {
         effects: action.effects || [],
         idempotency: action.idempotency || "unknown",
         adapter: action.adapter || "unknown",
+        argumentsRecovered: action.argumentsRecovered === true,
       });
       break;
     case "TOOL_VALIDATION_FAILED":
@@ -411,6 +481,8 @@ export function reduceSession(state, action) {
       next.contextMemory = action.memories;
       emit("memory.context_loaded", {
         count: action.memories.length,
+        pinnedCount: action.memories.filter((memory) => memory.pinned === true).length,
+        relevantCount: action.memories.filter((memory) => memory.pinned !== true).length,
         query: action.query.slice(0, 120),
         status: action.retrieval?.status || "ok",
         memoryIds: action.memories.map((memory) => memory.id).filter(Boolean),
@@ -446,6 +518,9 @@ export function reduceSession(state, action) {
       break;
     case "MEMORY_CANDIDATE_REJECTED":
       emit("memory.candidate_rejected", { memoryId: action.memoryId, reason: action.reason });
+      break;
+    case "MEMORY_PIN_CHANGED":
+      emit("memory.pin_changed", { memoryId: action.memoryId, pinned: action.pinned === true });
       break;
     case "MEMORY_MUTATION_REQUESTED":
       if (!next.pendingMemoryMutations.some((mutation) => mutation.id === action.mutation.id)) {
@@ -656,6 +731,10 @@ export function reduceSession(state, action) {
         });
       }
       next.phase = "failed";
+      if (next.modelStream?.status === "streaming") {
+        next.modelStream.status = "failed";
+        next.modelStream.updatedAt = at;
+      }
       next.lastError = action.error;
       next.pendingApproval = null;
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
@@ -672,6 +751,10 @@ export function reduceSession(state, action) {
         });
       }
       next.phase = "cancelled";
+      if (next.modelStream?.status === "streaming") {
+        next.modelStream.status = "cancelled";
+        next.modelStream.updatedAt = at;
+      }
       next.lastError = action.reason;
       next.pendingApproval = null;
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
@@ -725,6 +808,10 @@ export function reduceSession(state, action) {
         ...next.metrics,
       };
       next.turnStartedAt = null;
+      if (next.modelStream?.status === "streaming") {
+        next.modelStream.status = "interrupted";
+        next.modelStream.updatedAt = at;
+      }
       const previousPhase = next.phase;
       const discardedApproval = next.pendingApproval?.name || null;
       const unresolvedCalls = findUnresolvedToolCalls(next.messages);
@@ -814,12 +901,23 @@ export function migrateSessionState(state) {
     assertAgentProfileSnapshot(state.agentProfile);
     return state;
   }
+  if (state.schemaVersion === 13) {
+    assertAgentProfileSnapshot(state.agentProfile);
+    return {
+      ...state,
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      modelStream: null,
+      modelStreamChunks: [],
+    };
+  }
   if (state.schemaVersion === 12) {
     assertAgentProfileSnapshot(state.agentProfile);
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
       contextSummary: state.contextSummary || null,
+      modelStream: null,
+      modelStreamChunks: [],
     };
   }
   if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(state.schemaVersion)) {
@@ -835,6 +933,8 @@ export function migrateSessionState(state) {
       plan: state.plan || null,
       delegations: state.delegations || [],
       contextSummary: null,
+      modelStream: null,
+      modelStreamChunks: [],
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
       toolGrants: migrateToolGrants(state.toolGrants || []),
@@ -1002,6 +1102,8 @@ export function createSessionBranch(parentState, {
     ],
     contextMemory: [],
     contextSummary: null,
+    modelStream: null,
+    modelStreamChunks: [],
     memoryScope: createMemoryScope({ ...parent.memoryScope, workspace }),
     pendingMemoryMutations: [],
     memoryMutationIssues: [],
@@ -1056,6 +1158,15 @@ function findUnresolvedToolCalls(messages) {
 
 function elapsedSince(value, at) {
   return value ? Math.max(0, new Date(at).getTime() - new Date(value).getTime()) : 0;
+}
+
+function normalizeContextOverflow(value = {}) {
+  return {
+    kind: "context_overflow",
+    status: Number.isInteger(value.status) ? value.status : null,
+    providerCode: typeof value.providerCode === "string" ? value.providerCode.slice(0, 120) : null,
+    contextLimit: Number.isSafeInteger(value.contextLimit) && value.contextLimit > 0 ? value.contextLimit : null,
+  };
 }
 
 function normalizeSummaryUsage(value = {}) {

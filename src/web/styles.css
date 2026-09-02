@@ -214,6 +214,12 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .message-row.assistant { display: grid; grid-template-columns: 28px minmax(0, 1fr); gap: 12px; }
 .avatar { width: 26px; height: 26px; margin-top: 1px; border-radius: 7px; font-size: 11px; }
 .message-body { min-width: 0; color: var(--text-soft); font-size: 14px; line-height: 1.65; }
+.model-stream-state { margin-top: 10px; display: block; color: var(--muted); font-size: 9px; letter-spacing: .03em; }
+.model-stream.streaming .model-stream-state::after { content: ""; width: 5px; height: 11px; margin-left: 5px; display: inline-block; vertical-align: -2px; background: var(--accent); border-radius: 1px; animation: stream-cursor 1s steps(1) infinite; }
+.model-stream.cancelled .model-stream-state, .model-stream.interrupted .model-stream-state { color: var(--warning); }
+.model-stream.failed .model-stream-state { color: var(--danger); }
+@keyframes stream-cursor { 50% { opacity: .2; } }
+@media (prefers-reduced-motion: reduce) { .model-stream.streaming .model-stream-state::after { animation: none; } }
 .user-bubble { max-width: min(76%, 620px); padding: 10px 13px; color: #eef2e6; background: #252c20; border: 1px solid #343e2c; border-radius: 12px 12px 3px 12px; font-size: 13px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
 .runtime-error { margin: -6px 0 24px 40px; padding: 11px 13px; display: grid; gap: 3px; color: var(--danger); background: color-mix(in srgb, var(--danger) 8%, var(--surface)); border: 1px solid color-mix(in srgb, var(--danger) 35%, var(--line)); border-radius: 8px; font-size: 11px; line-height: 1.5; }
 .runtime-error strong { font-size: 12px; }
@@ -452,6 +458,61 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .event > i { width: 6px; height: 6px; margin-top: 5px; background: #555c67; border-radius: 50%; }
 .event > div { padding-bottom: 14px; border-bottom: 1px solid #20242b; }
 .event strong, .event span, .event code { display: block; }.event strong { color: var(--text-soft); font-size: 11px; }.event span { margin-top: 3px; color: var(--muted); font-size: 9px; }.event code { margin-top: 5px; color: #626975; font: 9px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.context-stack { display: flex; flex-direction: column; gap: 9px; }
+.context-card { padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 9px; }
+.context-card-head, .context-token-line, .context-memory-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.context-card-head { margin-bottom: 10px; }
+.context-card-head strong { color: var(--text); font-size: 11px; font-weight: 650; }
+.context-state { padding: 2px 6px; color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); border-radius: 999px; font-size: 8px; }
+.context-state.warning { color: var(--warning); background: color-mix(in srgb, var(--warning) 9%, transparent); }
+.context-state.danger { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.context-state.muted { color: var(--muted); background: var(--surface-raised); }
+.context-token-line strong { color: var(--text); font-size: 18px; font-weight: 660; font-variant-numeric: tabular-nums; letter-spacing: -.02em; }
+.context-token-line span { color: var(--muted); font-size: 9px; font-variant-numeric: tabular-nums; }
+.context-meter { height: 5px; margin: 9px 0 8px; overflow: hidden; background: var(--surface-raised); border-radius: 999px; }
+.context-meter i { height: 100%; display: block; background: var(--accent); border-radius: inherit; }
+.context-meter.warning i { background: var(--warning); }
+.context-meter.danger i { background: var(--danger); }
+.context-card-detail { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.55; }
+.context-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.context-metrics > div { padding: 9px; background: var(--surface-soft); border-radius: 7px; }
+.context-metrics span, .context-metrics strong, .context-metrics small, .context-memory-row strong, .context-memory-row small { display: block; }
+.context-metrics span { color: var(--muted); font-size: 8px; }
+.context-metrics strong { margin-top: 3px; color: var(--text); font-size: 15px; font-variant-numeric: tabular-nums; }
+.context-metrics small { margin-top: 2px; color: var(--muted); font-size: 8px; }
+.context-memory-row { padding: 8px 0; border-top: 1px solid var(--line); }
+.context-memory-row strong { color: var(--text-soft); font-size: 10px; }
+.context-memory-row small { margin-top: 3px; color: var(--muted); font-size: 8px; }
+.context-complete, .context-truncated { color: var(--success); font-size: 8px; }
+.context-truncated { color: var(--warning); }
+.context-replan.warning { border-color: color-mix(in srgb, var(--warning) 35%, var(--line)); }
+.context-replan.danger { border-color: color-mix(in srgb, var(--danger) 40%, var(--line)); }
+.context-identity { padding: 3px 2px 0; color: var(--muted); font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.5; overflow-wrap: anywhere; }
+.evaluation-stack { display: flex; flex-direction: column; gap: 9px; }
+.evaluation-card { padding: 12px; background: var(--surface); border: 1px solid var(--line); border-radius: 9px; }
+.evaluation-overview.healthy { border-color: color-mix(in srgb, var(--success) 35%, var(--line)); }
+.evaluation-overview.attention, .evaluation-overview.cancelled { border-color: color-mix(in srgb, var(--warning) 35%, var(--line)); }
+.evaluation-overview.failed { border-color: color-mix(in srgb, var(--danger) 45%, var(--line)); }
+.evaluation-summary, .evaluation-clean, .evaluation-foot { margin: 0; color: var(--muted); font-size: 9px; line-height: 1.55; }
+.evaluation-metrics { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+.evaluation-metrics > div { min-width: 0; padding: 9px; background: var(--surface-soft); border-radius: 7px; }
+.evaluation-metrics span, .evaluation-metrics strong, .evaluation-metrics small { display: block; }
+.evaluation-metrics span { color: var(--muted); font-size: 8px; }
+.evaluation-metrics strong { margin-top: 3px; overflow: hidden; color: var(--text); font-size: 13px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+.evaluation-metrics small { margin-top: 2px; color: var(--muted); font-size: 8px; line-height: 1.4; }
+.evaluation-rows { display: flex; flex-direction: column; }
+.evaluation-rows > div { padding: 8px 0; display: grid; grid-template-columns: 56px minmax(0, 1fr); gap: 8px; border-top: 1px solid var(--line); }
+.evaluation-rows strong { color: var(--text-soft); font-size: 9px; }
+.evaluation-rows span { color: var(--muted); font-size: 8px; line-height: 1.45; text-align: right; }
+.evaluation-issues { display: flex; flex-direction: column; }
+.evaluation-issue { padding: 8px 0; display: grid; grid-template-columns: 20px minmax(0, 1fr); gap: 8px; align-items: start; border-top: 1px solid var(--line); }
+.evaluation-issue > i { width: 18px; height: 18px; display: grid; place-items: center; color: var(--muted); background: var(--surface-raised); border-radius: 5px; font-size: 8px; font-style: normal; }
+.evaluation-issue.high > i { color: var(--danger); background: color-mix(in srgb, var(--danger) 9%, transparent); }
+.evaluation-issue.medium > i { color: var(--warning); background: color-mix(in srgb, var(--warning) 9%, transparent); }
+.evaluation-issue strong, .evaluation-issue small { display: block; }
+.evaluation-issue strong { color: var(--text-soft); font-size: 9px; font-weight: 620; }
+.evaluation-issue small { margin-top: 3px; color: var(--muted); font: 8px ui-monospace, SFMono-Regular, Menlo, monospace; }
+.evaluation-foot { padding: 3px 2px 0; }
 .memory-form { display: flex; gap: 7px; margin-bottom: 13px; }
 .candidate-section { margin-bottom: 14px; }
 .memory-section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin-bottom: 9px; }
@@ -465,6 +526,8 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .memory { padding: 10px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
 .memory p { margin: 0 0 9px; color: var(--text-soft); font-size: 11px; line-height: 1.5; }
 .memory button { padding: 0; color: var(--danger); background: transparent; border: 0; cursor: pointer; font-size: 9px; }
+.memory button + button { margin-left: 12px; }
+.memory .memory-pin { color: var(--accent); }
 .candidate-meta { display: block; margin: -4px 0 8px; }
 .candidate-actions { display: flex; gap: 12px; }
 .candidate-actions .candidate-approve { color: var(--accent); }

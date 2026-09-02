@@ -150,12 +150,22 @@
       </header>
       <div class="tabs" role="tablist">
         <button class="tab active" data-tab="events" role="tab">调试</button>
+        <button class="tab" data-tab="context" role="tab">上下文</button>
+        <button class="tab" data-tab="evaluation" role="tab">诊断</button>
         <button class="tab" data-tab="memory" role="tab">记忆</button>
         <button class="tab" data-tab="grants" role="tab">授权 <span id="grant-count" class="tab-count">0</span></button>
       </div>
       <div id="events-view" class="tab-view">
         <div class="debug-note">原始运行事件仅用于诊断，不影响任务执行。</div>
         <div id="events" class="events"></div>
+      </div>
+      <div id="context-view" class="tab-view hidden">
+        <div class="debug-note">仅显示预算、来源数量、压缩和重规划元数据；不会展示 System Prompt、消息、记忆或摘要正文。</div>
+        <div id="context-panel" class="context-stack"></div>
+      </div>
+      <div id="evaluation-view" class="tab-view hidden">
+        <div class="debug-note">从当前 Session Journal 确定性派生，不调用模型、不修改任务，也不展示消息、工具参数或原始错误正文。</div>
+        <div id="evaluation-panel" class="evaluation-stack"></div>
       </div>
       <div id="memory-view" class="tab-view hidden">
         <section class="candidate-section">

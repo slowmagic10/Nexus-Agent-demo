@@ -14,7 +14,8 @@ const SAFE_PERMISSION_PROFILES = new Set([
   "workspace-auto",
 ]);
 const PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible"]);
+const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible", "openai-responses"]);
+const PROVIDER_THINKING_MODES = new Set(["provider-default", "enabled", "disabled"]);
 
 export function normalizeNamedAgentProfiles(raw, {
   defaultId = "default",
@@ -74,6 +75,7 @@ export function inspectNamedAgentProfiles(catalog) {
         model: profile.provider.model,
         baseUrl: profile.provider.baseUrl,
         apiKey: profile.provider.apiKey ? "[REDACTED]" : null,
+        thinking: profile.provider.thinking,
       },
     })),
   };
@@ -125,19 +127,34 @@ function normalizeProvider(value, fallback, profileId) {
     throw new Error(`Agent Profile ${profileId}.provider 必须是对象`);
   }
   const override = value || {};
-  assertKnownKeys(override, new Set(["type", "apiKey", "baseUrl", "model"]), `Agent Profile ${profileId}.provider`);
+  assertKnownKeys(override, new Set(["type", "apiKey", "baseUrl", "model", "thinking"]), `Agent Profile ${profileId}.provider`);
+  let type = override.type ?? fallback.type;
+  if (!PROVIDER_TYPES.has(type)) {
+    throw new Error(`Agent Profile ${profileId}.provider.type 必须是 auto、demo、openai-compatible 或 openai-responses`);
+  }
+  if (type === "auto") type = (override.apiKey ?? fallback.apiKey) ? "openai-compatible" : "demo";
+  const changedAdapter = override.type !== undefined && type !== fallback.type;
   const provider = {
-    type: override.type ?? fallback.type,
+    type,
     apiKey: override.apiKey ?? fallback.apiKey ?? null,
     baseUrl: override.baseUrl ?? fallback.baseUrl ?? null,
     model: override.model ?? fallback.model,
+    thinking: override.thinking ?? (changedAdapter ? "provider-default" : fallback.thinking) ?? "provider-default",
   };
-  if (!PROVIDER_TYPES.has(provider.type)) {
-    throw new Error(`Agent Profile ${profileId}.provider.type 必须是 auto、demo 或 openai-compatible`);
+  if (!PROVIDER_THINKING_MODES.has(provider.thinking)) {
+    throw new Error(`Agent Profile ${profileId}.provider.thinking 必须是 provider-default、enabled 或 disabled`);
   }
-  if (provider.type === "auto") provider.type = provider.apiKey ? "openai-compatible" : "demo";
+  if (provider.thinking !== "provider-default" && provider.type !== "openai-compatible") {
+    throw new Error(`Agent Profile ${profileId}.provider.thinking 的 enabled/disabled 首版只支持 openai-compatible Adapter`);
+  }
   if (provider.type === "demo") {
-    return Object.freeze({ type: "demo", apiKey: null, baseUrl: null, model: "offline-demo" });
+    return Object.freeze({
+      type: "demo",
+      apiKey: null,
+      baseUrl: null,
+      model: "offline-demo",
+      thinking: "provider-default",
+    });
   }
   if (provider.apiKey !== null && typeof provider.apiKey !== "string") {
     throw new Error(`Agent Profile ${profileId}.provider.apiKey 必须是字符串`);

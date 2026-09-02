@@ -12,6 +12,7 @@ import { AgentSession } from "../core/session.js";
 import { assertMemoryInspection, assertMemoryInterface } from "../memory/interface.js";
 import { assertArtifactStore } from "../artifacts/interface.js";
 import { createModelMemoryExtractor, MemoryFlushPolicy } from "../memory/flush-policy.js";
+import { retrieveContextMemories } from "../memory/context-retrieval.js";
 import { createMemoryScope } from "../memory/scope.js";
 import {
   discardMemoryMutation,
@@ -23,6 +24,7 @@ import {
 import { ToolHost } from "../tools/host.js";
 import { PermissionToolHostRouter } from "../tools/permission-router.js";
 import { revokeSessionGrant } from "../tools/authorization.js";
+import { evaluateSession } from "../evaluation/session-evaluation.js";
 
 const PERMISSION_MODE_INFO = Object.freeze([
   Object.freeze({
@@ -59,7 +61,7 @@ const PERMISSION_MODE_INFO = Object.freeze([
 ]);
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, providerDescriptor, agentProfile, agentProfiles, agentProviders, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, artifactStore = store?.artifacts, memoryScope, maxSteps, maxTokensPerTurn, memoryFlushPolicy }) {
+  constructor({ workspace, provider, providerDescriptor, agentProfile, agentProfiles, agentProviders, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, artifactStore = store?.artifacts, memoryScope, maxSteps, maxTokensPerTurn, memoryFlushPolicy, runtimeFactory = null }) {
     this.workspace = workspace;
     this.provider = provider;
     this.systemPrompt = systemPrompt;
@@ -86,6 +88,10 @@ export class GatewaySessionManager {
     this.executionInfo = executionInfo;
     this.maxSteps = maxSteps ?? Infinity;
     this.maxTokensPerTurn = maxTokensPerTurn ?? Infinity;
+    if (runtimeFactory !== null && typeof runtimeFactory !== "function") {
+      throw new Error("Gateway Session Manager runtimeFactory 必须是函数或 null");
+    }
+    this.runtimeFactory = runtimeFactory;
     const runtimeProfiles = createRuntimeAgentProfiles({
       catalog: agentProfiles,
       snapshot: agentProfile,
@@ -499,7 +505,27 @@ export class GatewaySessionManager {
   }
 
   async listMemories(query = "") {
-    return await this.memory.search(query, { scope: this.defaultMemoryScope }, { limit: 100 });
+    const memories = await this.memory.search(query, { scope: this.defaultMemoryScope }, { limit: 100 });
+    return memories.sort((left, right) => Number(right.pinned) - Number(left.pinned));
+  }
+
+  async listSessionMemories(id, query = "") {
+    const entry = await this.ensureLoaded(id);
+    const memories = await this.memory.search(query, { scope: entry.state.memoryScope }, { limit: 100 });
+    return memories.sort((left, right) => Number(right.pinned) - Number(left.pinned));
+  }
+
+  async listSessionMemoryCandidates(id) {
+    const entry = await this.ensureLoaded(id);
+    return await this.memory.search("", { scope: entry.state.memoryScope }, {
+      limit: 100,
+      statuses: ["candidate"],
+    });
+  }
+
+  async evaluate(id) {
+    const entry = await this.ensureLoaded(id);
+    return evaluateSession(entry.state);
   }
 
   async listMemoryCandidates() {
@@ -510,27 +536,54 @@ export class GatewaySessionManager {
   }
 
   async addMemory(content, tags = []) {
-    if (typeof content !== "string" || !content.trim()) throw new GatewayError(400, "content 必须是非空字符串");
-    if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === "string")) throw new GatewayError(400, "tags 必须是字符串数组");
-    return await this.memory.add({ content, tags, kind: "fact", confidence: 1 }, {
-      scope: this.defaultMemoryScope,
-      provenance: { origin: "user_explicit", actor: this.defaultMemoryScope.userId },
-    });
+    return await this.#addMemory(content, tags, this.defaultMemoryScope);
+  }
+
+  async addSessionMemory(id, content, tags = []) {
+    const entry = await this.ensureLoaded(id);
+    return await this.#addMemory(content, tags, entry.state.memoryScope);
   }
 
   async deleteMemory(id, reason = "用户通过 Gateway 请求删除") {
-    if (!await this.memory.delete(id, reason, {
-      scope: this.defaultMemoryScope,
-      provenance: { origin: "user_explicit", actor: this.defaultMemoryScope.userId },
-    })) {
-      throw new GatewayError(404, `未找到长期记忆：${id}`);
-    }
+    await this.#deleteMemory(id, reason, this.defaultMemoryScope);
+  }
+
+  async deleteSessionMemory(id, memoryId, reason = "用户通过 Gateway 请求删除") {
+    const entry = await this.ensureLoaded(id);
+    await this.#deleteMemory(memoryId, reason, entry.state.memoryScope);
   }
 
   async verifyMemory(id) {
     const verification = await this.memory.verify(id, { scope: this.defaultMemoryScope });
     if (!verification) throw new GatewayError(404, `未找到长期记忆：${id}`);
     return verification;
+  }
+
+  async setMemoryPinned(id, memoryId, pinned) {
+    if (typeof pinned !== "boolean") throw new GatewayError(400, "pinned 必须是布尔值");
+    const entry = await this.ensureLoaded(id);
+    this.#assertMutationIdle(entry);
+    const current = await this.memory.get(memoryId, { scope: entry.state.memoryScope }, { includeInactive: true });
+    if (!current || current.status !== "active") throw new GatewayError(404, `未找到可固定的 active 长期记忆：${memoryId}`);
+    if (current.pinned === pinned) return current;
+    try {
+      const record = await executeMemoryMutation({
+        memory: this.memory,
+        dispatch: (action) => entry.session.dispatch(action),
+        mutation: {
+          id: `${id}:memory-pin:${memoryId}:v${current.version}:${pinned ? "on" : "off"}`,
+          operation: "update",
+          memoryId,
+          patch: { pinned },
+          scope: entry.state.memoryScope,
+          provenance: { origin: "user_explicit", actor: entry.state.memoryScope.userId },
+        },
+      });
+      await entry.session.dispatch({ type: "MEMORY_PIN_CHANGED", memoryId, pinned });
+      return record;
+    } catch (error) {
+      throw this.#mutationError(error);
+    }
   }
 
   async approveMemoryCandidate(id, memoryId) {
@@ -633,20 +686,26 @@ export class GatewaySessionManager {
       children: new Set(),
       subscribers: new Set(),
     };
-    entry.runtime = new AgentRuntime({
+    const runtimeOptions = {
       session,
       provider: runtimeProfile.provider,
       toolHost: this.toolHost,
       systemPrompt: runtimeProfile.systemPrompt,
-      retrieveMemory: (query, { signal } = {}) => this.memory.search(query, {
-        scope: session.state.memoryScope,
-        signal,
-      }, { limit: 5 }),
-      reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
-      flushMemory: (input) => runtimeProfile.memoryFlushPolicy.flush(input),
+      memoryFlushPolicy: runtimeProfile.memoryFlushPolicy,
       maxSteps,
       maxTokensPerTurn,
-    });
+    };
+    entry.runtime = this.runtimeFactory
+      ? this.runtimeFactory(runtimeOptions)
+      : new AgentRuntime({
+          ...runtimeOptions,
+          retrieveMemory: (query, { signal } = {}) => retrieveContextMemories(this.memory, query, {
+            scope: session.state.memoryScope,
+            signal,
+          }),
+          reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
+          flushMemory: (input) => runtimeProfile.memoryFlushPolicy.flush(input),
+        });
     session.subscribe((next) => this.update(entry, next));
     this.sessions.set(session.id, entry);
     return entry;
@@ -781,6 +840,24 @@ export class GatewaySessionManager {
       throw new GatewayError(404, `未找到候选记忆：${memoryId}`);
     }
     return record;
+  }
+
+  async #addMemory(content, tags, scope) {
+    if (typeof content !== "string" || !content.trim()) throw new GatewayError(400, "content 必须是非空字符串");
+    if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === "string")) throw new GatewayError(400, "tags 必须是字符串数组");
+    return await this.memory.add({ content, tags, kind: "fact", confidence: 1 }, {
+      scope,
+      provenance: { origin: "user_explicit", actor: scope.userId },
+    });
+  }
+
+  async #deleteMemory(id, reason, scope) {
+    if (!await this.memory.delete(id, reason, {
+      scope,
+      provenance: { origin: "user_explicit", actor: scope.userId },
+    })) {
+      throw new GatewayError(404, `未找到长期记忆：${id}`);
+    }
   }
 
   #mutationError(error) {

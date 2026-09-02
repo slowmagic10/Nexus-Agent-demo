@@ -17,6 +17,7 @@ test("Agent Profile snapshot 稳定摘要运行身份且不保存敏感正文", 
       name: "openai-compatible/deepseek-v4-flash",
       adapter: "openai-compatible",
       model: "deepseek-v4-flash",
+      thinking: "disabled",
       apiKey: "must-not-persist",
       baseUrl: "https://private.example/v1",
     },
@@ -43,11 +44,18 @@ test("Agent Profile snapshot 稳定摘要运行身份且不保存敏感正文", 
     provider: { ...common.provider, baseUrl: "https://another.example/v1" },
     toolSchemas: [toolSchema("read_file"), toolSchema("write_file")],
   });
+  const differentThinking = createAgentProfileSnapshot({
+    ...common,
+    provider: { ...common.provider, thinking: "enabled" },
+    toolSchemas: [toolSchema("read_file"), toolSchema("write_file")],
+  });
 
   assert.equal(first.version, reordered.version);
   assert.notEqual(first.version, differentEndpoint.version);
+  assert.notEqual(first.version, differentThinking.version);
   assert.deepEqual(compareAgentProfileSnapshots(first, reordered), []);
   assert.deepEqual(compareAgentProfileSnapshots(first, differentEndpoint).map((change) => change.field), ["provider.endpoint"]);
+  assert.deepEqual(compareAgentProfileSnapshots(first, differentThinking).map((change) => change.field), ["provider.thinking"]);
   assert.deepEqual(first.toolset.names, ["read_file", "write_file"]);
   assert.equal(first.budgets.maxSteps, "unlimited");
   assert.equal(first.budgets.maxTokensPerTurn, 20_000);

@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
+import { AgentSession } from "../src/core/session.js";
 import { createSession, migrateSessionState, reduceSession } from "../src/core/state.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 
@@ -162,7 +163,8 @@ test("旧数据库会按顺序执行显式 schema migration", async () => {
     assert.ok(eventColumns.includes("schema_version"));
     assert.ok(memoryEventColumns.includes("schema_version"));
     assert.ok(mutationColumns.includes("request_hash"));
-    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7]);
+    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.ok(store.db.prepare("PRAGMA table_info(memories)").all().some((column) => column.name === "pinned"));
     assert.ok(store.db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_checkpoints'",
     ).get());
@@ -197,7 +199,7 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 13);
+    assert.equal(restored.schemaVersion, 14);
     assert.equal(restored.agentProfile.id, "legacy-default");
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
@@ -231,7 +233,7 @@ test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 13);
+  assert.equal(migrated.schemaVersion, 14);
   assert.equal(migrated.agentProfile.id, "legacy-default");
   assert.equal(migrated.toolGrants[0].usage, "single_use");
   assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
@@ -246,9 +248,51 @@ test("schema v12 升级时保留 Agent Profile 并初始化 durable summary", ()
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 13);
+  assert.equal(migrated.schemaVersion, 14);
   assert.equal(migrated.agentProfile.version, profileVersion);
   assert.equal(migrated.contextSummary, null);
+  assert.equal(migrated.modelStream, null);
+  assert.deepEqual(migrated.modelStreamChunks, []);
+});
+
+test("Gateway 恢复时保留模型部分输出并标记为 interrupted", () => {
+  let state = createSession({ provider: "demo", workspace: "/workspace" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "生成较长回答" });
+  state = reduceSession(state, { type: "MODEL_REQUESTED" });
+  state = reduceSession(state, { type: "MODEL_STREAM_STARTED" });
+  state = reduceSession(state, { type: "MODEL_STREAM_DELTA", delta: "已经生成的部分\n" });
+
+  const resumed = reduceSession(state, { type: "RESUMED", provider: "demo", workspace: "/workspace" });
+
+  assert.equal(resumed.modelStream.status, "interrupted");
+  assert.equal(resumed.modelStreamChunks.join(""), "已经生成的部分\n");
+  assert.equal(resumed.phase, "idle");
+});
+
+test("模型增量通过 SQLite Journal 重放后仍可恢复", async () => {
+  const fixture = createFixture();
+  try {
+    const initial = createSession({ provider: "demo", workspace: fixture.workspace });
+    const session = new AgentSession({ state: initial, reducer: reduceSession, journal: fixture.store });
+    await session.dispatch({ type: "USER_MESSAGE", content: "生成回答" });
+    await session.dispatch({ type: "MODEL_REQUESTED" });
+    await session.dispatch({ type: "MODEL_STREAM_STARTED" });
+    await session.dispatch({ type: "MODEL_STREAM_DELTA", delta: "第一段\n" });
+    await session.dispatch({ type: "MODEL_STREAM_DELTA", delta: "第二段\n" });
+
+    const restored = new AgentSession({
+      state: fixture.store.load(session.id),
+      reducer: reduceSession,
+      journal: fixture.store,
+    });
+
+    assert.equal(restored.state.modelStream.status, "streaming");
+    assert.deepEqual(restored.state.modelStreamChunks, ["第一段\n", "第二段\n"]);
+    const deltas = restored.events().filter((event) => event.type === "MODEL_STREAM_DELTA");
+    assert.deepEqual(deltas.map((event) => event.patch.append.modelStreamChunks), [["第一段\n"], ["第二段\n"]]);
+  } finally {
+    fixture.close();
+  }
 });
 
 test("SessionStore 不再从数据库路径猜测 workspace", () => {

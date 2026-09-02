@@ -3,6 +3,7 @@ const FIELD_LABELS = Object.freeze({
   "provider.name": "Provider",
   "provider.adapter": "Provider Adapter",
   "provider.model": "模型",
+  "provider.thinking": "思考模式",
   "provider.endpoint": "模型 Endpoint",
   workspace: "Workspace",
   systemPrompt: "System Prompt",
@@ -26,6 +27,12 @@ export function profileDriftViewModel(event) {
     previousVersion: shortVersion(event.previousProfileVersion),
     currentVersion: shortVersion(event.profileVersion),
   };
+}
+
+export function providerThinkingLabel(value) {
+  if (value === "enabled") return "思考开";
+  if (value === "disabled") return "思考关";
+  return "Provider 默认";
 }
 
 function shortVersion(value) {

@@ -1,10 +1,6 @@
 import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
 import { ToolHost } from "../tools/host.js";
-import {
-  createModelContextSummarizer,
-  normalizeSemanticSummary,
-  selectContextSummaryBatch,
-} from "./context-summary.js";
+import { ContextLifecycle } from "./context-lifecycle.js";
 
 export class AgentRuntime {
   constructor({
@@ -17,6 +13,7 @@ export class AgentRuntime {
     reconcile = async () => [],
     flushMemory = async () => [],
     summarizeContext,
+    contextLifecycle,
     maxSteps = Infinity,
     maxTokensPerTurn = Infinity,
     maxInputTokens = 32_000,
@@ -32,14 +29,8 @@ export class AgentRuntime {
     if (maxTokensPerTurn !== Infinity && (!Number.isSafeInteger(maxTokensPerTurn) || maxTokensPerTurn < 1)) {
       throw new Error("AgentRuntime maxTokensPerTurn 必须是正整数或 Infinity");
     }
-    if (!Number.isSafeInteger(memorySearchTimeoutMs) || memorySearchTimeoutMs < 1) {
-      throw new Error("AgentRuntime memorySearchTimeoutMs 必须是正整数");
-    }
     if (!Number.isSafeInteger(memoryReconcileTimeoutMs) || memoryReconcileTimeoutMs < 1) {
       throw new Error("AgentRuntime memoryReconcileTimeoutMs 必须是正整数");
-    }
-    if (!Number.isSafeInteger(contextSummaryTimeoutMs) || contextSummaryTimeoutMs < 1) {
-      throw new Error("AgentRuntime contextSummaryTimeoutMs 必须是正整数");
     }
     this.session = session;
     this.provider = provider;
@@ -52,19 +43,27 @@ export class AgentRuntime {
     if (typeof this.toolHost.schemas !== "function" || typeof this.toolHost.execute !== "function") {
       throw new Error("AgentRuntime Tool Host Interface 无效");
     }
-    this.systemPrompt = systemPrompt;
-    this.retrieveMemory = retrieveMemory;
     this.reconcile = reconcile;
     this.flushMemory = flushMemory;
-    this.summarizeContext = summarizeContext || createModelContextSummarizer(provider);
-    if (typeof this.summarizeContext !== "function") throw new Error("AgentRuntime summarizeContext 必须是函数");
     this.maxSteps = maxSteps;
     this.maxTokensPerTurn = maxTokensPerTurn;
-    this.maxInputTokens = maxInputTokens;
-    this.memorySearchTimeoutMs = memorySearchTimeoutMs;
     this.memoryReconcileTimeoutMs = memoryReconcileTimeoutMs;
-    this.contextSummaryTimeoutMs = contextSummaryTimeoutMs;
     this.abortController = null;
+    this.contextLifecycle = contextLifecycle || new ContextLifecycle({
+      session,
+      provider,
+      systemPrompt,
+      getTools: () => this.toolHost.schemas({ session: this.session }),
+      requestModel: (request) => this.#completeProvider(request),
+      retrieveMemory,
+      summarizeContext,
+      maxInputTokens,
+      memorySearchTimeoutMs,
+      contextSummaryTimeoutMs,
+    });
+    if (typeof this.contextLifecycle.startTurn !== "function") {
+      throw new Error("AgentRuntime Context Lifecycle Interface 无效");
+    }
   }
 
   get state() {
@@ -101,46 +100,20 @@ export class AgentRuntime {
     const turnSourceCursor = this.session.cursor;
 
     try {
-      let memories = [];
-      let retrieval = { status: "ok" };
-      try {
-        const memorySignal = AbortSignal.any([
-          abortController.signal,
-          AbortSignal.timeout(this.memorySearchTimeoutMs),
-        ]);
-        memories = await this.retrieveMemory(content, { signal: memorySignal });
-        if (!Array.isArray(memories)) throw new Error("Memory Adapter search 必须返回数组");
-      } catch (error) {
-        retrieval = { status: "degraded", error: redactSensitiveText(error.message) };
-      }
-      await this.dispatch({ type: "MEMORY_CONTEXT_SET", query: content, memories, retrieval });
+      const contextTurn = await this.contextLifecycle.startTurn({
+        query: content,
+        signal: abortController.signal,
+      });
       for (let index = 0; index < this.maxSteps; index += 1) {
         throwIfAborted(abortController.signal);
-        let prepared = this.session.prepareModelRequest({
-          systemPrompt: this.systemPrompt,
-          tools: this.toolHost.schemas({ session: this.session }),
-          maxInputTokens: this.maxInputTokens,
-        });
-        prepared = await this.#prepareDurableSummary(prepared, abortController.signal);
-        const { contextPlan, ...request } = prepared;
-        await this.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
-        await this.dispatch({ type: "MODEL_REQUESTED" });
-        const modelStarted = performance.now();
-        const response = await this.provider.complete({
-          ...request,
-          signal: abortController.signal,
-        });
-        const usage = normalizeUsage(response.usage, request.messages, response.text);
-        await this.dispatch({
-          type: "MODEL_COMPLETED",
-          usage,
-          durationMs: Math.round(performance.now() - modelStarted),
-          finishReason: response.finishReason || null,
-        });
+        const response = await contextTurn.completeModelStep();
 
         const assistantMessage = {
           role: "assistant",
           content: redactSensitiveText(response.text || ""),
+          ...(response.providerItems?.length ? {
+            provider_items: redactSensitiveValue(response.providerItems),
+          } : {}),
           ...(response.toolCalls.length ? {
             tool_calls: response.toolCalls.map((call) => ({
               id: call.id,
@@ -150,6 +123,7 @@ export class AgentRuntime {
           } : {}),
         };
         await this.dispatch({ type: "ASSISTANT_MESSAGE", message: assistantMessage });
+        assertNormalModelFinish(response);
 
         if (!response.toolCalls.length) {
           await this.dispatch({ type: "COMPLETED" });
@@ -199,72 +173,64 @@ export class AgentRuntime {
     this.abortController?.abort(new Error(reason));
   }
 
-  async #prepareDurableSummary(prepared, turnSignal) {
-    let current = prepared;
-    for (let attempt = 0; attempt < 2 && current.contextPlan.compacted; attempt += 1) {
-      const plan = current.contextPlan.summary;
-      const throughMessage = this.state.contextSummary?.throughMessage || 0;
-      if (!plan || plan.included || plan.requiredThroughMessage <= throughMessage) break;
-      const batch = selectContextSummaryBatch(this.state.messages, {
-        fromMessage: throughMessage,
-        throughMessage: plan.requiredThroughMessage,
-      });
-      const sourceCursor = this.session.cursor;
-      await this.dispatch({
-        type: "CONTEXT_SUMMARY_REQUESTED",
-        fromMessage: batch.fromMessage,
-        throughMessage: batch.throughMessage,
-        sourceCursor,
-        modelCall: this.summarizeContext.usesModel !== false,
-      });
-      const summarySignal = AbortSignal.any([
-        turnSignal,
-        AbortSignal.timeout(this.contextSummaryTimeoutMs),
-      ]);
-      const started = performance.now();
-      try {
-        const response = await raceWithSignal(Promise.resolve().then(() => this.summarizeContext({
-          previousSummary: this.state.contextSummary,
-          messages: batch.messages,
-          fromMessage: batch.fromMessage,
-          throughMessage: batch.throughMessage,
-          objective: this.state.objective,
-          plan: this.state.plan,
-          signal: summarySignal,
-        })), summarySignal);
-        const summary = normalizeSemanticSummary(response?.summary || response);
-        const usage = normalizeUsage(response?.usage, batch.messages, JSON.stringify(summary));
-        await this.dispatch({
-          type: "CONTEXT_SUMMARY_COMPLETED",
-          summary,
-          fromMessage: batch.fromMessage,
-          throughMessage: batch.throughMessage,
-          sourceCursor,
-          sourceComplete: batch.sourceComplete,
-          model: response?.model || this.provider.name || "unknown",
-          usage,
-          durationMs: Math.round(performance.now() - started),
-        });
-      } catch (error) {
-        if (turnSignal.aborted) throw error;
-        await this.dispatch({
-          type: "CONTEXT_SUMMARY_DEGRADED",
-          fromMessage: batch.fromMessage,
-          throughMessage: batch.throughMessage,
-          sourceCursor,
-          usage: normalizeUsage(error?.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, batch.messages, ""),
-          durationMs: Math.round(performance.now() - started),
-          error: redactSensitiveText(error?.message || "Context summary 失败"),
-        });
-        break;
+  async #completeProvider(request) {
+    if (typeof this.provider.stream !== "function") return this.provider.complete(request);
+
+    await this.dispatch({ type: "MODEL_STREAM_STARTED" });
+    const buffer = new DurableModelStreamBuffer();
+    let completed = null;
+    try {
+      for await (const event of this.provider.stream(request)) {
+        if (event?.type === "text_delta") {
+          const delta = buffer.push(event.delta);
+          if (delta) await this.dispatch({ type: "MODEL_STREAM_DELTA", delta });
+          continue;
+        }
+        if (event?.type === "completed") {
+          completed = event.response;
+          break;
+        }
+        throw new Error(`模型 Provider 返回未知流事件：${event?.type || "unknown"}`);
       }
-      current = this.session.prepareModelRequest({
-        systemPrompt: this.systemPrompt,
-        tools: this.toolHost.schemas({ session: this.session }),
-        maxInputTokens: this.maxInputTokens,
-      });
+    } catch (error) {
+      const tail = buffer.flush();
+      if (tail) await this.dispatch({ type: "MODEL_STREAM_DELTA", delta: tail });
+      throw error;
     }
-    return current;
+
+    const tail = buffer.flush();
+    if (tail) await this.dispatch({ type: "MODEL_STREAM_DELTA", delta: tail });
+    if (!completed || typeof completed !== "object") throw new Error("模型输出流没有返回 completed 事件");
+    completed = {
+      ...completed,
+      text: String(completed.text || ""),
+      toolCalls: Array.isArray(completed.toolCalls) ? completed.toolCalls : [],
+    };
+    await this.dispatch({ type: "MODEL_STREAM_COMPLETED" });
+    return completed;
+  }
+}
+
+class DurableModelStreamBuffer {
+  constructor() {
+    this.pending = "";
+  }
+
+  push(value) {
+    this.pending += String(value || "");
+    let boundary = -1;
+    for (const match of this.pending.matchAll(/[\n。！？；]/g)) boundary = match.index;
+    if (boundary < 0) return "";
+    const stable = this.pending.slice(0, boundary + 1);
+    this.pending = this.pending.slice(boundary + 1);
+    return redactSensitiveText(stable);
+  }
+
+  flush() {
+    if (!this.pending) return "";
+    const value = redactSensitiveText(this.pending);
+    this.pending = "";
+    return value;
   }
 }
 
@@ -273,28 +239,32 @@ function throwIfAborted(signal) {
 }
 
 function raceWithSignal(operation, signal) {
-  if (signal.aborted) return Promise.reject(signal.reason || new Error("任务已取消"));
   return new Promise((resolve, reject) => {
     const onAbort = () => reject(signal.reason || new Error("任务已取消"));
     signal.addEventListener("abort", onAbort, { once: true });
-    Promise.resolve(operation).then(resolve, reject).finally(() => {
-      signal.removeEventListener("abort", onAbort);
-    });
+    Promise.resolve(operation).then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+    if (signal.aborted) onAbort();
   });
-}
-
-function normalizeUsage(usage, messages, text) {
-  if (usage) {
-    const inputTokens = usage.inputTokens ?? usage.prompt_tokens ?? 0;
-    const outputTokens = usage.outputTokens ?? usage.completion_tokens ?? 0;
-    return { inputTokens, outputTokens, totalTokens: usage.totalTokens ?? usage.total_tokens ?? inputTokens + outputTokens };
-  }
-  const inputTokens = Math.ceil(JSON.stringify(messages).length / 4);
-  const outputTokens = Math.ceil(String(text || "").length / 4);
-  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
 }
 
 function currentTurnMessages(messages) {
   const start = messages.findLastIndex((message) => message.role === "user");
   return structuredClone(start < 0 ? messages : messages.slice(start));
+}
+
+function assertNormalModelFinish(response) {
+  const finishReason = response?.finishReason;
+  if (finishReason == null || finishReason === "stop") return;
+  if (finishReason === "tool_calls" && response.toolCalls?.length) return;
+  const normalized = String(finishReason).slice(0, 120);
+  throw new Error(`模型输出未正常完成（finishReason=${normalized}）；已保留部分回答，但任务未标记为完成。`);
 }

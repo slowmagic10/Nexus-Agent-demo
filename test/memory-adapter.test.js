@@ -95,6 +95,36 @@ test("已过期 Memory 不会进入检索结果", async () => {
   }
 });
 
+test("Pinned Memory 只允许 active 记录并支持独立 scope 检索", async () => {
+  const fixture = createFixture();
+  try {
+    const pinned = await fixture.memory.add({ content: "固定项目约束", pinned: true }, access(fixture));
+    const regular = await fixture.memory.add({ content: "普通相关事实" }, access(fixture));
+
+    assert.equal(pinned.pinned, true);
+    assert.deepEqual(
+      (await fixture.memory.search("", access(fixture), { pinned: true })).map((item) => item.id),
+      [pinned.id],
+    );
+    assert.deepEqual(
+      (await fixture.memory.search("", access(fixture), { pinned: false })).map((item) => item.id),
+      [regular.id],
+    );
+    const unpinned = await fixture.memory.update(pinned.id, { pinned: false }, access(fixture));
+    assert.equal(unpinned.pinned, false);
+    await assert.rejects(
+      fixture.memory.add({ content: "未确认候选", status: "candidate", pinned: true }, access(fixture)),
+      /只有 active 长期记忆可以固定/,
+    );
+    await assert.rejects(
+      fixture.memory.update(regular.id, { status: "candidate", pinned: true }, access(fixture)),
+      /只有 active 长期记忆可以固定/,
+    );
+  } finally {
+    fixture.close();
+  }
+});
+
 test("Adapter 拒绝非法终态创建和不可变字段更新", async () => {
   const fixture = createFixture();
   try {

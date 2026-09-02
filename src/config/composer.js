@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { DemoProvider } from "../providers/demo.js";
 import { OpenAICompatibleProvider } from "../providers/openai-compatible.js";
+import { OpenAIResponsesProvider } from "../providers/openai-responses.js";
 import {
   formatMaxSteps,
   formatMaxTokensPerTurn,
@@ -18,7 +19,8 @@ import {
 
 const PROFILE_FILE = "nexus.config.json";
 const LOCAL_FILE = path.join(".nexus", "config.local.json");
-const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible"]);
+const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible", "openai-responses"]);
+const PROVIDER_THINKING_MODES = new Set(["provider-default", "enabled", "disabled"]);
 const EXECUTION_TYPES = new Set(["native", "local", "docker"]);
 const SAFE_PERMISSION_PROFILES = new Set(["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto"]);
 
@@ -40,6 +42,7 @@ export async function composeRuntimeConfig({
     "provider.apiKey": null,
     "provider.baseUrl": "https://api.openai.com/v1",
     "provider.model": "gpt-4.1-mini",
+    "provider.thinking": "provider-default",
     "runtime.maxSteps": Infinity,
     "runtime.maxTokensPerTurn": Infinity,
     "execution.type": "native",
@@ -62,19 +65,24 @@ export async function composeRuntimeConfig({
     values["provider.type"] = values["provider.apiKey"] ? "openai-compatible" : "demo";
     sources["provider.type"] = `derived:${sources["provider.apiKey"]}`;
   }
+  validateProviderFeatures(values);
 
-  const agents = normalizeNamedAgentProfiles(local?.agentProfiles, {
-    defaultId: values["agents.default"],
-    defaultPermissionProfile: values["permission.profile"],
-    maxSteps: values["runtime.maxSteps"],
-    maxTokensPerTurn: values["runtime.maxTokensPerTurn"],
-    defaultProvider: {
-      type: values["provider.type"],
-      apiKey: values["provider.apiKey"],
-      baseUrl: values["provider.baseUrl"],
-      model: values["provider.model"],
+  const agents = normalizeNamedAgentProfiles(
+    args.includes("--demo") ? withoutProviderOverrides(local?.agentProfiles) : local?.agentProfiles,
+    {
+      defaultId: values["agents.default"],
+      defaultPermissionProfile: values["permission.profile"],
+      maxSteps: values["runtime.maxSteps"],
+      maxTokensPerTurn: values["runtime.maxTokensPerTurn"],
+      defaultProvider: {
+        type: values["provider.type"],
+        apiKey: values["provider.apiKey"],
+        baseUrl: values["provider.baseUrl"],
+        model: values["provider.model"],
+        thinking: values["provider.thinking"],
+      },
     },
-  });
+  );
 
   return {
     workspace,
@@ -83,6 +91,7 @@ export async function composeRuntimeConfig({
       apiKey: values["provider.apiKey"],
       baseUrl: values["provider.baseUrl"],
       model: values["provider.model"],
+      thinking: values["provider.thinking"],
     },
     runtime: {
       maxSteps: values["runtime.maxSteps"],
@@ -120,22 +129,32 @@ export function createConfiguredAgentProviders(config) {
 
 function createProvider(provider) {
   if (provider.type === "demo") return new DemoProvider();
+  if (provider.type === "openai-responses") {
+    return new OpenAIResponsesProvider({
+      apiKey: provider.apiKey,
+      baseUrl: provider.baseUrl,
+      model: provider.model,
+    });
+  }
   return new OpenAICompatibleProvider({
     apiKey: provider.apiKey,
     baseUrl: provider.baseUrl,
     model: provider.model,
+    thinking: provider.thinking,
   });
 }
 
 function providerDescriptor(provider) {
-  return provider.type === "demo"
-    ? { name: "offline-demo", adapter: "demo", model: "offline-demo", baseUrl: null }
-    : {
-        name: `openai-compatible/${provider.model}`,
-        adapter: provider.type,
-        model: provider.model,
-        baseUrl: provider.baseUrl,
-      };
+  if (provider.type === "demo") {
+    return { name: "offline-demo", adapter: "demo", model: "offline-demo", baseUrl: null };
+  }
+  return {
+    name: `${provider.type}/${provider.model}`,
+    adapter: provider.type,
+    model: provider.model,
+    baseUrl: provider.baseUrl,
+    thinking: provider.thinking,
+  };
 }
 
 export function inspectRuntimeConfig(config) {
@@ -146,6 +165,7 @@ export function inspectRuntimeConfig(config) {
       apiKey: config.provider.apiKey ? "[REDACTED]" : null,
       baseUrl: config.provider.baseUrl,
       model: config.provider.model,
+      thinking: config.provider.thinking,
     },
     runtime: {
       maxSteps: formatMaxSteps(config.runtime.maxSteps),
@@ -175,7 +195,7 @@ async function readConfigFile(file, { label, allowApiKey }) {
   const values = {};
   if (payload.provider !== undefined) {
     assertObject(payload.provider, `${label}.provider`);
-    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model"]), `${label}.provider`);
+    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model", "thinking"]), `${label}.provider`);
     if (payload.provider.apiKey !== undefined && !allowApiKey) {
       throw new Error(`${label} 不允许保存 provider.apiKey；请使用 .env.local 或 .nexus/config.local.json`);
     }
@@ -183,6 +203,7 @@ async function readConfigFile(file, { label, allowApiKey }) {
     copyDefined(values, "provider.apiKey", payload.provider.apiKey);
     copyDefined(values, "provider.baseUrl", payload.provider.baseUrl);
     copyDefined(values, "provider.model", payload.provider.model);
+    copyDefined(values, "provider.thinking", payload.provider.thinking);
   }
   if (payload.runtime !== undefined) {
     assertObject(payload.runtime, `${label}.runtime`);
@@ -219,6 +240,7 @@ function applyEnvironment(values, sources, env, localEnvironment) {
     OPENAI_API_KEY: "provider.apiKey",
     OPENAI_BASE_URL: "provider.baseUrl",
     OPENAI_MODEL: "provider.model",
+    NEXUS_PROVIDER_THINKING: "provider.thinking",
     NEXUS_MAX_STEPS: "runtime.maxSteps",
     NEXUS_MAX_TOKENS_PER_TURN: "runtime.maxTokensPerTurn",
     NEXUS_EXECUTION: "execution.type",
@@ -241,9 +263,13 @@ function applyEnvironment(values, sources, env, localEnvironment) {
 
 function applyCli(values, sources, args) {
   if (args.includes("--demo") && valueArg(args, "provider")) throw new Error("--demo 不能与 --provider 同时使用");
+  if (args.includes("--demo") && valueArg(args, "provider-thinking")) {
+    throw new Error("--demo 不能与 --provider-thinking 同时使用");
+  }
   const mappings = {
     provider: "provider.type",
     model: "provider.model",
+    "provider-thinking": "provider.thinking",
     "base-url": "provider.baseUrl",
     "max-steps": "runtime.maxSteps",
     "max-tokens-per-turn": "runtime.maxTokensPerTurn",
@@ -268,17 +294,33 @@ function applyCli(values, sources, args) {
   if (args.includes("--demo")) {
     values["provider.type"] = "demo";
     sources["provider.type"] = "cli";
+    values["provider.thinking"] = "provider-default";
+    sources["provider.thinking"] = "cli";
   }
 }
 
+function withoutProviderOverrides(profiles) {
+  if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) return profiles;
+  return Object.fromEntries(Object.entries(profiles).map(([id, value]) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return [id, value];
+    const { provider: _provider, ...profile } = value;
+    return [id, profile];
+  }));
+}
+
 function validateValues(values) {
-  if (!PROVIDER_TYPES.has(values["provider.type"])) throw new Error("provider.type 必须是 auto、demo 或 openai-compatible");
+  if (!PROVIDER_TYPES.has(values["provider.type"])) {
+    throw new Error("provider.type 必须是 auto、demo、openai-compatible 或 openai-responses");
+  }
   for (const key of ["provider.baseUrl", "provider.model"]) {
     if (typeof values[key] !== "string" || !values[key].trim()) throw new Error(`${key} 必须是非空字符串`);
     values[key] = values[key].trim();
   }
   if (values["provider.apiKey"] !== null && typeof values["provider.apiKey"] !== "string") {
     throw new Error("provider.apiKey 必须是字符串");
+  }
+  if (!PROVIDER_THINKING_MODES.has(values["provider.thinking"])) {
+    throw new Error("provider.thinking 必须是 provider-default、enabled 或 disabled");
   }
   values["runtime.maxSteps"] = parseMaxSteps(values["runtime.maxSteps"]);
   values["runtime.maxTokensPerTurn"] = parseMaxTokensPerTurn(values["runtime.maxTokensPerTurn"]);
@@ -303,6 +345,12 @@ function validateValues(values) {
   const port = typeof values["gateway.port"] === "number" ? values["gateway.port"] : Number(values["gateway.port"]);
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error("gateway.port 必须是 0 到 65535 的整数");
   values["gateway.port"] = port;
+}
+
+function validateProviderFeatures(values) {
+  if (values["provider.thinking"] !== "provider-default" && values["provider.type"] !== "openai-compatible") {
+    throw new Error("provider.thinking 的 enabled/disabled 首版只支持 openai-compatible Adapter");
+  }
 }
 
 function applyLayer(values, sources, layer, source) {

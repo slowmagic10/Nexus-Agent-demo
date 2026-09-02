@@ -9,7 +9,7 @@ Nexus Agent 是一个本地优先、可执行、可恢复的 Agent Harness。本
 _Avoid_: Conversation, chat state
 
 **Agent Profile Snapshot**:
-Session 当前绑定的无密钥运行身份，包含 Provider/model、System Prompt 与工具 schema hash、Permission/Policy、Execution、Memory Scope 和预算，并以内容 SHA-256 版本进入 Journal。恢复时运行身份变化必须写 `agent.profile_selected`；snapshot 用于审计和漂移检测，不是假装可以复活已删除 Adapter 的冻结执行包。
+Session 当前绑定的无密钥运行身份，包含 Provider/model/thinking、System Prompt 与工具 schema hash、Permission/Policy、Execution、Memory Scope 和预算，并以内容 SHA-256 版本进入 Journal。恢复时运行身份变化必须写 `agent.profile_selected`；snapshot 用于审计和漂移检测，不是假装可以复活已删除 Adapter 的冻结执行包。
 _Avoid_: Profile ID only, raw secret config, implicit runtime overwrite, serialized adapter instance
 
 **Profile Drift**:
@@ -24,6 +24,10 @@ _Avoid_: UI-only persona, implicit routing, switching an active Session
 根据用户在创建 Session 时选择的 Named Agent Profile，解析并绑定对应 Provider Adapter 的确定性入口。路由决定进入 baseline，Branch 与 Child 继承，恢复按同一 Profile 重新构造 Provider 并记录 Drift。它不根据任务文本自动选模，也不在 active turn 中切换或故障转移。
 _Avoid_: Auto router, model fallback, mid-turn switch, provider hidden behind global singleton
 
+**Provider Thinking Mode**:
+Config Composition 与 Named Agent Profile 共同拥有的显式三态 Provider 行为：`provider-default` 不发送开关，`enabled/disabled` 只允许由声明支持它的 OpenAI-compatible Adapter 翻译成线协议。它进入 Agent Profile Snapshot、Profile Drift、配置 inspection 和 Web 标识，但不根据模型名或 Endpoint 推断，也不允许 active turn 热切换。思考模式工具轮所需的 `reasoning_content` 仍作为 opaque `provider_items` durable 保存并原样续传；关闭开关不会授权 Context Lifecycle 猜测或改写既有 Provider 状态。
+_Avoid_: Vendor heuristics, arbitrary extra request body, silently ignoring unsupported options, UI-only toggle, mid-turn thinking switch
+
 **Durable Session Event**:
 已经原子写入 session journal、可用于恢复和审计的事实；只有 durable event 才能推进投影或对外发布。
 _Avoid_: Log line, transient callback
@@ -36,6 +40,10 @@ _Avoid_: Truncated-away output, unscoped blob URL, raw secret payload, inline la
 有副作用工具执行前后的有界工作区快照差异。durable event 只保存 created/modified/deleted、相对路径、文件类型、大小、SHA-256 和 Diff Artifact 引用；秘密与内部目录不参与内容采集，超过边界时必须标记不完整。路径工具通过工作区内符号链接写入时审计 canonical 真实目标；Shell 扫描把链接目标本身作为 `symlink` 记录。它描述观察到的变化，不等同于 Git commit，也不保证并发外部写入一定来自当前工具。
 _Avoid_: Full workspace snapshot in Journal, implicit Git staging, secret file diff, claiming atomic provenance under concurrent writes
 
+**Multi-file Patch**:
+一次 Tool Call 中由 `add/update/delete` 结构化操作组成的有界文件批次。同一字面路径可以声明多个按顺序作用于内存快照的 `update`，但不同路径或符号链接别名指向同一 canonical 文件时仍作为歧义拒绝。所有目标先经过 schema、canonical workspace boundary、Access Policy、现有内容、精确匹配和大小预检，之后才开始写入；提交中失败会按预检快照回滚所有已经尝试的文件。Capability 与 Grant 绑定批次内每一个去重后的精确路径，Tool Host 统一生成 File Change Manifest 和 Diff Artifact。它提供进程内的文件级预检与补偿回滚，不宣称跨崩溃事务，也不接受模糊匹配或任意 unified diff。
+_Avoid_: Hidden patch paths, partial preflight writes, fuzzy replacement, claiming filesystem crash atomicity
+
 **Model Context**:
 由 durable session event 投影得到、允许模型看到的消息、短期记忆、相关长期记忆和已加载 Skills。
 _Avoid_: Full state, UI state, prompt state
@@ -43,6 +51,18 @@ _Avoid_: Full state, UI state, prompt state
 **Context Window Plan**:
 一次模型请求对 Model Context 的确定性预算投影；固定计算 system prompt、Skills、工具 schema 和完整 turn 成本，只选择连续的最近完整 turn，并记录包含与省略数量。
 _Avoid_: Message slice, token truncation
+
+**Historical Tool Transcript Projection**:
+Context Lifecycle 在 Context Window Plan 之前对已完成历史 turn 生成的确定性有界投影。旧 turn 只有在整个投影确实更省 Token 时，才把完整 assistant tool call 与对应 tool result 一起改写为带工具名、参数/结果短预览的普通 assistant 历史记录，避免留下孤立 tool message。用户消息、最终回答和消息位置不变，完整参数与结果仍只存在于 Durable Session Event；每次 Model Context 计划记录版本、投影调用/结果数量及实际估算 Token 节省。它不调用模型、不修改 Journal，也不替代语义摘要或 Artifact。
+_Avoid_: Mutating durable messages, orphan tool results, claiming character count equals token savings
+
+**Active Tool Transcript Projection**:
+Context Lifecycle 对当前用户 turn 内已经闭合的较早工具轮生成的确定性有界投影。最近两个 assistant tool call + 对应 tool result 轮始终逐字保留；更早轮次只有在各自完整成对投影确实更省 Token 时，才改写为带工具名和短预览的普通 assistant 记录。一个 turn 只要包含任意 opaque `provider_items`，该 turn 的全部工具协议就保持逐字不变，避免改写 Provider 私有状态的配对上下文。用户目标、普通 assistant 正文和 Durable Session Event 均不修改；Context Window Plan 独立记录 eligible/preserved/compacted rounds 与估算节省。它减少长任务每次模型调用重复携带旧工具正文的成本，但不是语义摘要，也不允许拆散或截断最近工具协议。
+_Avoid_: Keeping only the last message, orphan tool results, compacting the latest two tool rounds, mutating Session state, model-generated active summary
+
+**Context Lifecycle**:
+管理一个用户 turn 内模型可见上下文完整生命周期的 deep Module。`startTurn` 在 Durable User Message 之后执行有界 Memory retrieval，并返回只公开 `completeModelStep` 的 turn Interface；该 Interface 在内部维护收紧后的 Context 预算，集中完成 Historical/Active Tool Transcript Projection、Context Window Plan、durable semantic summary、模型请求审计、usage 计量、Provider overflow 单次 replan 和 degraded audit。AgentRuntime 只协调 turn、工具循环和最终状态；`model-context` 纯投影与 Memory retrieval Adapter 是 Context Lifecycle 的内部 Implementation，不扩散给调用者。
+_Avoid_: Agent loop coordinating summary batches, caller-owned overflow retries, resetting tightened budget between tool rounds, pass-through context wrapper
 
 **Turn Budget**:
 一次用户任务内所有模型调用的累计 Token 成本边界，与单次请求的 Context Window Plan 和工具循环 `maxSteps` 分别配置。步骤与累计 Token 默认均为 unlimited；用户显式设置边界后，达到边界的新工具调用必须在 Adapter 启动前停止并闭合模型工具协议，最终模型回答不能因事后预算检查而丢失。
@@ -109,7 +129,7 @@ _Avoid_: Model extraction inside storage Adapter, auto-write active memory
 _Avoid_: Injecting unreviewed candidate into model context
 
 **Tool Host**:
-工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。
+工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
 _Avoid_: AgentRuntime reading tool approval or execute implementation
 
 **Tool Authorization Decision**:
@@ -154,8 +174,16 @@ _Avoid_: Project grants stored in the repository, raw secret-bearing shell comma
 _Avoid_: Timeout means no side effect, automatic replay after crash
 
 **Config Composition**:
-把内置默认值、workspace profile、本机私有配置、环境变量和 CLI 覆盖合成为唯一 RuntimeConfig 的 deep Module。每个 leaf 字段保留最终来源；CLI/Gateway 只消费规范化结果，inspection 永不返回原始 Secret。workspace 内 JSON 配置不能启用 MCP、切换 WorkspaceExecution 或选择 Permission Profile，只有受信任环境或显式 CLI 可以。
+把内置默认值、workspace profile、本机私有配置、环境变量和 CLI 覆盖合成为唯一 RuntimeConfig 的 deep Module。每个 leaf 字段保留最终来源；CLI/Gateway 只消费规范化结果，inspection 永不返回原始 Secret。workspace 内 JSON 配置不能启用 MCP、切换 WorkspaceExecution 或选择 Permission Profile，只有受信任环境或显式 CLI 可以。显式 `--demo` 是最高优先级的强制离线选择：所有 Named Agent Profile 保留行为配置但删除 Provider override，Thinking 归一为 `provider-default`；同层 `--provider`/`--provider-thinking` 冲突必须拒绝。
 _Avoid_: Entrypoint-specific parsing, hidden precedence, printing raw secrets, process launch from workspace config
+
+**Runtime Assembly**:
+从规范化 RuntimeConfig 构造并拥有 Store、Provider bindings、Capability Runtime、WorkspaceExecution、Permission Profiles、Tool Registry、MCP、Tool Hosts 与 Project Grant Store 的 deep Module。基础阶段只打开 Session Store，使 CLI 的列表、Import 和离线流程不会隐式启动 Execution 或 MCP；显式 activate 后才创建可执行对象图。CLI 与 Gateway 是入口 Adapter，不重复知道对象创建顺序；所有 owner-scoped capability、MCP、私有 Grant Store 和 Session Store 由同一个幂等 close 生命周期逆序收敛。Gateway 的每个 AgentRuntime 也由该 Module 的 factory 创建，但 Session 路由、HTTP/SSE 和终端交互仍属于入口 Adapter。
+_Avoid_: Entrypoint-owned object graphs, MCP during session listing, duplicated shutdown order, Runtime Assembly absorbing CLI commands or Gateway routing
+
+**Provider Output Stream**:
+真实 Provider Adapter 可选提供的增量输出能力。OpenAI-compatible Chat Completions 与原生 OpenAI Responses 两个 Adapter 都只向 Agent Runtime 暴露规范化 `text_delta` 和带完整 `text/toolCalls/usage/finishReason` 的 `completed`；共享代码只负责 SSE framing，原始事件语义、chunk 边界和工具参数碎片留在各 Adapter 内。Responses 的 encrypted reasoning item 和 OpenAI-compatible 的 `reasoning_content` 都规范化为 opaque `provider_items`，随 Assistant Message durable 保存并在对应 Adapter 的工具往返时原样续传，不解释、不展示，也不把可见推理文本加入状态。Runtime 把正文按完整行/句末合并、整段脱敏后写入 `modelStreamChunks` durable projection，Gateway 继续通过 Session Event SSE 发布。取消、失败、进程中断以及 `max_output_tokens/length/content_filter` 等非正常 Provider 终态都保留已持久化部分输出；非正常终态不得标记 Objective 完成，也不得启动其携带的 Tool Call。成功后由最终 Assistant Message 原子取代流投影。Provider 不返回 usage 时允许使用现有估算。
+_Avoid_: Token-per-event journal writes, raw Provider SSE in session state, browser-only deltas, persisting unredacted token fragments, treating partial tool arguments as executable calls
 
 **Capability Runtime**:
 管理运行时能力实现的 owner、registration identity、active index、lease、撤销和 dispose。Capability Scope 描述“能做什么”，Capability Runtime 描述“实现当前是否存在以及由谁拥有”。撤销先隐藏能力并禁止新 lease，再等待在途 lease，最后清理 owner 资源。

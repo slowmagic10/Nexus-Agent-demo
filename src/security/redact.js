@@ -6,7 +6,10 @@ const SECRET_PATTERNS = [
   [/\b([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=([^\s]+)/g, "$1=[REDACTED]"],
   [/(\bsshpass\s+-p\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|\S+)/gi, "$1[REDACTED]"],
   [/(\bexpect\s+\S+\s+\S+\s+\S+\s+)(?:"[^"\r\n]*"|'[^'\r\n]*'|\S+)/gi, "$1[REDACTED]"],
-  [/(["'])(?=[^"'\r\n]{8,}\1)(?=[^"'\r\n]*[A-Za-z])(?=[^"'\r\n]*\d)(?=[^"'\r\n]*[^A-Za-z0-9\s])[^"'\r\n]+\1/g, "$1[REDACTED]$1"],
+  [
+    /((?:登录)?密码|password|passphrase|api[_ -]?key|access[_ -]?token|client[_ -]?secret)(\s*(?:是|为|[:=])\s*)(["'])[^"'\r\n]+\3/gi,
+    "$1$2$3[REDACTED]$3",
+  ],
 ];
 
 export function redactSensitiveText(value) {

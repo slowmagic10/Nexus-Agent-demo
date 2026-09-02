@@ -100,12 +100,15 @@ export function normalizeMemoryCandidate(candidate, defaultScope = {}) {
   if (typeof confidence !== "number" || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
     throw new Error("memory.confidence 必须是 0 到 1 的数字");
   }
+  const pinned = candidate.pinned ?? false;
+  if (typeof pinned !== "boolean") throw new Error("memory.pinned 必须是布尔值");
   return {
     ...candidate,
     content,
     kind,
     status,
     confidence,
+    pinned,
     scope: normalizeMemoryScope(candidate.scope, defaultScope),
     tags: normalizeTags(candidate.tags),
     observedAt: optionalDate(candidate.observedAt, "memory.observedAt"),
@@ -141,7 +144,9 @@ export function normalizeSearchOptions(options = {}) {
   if (!Array.isArray(statuses) || !statuses.length || statuses.some((status) => !MEMORY_STATUSES.includes(status))) {
     throw new Error("Memory search statuses 无效");
   }
-  return { limit, statuses: [...new Set(statuses)] };
+  const pinned = options.pinned ?? null;
+  if (pinned !== null && typeof pinned !== "boolean") throw new Error("Memory search pinned 必须是布尔值或 null");
+  return { limit, statuses: [...new Set(statuses)], pinned };
 }
 
 export function normalizeTags(tags = []) {

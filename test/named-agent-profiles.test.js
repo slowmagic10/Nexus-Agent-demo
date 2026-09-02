@@ -41,4 +41,7 @@ test("具名 Agent Profile 拒绝危险权限、未知字段和不存在的默�
   assert.throws(() => normalizeNamedAgentProfiles({ review: { provider: { unexpected: true } } }), /未知字段 unexpected/);
   assert.throws(() => normalizeNamedAgentProfiles({ review: {} }, { defaultId: "missing" }), /不存在/);
   assert.throws(() => normalizeNamedAgentProfiles({ "Invalid ID": {} }), /只能包含/);
+  assert.throws(() => normalizeNamedAgentProfiles({ review: {
+    provider: { type: "openai-responses", apiKey: "test", baseUrl: "https://example.com/v1", thinking: "enabled" },
+  } }), /只支持 openai-compatible/);
 });

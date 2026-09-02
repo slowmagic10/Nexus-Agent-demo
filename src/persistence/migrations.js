@@ -185,6 +185,16 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 8,
+    up(db) {
+      addColumn(db, "memories", "pinned", "INTEGER NOT NULL DEFAULT 0");
+      db.exec(`
+        CREATE INDEX IF NOT EXISTS memories_scope_pinned_updated
+          ON memories(scope_workspace, scope_agent, scope_user, pinned, status, updated_at DESC);
+      `);
+    },
+  },
 ];
 
 export function migrateDatabase(db) {

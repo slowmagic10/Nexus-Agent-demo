@@ -54,12 +54,15 @@ export class ToolHost {
     });
     const registration = resolveRegistryTool(this.registry, call.name);
     const tool = registration?.tool || null;
-    const argsHash = hashValue(call.arguments);
     const definition = tool ? normalizeDefinition(tool, this.defaultTimeoutMs) : null;
+    const recovered = definition ? recoverWrappedArguments(call.arguments, definition.parameters) : null;
+    if (recovered) call = { ...call, arguments: recovered };
+    const argsHash = hashValue(call.arguments);
     await session.dispatch({
       type: "TOOL_REQUESTED",
       call,
       argsHash,
+      argumentsRecovered: Boolean(recovered),
       effects: definition?.effects || [],
       idempotency: definition?.idempotency || "unknown",
       adapter: definition?.adapter || "unknown",
@@ -489,9 +492,16 @@ function normalizeChangeTracking(value) {
   }
   if (value.mode === "paths" && Array.isArray(value.arguments) && value.arguments.length
       && value.arguments.every((name) => typeof name === "string" && name)) {
-    const unknown = Object.keys(value).find((key) => !["mode", "arguments"].includes(key));
+    const unknown = Object.keys(value).find((key) => !["mode", "arguments", "pathField"].includes(key));
     if (unknown) throw new Error(`changeTracking 包含未知字段 ${unknown}`);
-    return Object.freeze({ mode: "paths", arguments: Object.freeze([...new Set(value.arguments)]) });
+    if (value.pathField !== undefined && (typeof value.pathField !== "string" || !value.pathField)) {
+      throw new Error("changeTracking.pathField 必须是非空字符串");
+    }
+    return Object.freeze({
+      mode: "paths",
+      arguments: Object.freeze([...new Set(value.arguments)]),
+      ...(value.pathField ? { pathField: value.pathField } : {}),
+    });
   }
   throw new Error("changeTracking 必须声明 workspace 或带 arguments 的 paths 模式");
 }
@@ -499,7 +509,11 @@ function normalizeChangeTracking(value) {
 async function beginTrackedChanges(definition, args, workspace) {
   if (!definition.changeTracking) return null;
   try {
-    const paths = definition.changeTracking.arguments.map((name) => args[name]);
+    const paths = definition.changeTracking.arguments.flatMap((name) => {
+      const value = args[name];
+      if (!definition.changeTracking.pathField) return [value];
+      return Array.isArray(value) ? value.map((item) => item?.[definition.changeTracking.pathField]) : [];
+    });
     return await beginFileChangeCapture({
       workspace,
       mode: definition.changeTracking.mode,
@@ -634,12 +648,28 @@ function validateArguments(schema, value, path = "arguments") {
     }
   }
   if (type === "array" && schema.items) {
+    if (Number.isSafeInteger(schema.minItems) && value.length < schema.minItems) return `${path} 至少需要 ${schema.minItems} 项`;
+    if (Number.isSafeInteger(schema.maxItems) && value.length > schema.maxItems) return `${path} 最多允许 ${schema.maxItems} 项`;
     for (let index = 0; index < value.length; index += 1) {
       const error = validateArguments(schema.items, value[index], `${path}[${index}]`);
       if (error) return error;
     }
   }
   return null;
+}
+
+function recoverWrappedArguments(value, schema) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (!validateArguments(schema, value)) return null;
+  if (Object.keys(value).length !== 1 || typeof value.arguments !== "string") return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(value.arguments);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  return validateArguments(schema, parsed) ? null : parsed;
 }
 
 function matchesType(value, type) {

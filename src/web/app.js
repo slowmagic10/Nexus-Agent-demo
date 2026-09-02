@@ -6,8 +6,9 @@ import {
 } from "/keyboard.js";
 import { grantViewModel } from "/grants.js";
 import { objectivePlanViewModel } from "/plan-view.js";
-import { profileDriftViewModel } from "/profile-view.js";
+import { profileDriftViewModel, providerThinkingLabel } from "/profile-view.js";
 import { artifactIdFromToolResult } from "/artifact-view.js";
+import { contextObservabilityViewModel } from "/context-view.js";
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
@@ -28,6 +29,8 @@ const elements = {
   messages: $("#messages"),
   planPanel: $("#plan-panel"),
   events: $("#events"),
+  contextPanel: $("#context-panel"),
+  evaluationPanel: $("#evaluation-panel"),
   title: $("#session-title"),
   meta: $("#session-meta"),
   phaseDot: $("#phase-dot"),
@@ -59,6 +62,7 @@ applyTheme(savedTheme());
 $("#new-session").addEventListener("click", createSession);
 elements.form.addEventListener("submit", sendMessage);
 let inputIsComposing = false;
+let evaluationTimer = null;
 elements.input.addEventListener("compositionstart", () => {
   inputIsComposing = true;
 });
@@ -198,7 +202,13 @@ async function selectSession(id) {
   state.cursor = cursor;
   renderSession(session);
   connectEvents();
-  await Promise.all([loadSessions(), loadGrants()]);
+  await Promise.all([
+    loadSessions(),
+    loadGrants(),
+    loadMemories(),
+    loadCandidates(),
+    ...(state.inspectorTab === "evaluation" ? [loadEvaluation()] : []),
+  ]);
 }
 
 function connectEvents() {
@@ -230,6 +240,7 @@ async function handleSessionEvent(message) {
   if (["TOOL_GRANT_ISSUED", "TOOL_GRANT_CONSUMED", "TOOL_GRANT_REVOKED", "TOOL_PROJECT_GRANT_ISSUED", "TOOL_PROJECT_GRANT_REVOKED"].includes(event.type)) {
     await loadGrants();
   }
+  if (state.inspectorTab === "evaluation") scheduleEvaluation();
 }
 
 function renderSession(session) {
@@ -250,8 +261,16 @@ function renderSession(session) {
   renderPermissionControl();
   setGrantActionAvailability(busy);
 
-  renderMessages(session.messages, session.pendingApproval, session.phase === "failed" ? session.lastError : null, session.events);
+  renderMessages(
+    session.messages,
+    session.pendingApproval,
+    session.phase === "failed" ? session.lastError : null,
+    session.events,
+    session.modelStream,
+    session.modelStreamChunks,
+  );
   renderObjectivePlan(session.objective, session.plan, session.delegations);
+  renderContextObservability(session);
   renderEvents(session.events);
   updateSelectedSession(session, title);
 }
@@ -276,7 +295,7 @@ function renderStatus(session) {
     if (text === session.provider) {
       const profile = session.agentProfile;
       chip.title = profile
-        ? `${session.workspace}\nProfile ${profile.id}@${profile.version.slice(0, 12)}`
+        ? `${session.workspace}\nProfile ${profile.id}@${profile.version.slice(0, 12)}\n${providerThinkingLabel(profile.provider?.thinking)}`
         : session.workspace;
     }
     return chip;
@@ -288,7 +307,7 @@ function renderAgentProfileControl() {
   elements.agentProfileSelect.replaceChildren(...profiles.map((profile) => {
     const option = document.createElement("option");
     option.value = profile.id;
-    option.textContent = `${profile.label} · ${profile.provider?.model || "当前模型"}`;
+    option.textContent = `${profile.label} · ${profile.provider?.model || "当前模型"} · ${providerThinkingLabel(profile.provider?.thinking)}`;
     option.title = [profile.description, profile.id, permissionLabel(profile.permissionProfile)].filter(Boolean).join(" · ");
     return option;
   }));
@@ -432,7 +451,7 @@ function updateSelectedSession(session, title) {
   item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
 }
 
-function renderMessages(messages, pendingApproval, terminalError, events = []) {
+function renderMessages(messages, pendingApproval, terminalError, events = [], modelStream = null, modelStreamChunks = []) {
   if (!messages.length) {
     elements.messages.replaceChildren(createWelcome());
     return;
@@ -490,6 +509,29 @@ function renderMessages(messages, pendingApproval, terminalError, events = []) {
     rendered.push(row);
   }
 
+  const streamedText = Array.isArray(modelStreamChunks) ? modelStreamChunks.join("") : "";
+  if (modelStream && streamedText) {
+    const row = document.createElement("article");
+    row.className = `message-row assistant model-stream ${modelStream.status}`;
+    const avatar = document.createElement("div");
+    avatar.className = "avatar";
+    avatar.textContent = "N";
+    const body = document.createElement("div");
+    body.className = "message-body";
+    body.append(renderMarkdown(streamedText));
+    const stateLabel = document.createElement("span");
+    stateLabel.className = "model-stream-state";
+    stateLabel.textContent = ({
+      streaming: "正在生成",
+      cancelled: "已中途停止",
+      failed: "生成失败，保留部分输出",
+      interrupted: "进程中断，保留部分输出",
+    })[modelStream.status] || "部分输出";
+    body.append(stateLabel);
+    row.append(avatar, body);
+    rendered.push(row);
+  }
+
   if (terminalError) {
     const alert = document.createElement("div");
     alert.className = "runtime-error";
@@ -501,7 +543,7 @@ function renderMessages(messages, pendingApproval, terminalError, events = []) {
     rendered.push(alert);
   }
 
-  if (["thinking", "executing"].includes(state.session?.phase)) rendered.push(thinkingIndicator());
+  if (["thinking", "executing"].includes(state.session?.phase) && !streamedText) rendered.push(thinkingIndicator());
   elements.messages.replaceChildren(...rendered);
   requestAnimationFrame(() => { elements.messages.scrollTop = elements.messages.scrollHeight; });
 }
@@ -581,6 +623,291 @@ function renderObjectivePlan(objective, plan, delegations) {
   }
   const hasPlanDetails = Boolean(view.explanation || view.steps.length || view.delegations.length || view.revision);
   elements.planPanel.replaceChildren(header, ...(hasPlanDetails ? [body] : []));
+}
+
+function renderContextObservability(session) {
+  const view = contextObservabilityViewModel(session);
+  if (!view) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "模型完成第一次请求后，这里会显示 Context 预算和压缩状态。";
+    elements.contextPanel.replaceChildren(empty);
+    return;
+  }
+
+  const overview = document.createElement("section");
+  overview.className = "context-card context-overview";
+  const head = contextCardHeading("本次模型上下文", view.plan?.statusLabel || "等待规划", view.plan?.compacted ? "warning" : "normal");
+  const tokenLine = document.createElement("div");
+  tokenLine.className = "context-token-line";
+  const tokenValue = document.createElement("strong");
+  tokenValue.textContent = `${formatTokens(view.usage.estimatedTokens)} / ${view.usage.maxTokens ? formatTokens(view.usage.maxTokens) : "未设置"}`;
+  const tokenPercent = document.createElement("span");
+  tokenPercent.textContent = view.usage.maxTokens ? `${view.usage.percent}%` : "无预算";
+  tokenLine.append(tokenValue, tokenPercent);
+  const meter = document.createElement("div");
+  meter.className = `context-meter ${view.usage.level}`;
+  const fill = document.createElement("i");
+  fill.style.width = `${view.usage.meterPercent}%`;
+  meter.append(fill);
+  const tokenDetail = document.createElement("p");
+  tokenDetail.className = "context-card-detail";
+  tokenDetail.textContent = `固定 ${formatTokens(view.usage.fixedTokens)} · 消息 ${formatTokens(view.usage.messageTokens)} · ${view.plan?.strategyLabel || "尚无策略"}`;
+  overview.append(head, tokenLine, meter, tokenDetail);
+
+  const history = document.createElement("section");
+  history.className = "context-card";
+  const toolProjection = view.history.toolProjection;
+  const activeToolProjection = view.history.activeToolProjection;
+  history.append(
+    contextCardHeading("历史窗口", view.history.omittedMessages ? `省略 ${view.history.omittedMessages} 条` : "未省略", view.history.omittedMessages ? "warning" : "normal"),
+    contextMetrics([
+      ["纳入消息", String(view.history.includedMessages), `${view.history.includedTurns} 个完整轮次`],
+      ["省略消息", String(view.history.omittedMessages), `${view.history.omittedTurns} 个完整轮次`],
+      [
+        "工具历史",
+        toolProjection.applied
+          ? `${toolProjection.compactedToolCalls + toolProjection.compactedToolResults} 项精简`
+          : "保持原样",
+        toolProjection.applied
+          ? `节省 ${formatTokens(toolProjection.savedTokens)} tokens`
+          : `${toolProjection.eligibleTurns} 个历史轮次可投影`,
+      ],
+      [
+        "本轮工具",
+        activeToolProjection.applied
+          ? `${activeToolProjection.compactedRounds} 轮精简`
+          : "保持原样",
+        activeToolProjection.applied
+          ? `节省 ${formatTokens(activeToolProjection.savedTokens)} tokens · 最近 ${activeToolProjection.preservedRounds} 轮完整`
+          : `最近 ${activeToolProjection.preservedRounds} 轮完整`,
+      ],
+    ]),
+  );
+
+  const memory = document.createElement("section");
+  memory.className = "context-card";
+  memory.append(
+    contextCardHeading("长期记忆", `${view.memory.pinned.included + view.memory.relevant.included} 条命中`, "normal"),
+    contextMemoryRow("固定记忆", view.memory.pinned),
+    contextMemoryRow("相关记忆", view.memory.relevant),
+  );
+
+  const summary = document.createElement("section");
+  summary.className = "context-card";
+  summary.append(contextCardHeading("滚动摘要", view.summary.statusLabel, view.summary.degraded ? "danger" : view.summary.included ? "normal" : "muted"));
+  const summaryDetail = document.createElement("p");
+  summaryDetail.className = "context-card-detail";
+  summaryDetail.textContent = view.summary.available
+    ? `revision ${view.summary.revision} · 覆盖到消息 ${view.summary.throughMessage}${view.summary.sourceComplete === false ? " · 来源不完整" : ""}`
+    : "仅在历史需要压缩时生成；摘要正文不会显示在此面板。";
+  summary.append(summaryDetail);
+
+  const cards = [overview, history, memory, summary];
+  if (view.replan) {
+    const replan = document.createElement("section");
+    replan.className = `context-card context-replan ${view.replan.level}`;
+    replan.append(contextCardHeading("Context 超限处理", view.replan.statusLabel, view.replan.level));
+    const detail = document.createElement("p");
+    detail.className = "context-card-detail";
+    detail.textContent = view.replan.status === "replanned"
+      ? `输入预算 ${formatTokens(view.replan.fromMaxInputTokens)} → ${formatTokens(view.replan.toMaxInputTokens)}；新增省略 ${view.replan.omittedMessages} 条消息。`
+      : view.replan.status === "exhausted"
+        ? `当前预算 ${formatTokens(view.replan.maxInputTokens)}${view.replan.contextLimit ? `；Provider 上限 ${formatTokens(view.replan.contextLimit)}` : ""}。`
+        : `输入预算 ${formatTokens(view.replan.fromMaxInputTokens)} → ${formatTokens(view.replan.toMaxInputTokens)}。`;
+    replan.append(detail);
+    cards.push(replan);
+  }
+
+  const identity = document.createElement("div");
+  identity.className = "context-identity";
+  identity.textContent = [
+    view.identity.contextHashShort ? `Context ${view.identity.contextHashShort}` : null,
+    view.identity.estimatorVersion,
+    view.plan?.at ? new Date(view.plan.at).toLocaleTimeString() : null,
+  ].filter(Boolean).join(" · ");
+  cards.push(identity);
+  elements.contextPanel.replaceChildren(...cards);
+}
+
+async function loadEvaluation() {
+  if (!state.sessionId) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "请先选择一个任务。";
+    elements.evaluationPanel.replaceChildren(empty);
+    return;
+  }
+  try {
+    const { evaluation } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/evaluation`, {}, { silent: true });
+    if (state.sessionId !== evaluation.sessionId) return;
+    renderEvaluation(evaluation);
+  } catch {
+    const failed = document.createElement("div");
+    failed.className = "drawer-empty";
+    failed.textContent = "诊断报告暂时不可用。";
+    elements.evaluationPanel.replaceChildren(failed);
+  }
+}
+
+function scheduleEvaluation() {
+  clearTimeout(evaluationTimer);
+  evaluationTimer = setTimeout(() => void loadEvaluation(), 120);
+}
+
+function renderEvaluation(report) {
+  const overview = document.createElement("section");
+  overview.className = `evaluation-card evaluation-overview ${report.status}`;
+  const head = contextCardHeading("任务健康报告", evaluationStatusLabel(report.status), evaluationStatusLevel(report.status));
+  const summary = document.createElement("p");
+  summary.className = "evaluation-summary";
+  summary.textContent = `基于 ${report.cursor} 个 durable events · ${report.version}`;
+  overview.append(head, summary);
+
+  const metrics = document.createElement("section");
+  metrics.className = "evaluation-card";
+  metrics.append(
+    contextCardHeading("运行概况", report.phase, "muted"),
+    evaluationMetrics([
+      ["Objective", report.objective.status || "无", report.objective.totalSteps ? `计划 ${report.objective.completedSteps}/${report.objective.totalSteps}` : "无计划步骤"],
+      ["工具成功", report.tools.completed ? `${report.tools.successRate}%` : "—", `${report.tools.succeeded}/${report.tools.completed} 成功`],
+      ["Context", String(report.context.plans), `压缩 ${report.context.compacted} · 历史节省 ${formatTokens(report.context.historySavedTokens)} tokens`],
+      ["Token", formatTokens(report.metrics.totalTokens), `模型调用 ${report.metrics.modelCalls}`],
+    ]),
+  );
+
+  const reliability = document.createElement("section");
+  reliability.className = "evaluation-card";
+  reliability.append(
+    contextCardHeading("可靠性信号", report.tools.executionUnknown ? `${report.tools.executionUnknown} 个未知结果` : "执行结果明确", report.tools.executionUnknown ? "danger" : "normal"),
+    evaluationRows([
+      ["工具", `失败 ${report.tools.failed} · 参数无效 ${report.tools.validationFailed} · 能力不可用 ${report.tools.capabilityUnavailable}`],
+      ["审批", `请求 ${report.approvals.requested} · 通过 ${report.approvals.granted} · 拒绝 ${report.approvals.denied}`],
+      ["Context", `最高占用 ${report.context.maxUtilizationPercent}% · 重规划 ${report.context.replanned} · 耗尽 ${report.context.replanExhausted}`],
+      ["委派", `完成 ${report.delegations.completed}/${report.delegations.total} · 异常 ${report.delegations.failed}`],
+    ]),
+  );
+
+  const issues = document.createElement("section");
+  issues.className = "evaluation-card";
+  issues.append(contextCardHeading("需要关注", report.issues.length ? `${report.issues.length} 类` : "未发现问题", report.issues.some((issue) => issue.severity === "high") ? "danger" : report.issues.length ? "warning" : "normal"));
+  if (report.issues.length) {
+    const list = document.createElement("div");
+    list.className = "evaluation-issues";
+    for (const issue of report.issues) {
+      const item = document.createElement("div");
+      item.className = `evaluation-issue ${issue.severity}`;
+      const marker = document.createElement("i");
+      marker.textContent = ({ high: "!", medium: "·", low: "i" })[issue.severity] || "·";
+      const copy = document.createElement("span");
+      const title = document.createElement("strong");
+      title.textContent = issue.label;
+      const detail = document.createElement("small");
+      detail.textContent = `${issue.code}${issue.count > 1 ? ` · ${issue.count} 次` : ""}${issue.eventSeq ? ` · event ${issue.eventSeq}` : ""}`;
+      copy.append(title, detail);
+      item.append(marker, copy);
+      list.append(item);
+    }
+    issues.append(list);
+  } else {
+    const clean = document.createElement("p");
+    clean.className = "evaluation-clean";
+    clean.textContent = "本次回放投影中没有发现失败、未知副作用或未闭合状态。";
+    issues.append(clean);
+  }
+
+  const foot = document.createElement("p");
+  foot.className = "evaluation-foot";
+  foot.textContent = "报告由 Session Journal 派生，不调用模型，也不会修改原任务。";
+  elements.evaluationPanel.replaceChildren(overview, metrics, reliability, issues, foot);
+}
+
+function evaluationMetrics(items) {
+  const grid = document.createElement("div");
+  grid.className = "evaluation-metrics";
+  for (const [label, value, detail] of items) {
+    const metric = document.createElement("div");
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    const small = document.createElement("small");
+    small.textContent = detail;
+    metric.append(caption, strong, small);
+    grid.append(metric);
+  }
+  return grid;
+}
+
+function evaluationRows(items) {
+  const list = document.createElement("div");
+  list.className = "evaluation-rows";
+  for (const [label, value] of items) {
+    const row = document.createElement("div");
+    const title = document.createElement("strong");
+    title.textContent = label;
+    const detail = document.createElement("span");
+    detail.textContent = value;
+    row.append(title, detail);
+    list.append(row);
+  }
+  return list;
+}
+
+function evaluationStatusLabel(status) {
+  return ({ healthy: "健康", attention: "需要关注", failed: "失败", cancelled: "已取消", running: "运行中", idle: "尚未运行" })[status] || status;
+}
+
+function evaluationStatusLevel(status) {
+  if (status === "failed") return "danger";
+  if (["attention", "cancelled"].includes(status)) return "warning";
+  if (["idle", "running"].includes(status)) return "muted";
+  return "normal";
+}
+
+function contextCardHeading(titleText, statusText, level) {
+  const head = document.createElement("header");
+  head.className = "context-card-head";
+  const title = document.createElement("strong");
+  title.textContent = titleText;
+  const status = document.createElement("span");
+  status.className = `context-state ${level}`;
+  status.textContent = statusText;
+  head.append(title, status);
+  return head;
+}
+
+function contextMetrics(items) {
+  const grid = document.createElement("div");
+  grid.className = "context-metrics";
+  for (const [label, value, detail] of items) {
+    const metric = document.createElement("div");
+    const caption = document.createElement("span");
+    caption.textContent = label;
+    const strong = document.createElement("strong");
+    strong.textContent = value;
+    const small = document.createElement("small");
+    small.textContent = detail;
+    metric.append(caption, strong, small);
+    grid.append(metric);
+  }
+  return grid;
+}
+
+function contextMemoryRow(label, section) {
+  const row = document.createElement("div");
+  row.className = "context-memory-row";
+  const copy = document.createElement("span");
+  const title = document.createElement("strong");
+  title.textContent = label;
+  const detail = document.createElement("small");
+  detail.textContent = `${section.included} 条 · ${formatTokens(section.estimatedTokens)}${section.maxTokens ? ` / ${formatTokens(section.maxTokens)}` : ""}`;
+  copy.append(title, detail);
+  const status = document.createElement("span");
+  status.className = section.truncated ? "context-truncated" : "context-complete";
+  status.textContent = section.truncated ? `${section.truncated} 条截断` : "完整";
+  row.append(copy, status);
+  return row;
 }
 
 function toolCard(call, result, pending, fileChanges = null) {
@@ -854,7 +1181,14 @@ async function exportSession() {
 }
 
 async function loadMemories() {
-  const { memories } = await api("/memories");
+  if (!state.sessionId) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "请先选择一个任务。";
+    elements.memoryList.replaceChildren(empty);
+    return;
+  }
+  const { memories } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories`);
   if (!memories.length) {
     const empty = document.createElement("div");
     empty.className = "drawer-empty";
@@ -867,19 +1201,45 @@ async function loadMemories() {
     box.className = "memory";
     const text = document.createElement("p");
     text.textContent = memory.content;
+    const pin = document.createElement("button");
+    pin.className = "memory-pin";
+    pin.textContent = memory.pinned ? "取消固定" : "固定";
+    pin.addEventListener("click", async () => {
+      if (!state.sessionId) {
+        toast("请先选择一个任务再管理固定记忆");
+        return;
+      }
+      pin.disabled = true;
+      try {
+        await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories/${encodeURIComponent(memory.id)}/pin`, {
+          method: "POST",
+          body: { pinned: !memory.pinned },
+        });
+        await loadMemories();
+      } catch {
+        pin.disabled = false;
+      }
+    });
     const remove = document.createElement("button");
     remove.textContent = "删除";
     remove.addEventListener("click", async () => {
-      await api(`/memories/${encodeURIComponent(memory.id)}`, { method: "DELETE" });
+      await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories/${encodeURIComponent(memory.id)}`, { method: "DELETE" });
       await loadMemories();
     });
-    box.append(text, remove);
+    box.append(text, pin, remove);
     return box;
   }));
 }
 
 async function loadCandidates() {
-  const { candidates } = await api("/memory-candidates");
+  if (!state.sessionId) {
+    const empty = document.createElement("div");
+    empty.className = "candidate-empty";
+    empty.textContent = "请先选择一个任务。";
+    elements.candidateList.replaceChildren(empty);
+    return;
+  }
+  const { candidates } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/memory-candidates`);
   if (!candidates.length) {
     const empty = document.createElement("div");
     empty.className = "candidate-empty";
@@ -930,10 +1290,14 @@ async function loadCandidates() {
 
 async function addMemory(event) {
   event.preventDefault();
+  if (!state.sessionId) {
+    toast("请先选择一个任务再新增长期记忆");
+    return;
+  }
   const input = $("#memory-input");
   const content = input.value.trim();
   if (!content) return;
-  await api("/memories", { method: "POST", body: { content, tags: [] } });
+  await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories`, { method: "POST", body: { content, tags: [] } });
   input.value = "";
   await loadMemories();
 }
@@ -1072,9 +1436,13 @@ function selectTab(name) {
     tab.setAttribute("aria-selected", String(active));
   });
   $("#events-view").classList.toggle("hidden", name !== "events");
+  $("#context-view").classList.toggle("hidden", name !== "context");
+  $("#evaluation-view").classList.toggle("hidden", name !== "evaluation");
   $("#memory-view").classList.toggle("hidden", name !== "memory");
   $("#grants-view").classList.toggle("hidden", name !== "grants");
   if (name === "grants") void loadGrants();
+  if (name === "evaluation") void loadEvaluation();
+  if (name === "memory") void Promise.allSettled([loadMemories(), loadCandidates()]);
 }
 
 function renderMarkdown(source) {
@@ -1249,6 +1617,7 @@ function toolLabel(name) {
     read_file: "读取文件",
     write_file: "修改文件",
     edit_file: "精确编辑文件",
+    apply_patch: "应用多文件 Patch",
     list_files: "查看文件",
     search_files: "搜索文件",
     memory_save: "保存长期记忆",
@@ -1306,6 +1675,9 @@ function eventLabel(type) {
     "context.summary_requested": "生成会话摘要",
     "context.summary_completed": "更新会话摘要",
     "context.summary_degraded": "会话摘要降级",
+    "context.replan_requested": "模型上下文超限",
+    "context.replanned": "重新规划上下文",
+    "context.replan_exhausted": "上下文重试仍超限",
     "memory.context_loaded": "加载相关记忆",
     "memory.added": "保存会话记忆",
     "memory.flush_requested": "提取记忆候选",
@@ -1314,6 +1686,7 @@ function eventLabel(type) {
     "memory.candidate_created": "创建记忆候选",
     "memory.candidate_approved": "保留记忆候选",
     "memory.candidate_rejected": "忽略记忆候选",
+    "memory.pin_changed": "更新固定记忆",
     "tool.requested": "请求工具",
     "tool.validation_failed": "工具参数无效",
     "tool.authorization_decided": "工具策略决策",

@@ -289,12 +289,18 @@ function normalizeResourceDescriptor(resource) {
   if (resource.kind === "workspace_path" && (typeof resource.argument !== "string" || !resource.argument)) {
     throw new Error("workspace_path capability 必须声明 argument");
   }
+  if (resource.pathField !== undefined && (
+    resource.kind !== "workspace_path" || typeof resource.pathField !== "string" || !resource.pathField
+  )) {
+    throw new Error("workspace_path capability.pathField 无效");
+  }
   if (resource.kind === "shell_command" && (typeof resource.argument !== "string" || !resource.argument)) {
     throw new Error("shell_command capability 必须声明 argument");
   }
   return {
     kind: resource.kind,
     ...(resource.argument ? { argument: resource.argument } : {}),
+    ...(resource.pathField ? { pathField: resource.pathField } : {}),
     ...(resource.value ? { value: String(resource.value) } : {}),
     ...(resource.default !== undefined ? { default: resource.default } : {}),
     ...(resource.access ? { access: String(resource.access) } : {}),
@@ -302,9 +308,25 @@ function normalizeResourceDescriptor(resource) {
 }
 
 function resolveCapabilityResources(capability, args, state) {
-  return capability.resources.map((resource) => {
+  const resolved = capability.resources.flatMap((resource) => {
     if (resource.kind === "workspace_path") {
       const requested = args[resource.argument] ?? resource.default ?? ".";
+      if (resource.pathField) {
+        if (!Array.isArray(requested) || !requested.length) {
+          throw new Error(`资源参数 ${resource.argument} 必须是非空数组`);
+        }
+        return requested.map((item, index) => {
+          const nested = item?.[resource.pathField];
+          if (typeof nested !== "string" || !nested) {
+            throw new Error(`资源参数 ${resource.argument}[${index}].${resource.pathField} 必须是字符串`);
+          }
+          return {
+            kind: resource.kind,
+            value: resolveWorkspaceResource(state.workspace, nested),
+            access: resource.access || (capability.readOnly ? "read" : "write"),
+          };
+        });
+      }
       if (typeof requested !== "string") throw new Error(`资源参数 ${resource.argument} 必须是字符串`);
       return {
         kind: resource.kind,
@@ -326,6 +348,12 @@ function resolveCapabilityResources(capability, args, state) {
       ...(resource.access ? { access: resource.access } : {}),
     };
   });
+  const unique = new Map();
+  for (const resource of resolved) {
+    const key = `${resource.kind}\u0000${resource.access || ""}\u0000${resource.value}`;
+    if (!unique.has(key)) unique.set(key, resource);
+  }
+  return [...unique.values()];
 }
 
 function resolveWorkspaceResource(workspace, requested) {
