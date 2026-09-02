@@ -54,7 +54,7 @@ export class LocalWorkspaceAdapter {
     };
   }
 
-  async execute(spec, { signal } = {}) {
+  async execute(spec, { signal, onOutput } = {}) {
     const normalized = createExecutionSpec(spec);
     if (normalized.filesystemMode === "read-only") {
       throw new WorkspaceExecutionError("trusted-local 无法强制 read-only 文件系统；不会静默执行。", {
@@ -66,6 +66,7 @@ export class LocalWorkspaceAdapter {
         code: "execution_isolation_unavailable",
       });
     }
+    if (onOutput !== undefined && typeof onOutput !== "function") throw new Error("WorkspaceExecution onOutput 必须是函数");
     if (signal?.aborted) return Promise.reject(signal.reason || new Error("任务已取消"));
     const cwd = resolveWorkspaceDirectory(this.workspace, normalized.cwd);
     const env = mergeAllowedEnvironment(this.environment, normalized.env, this.environmentAllowlist);
@@ -79,6 +80,7 @@ export class LocalWorkspaceAdapter {
         stdio: ["ignore", "pipe", "pipe"],
       });
       const output = createOutputCollector(normalized.maxOutputChars);
+      const notifications = createOutputNotifier(onOutput);
       let settled = false;
       let timedOut = false;
       let forceKillTimer = null;
@@ -98,8 +100,14 @@ export class LocalWorkspaceAdapter {
       };
       const onAbort = () => requestTermination();
       signal?.addEventListener("abort", onAbort, { once: true });
-      child.stdout.on("data", (chunk) => output.append("stdout", chunk));
-      child.stderr.on("data", (chunk) => output.append("stderr", chunk));
+      child.stdout.on("data", (chunk) => {
+        output.append("stdout", chunk);
+        notifications.emit({ channel: "stdout", chunk: chunk.toString() });
+      });
+      child.stderr.on("data", (chunk) => {
+        output.append("stderr", chunk);
+        notifications.emit({ channel: "stderr", chunk: chunk.toString() });
+      });
       const timer = normalized.timeoutMs === null ? null : setTimeout(() => {
         timedOut = true;
         requestTermination();
@@ -117,10 +125,11 @@ export class LocalWorkspaceAdapter {
         cleanup();
         reject(new WorkspaceExecutionError(`无法启动本机执行：${error.message}`, { code: "spawn_failed" }));
       });
-      child.once("close", (exitCode, closeSignal) => {
+      child.once("close", async (exitCode, closeSignal) => {
         if (settled) return;
         settled = true;
         cleanup();
+        await notifications.drain();
         const result = {
           executionId: `local-${child.pid || "unknown"}`,
           status: exitCode === 0 ? "completed" : "failed",
@@ -179,6 +188,19 @@ function createOutputCollector(limit) {
       return Object.fromEntries(Object.keys(values).map((key) => [key, truncated[key]
         ? `${values[key]}\n…（已截断）`
         : values[key]]));
+    },
+  };
+}
+
+function createOutputNotifier(callback) {
+  let tail = Promise.resolve();
+  return {
+    emit(event) {
+      if (!callback) return;
+      tail = tail.then(() => callback(event)).catch(() => {});
+    },
+    async drain() {
+      await tail;
     },
   };
 }

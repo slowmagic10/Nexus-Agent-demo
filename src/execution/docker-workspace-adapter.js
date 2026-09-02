@@ -77,7 +77,7 @@ export class DockerWorkspaceAdapter {
     };
   }
 
-  async execute(spec, { signal } = {}) {
+  async execute(spec, { signal, onOutput } = {}) {
     const normalized = createExecutionSpec(spec);
     if (normalized.networkTargets.length) {
       throw new WorkspaceExecutionError("Docker Adapter 尚未实现精确网络目标扩展；不会静默改用 unrestricted 网络。", {
@@ -111,7 +111,7 @@ export class DockerWorkspaceAdapter {
         cwd: ".",
         timeoutMs: normalized.timeoutMs,
         maxOutputChars: normalized.maxOutputChars,
-      }), { signal });
+      }), { signal, onOutput });
       const mapped = { ...result, executionId: `docker:${containerName}` };
       if (result.exitCode !== 0) {
         throw new WorkspaceExecutionError(`Docker 容器执行失败（退出码 ${result.exitCode}）`, {

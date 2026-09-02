@@ -56,6 +56,25 @@ test("LocalWorkspaceAdapter 只向子进程暴露环境白名单", async (t) => 
   })), (error) => error.code === "execution_isolation_unavailable" && /read-only/.test(error.message));
 });
 
+test("LocalWorkspaceAdapter 按 stdout/stderr 通道发布执行中输出", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-local-exec-stream-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const adapter = new LocalWorkspaceAdapter({ workspace, environment: {} });
+  const chunks = [];
+
+  const result = await adapter.execute(createExecutionSpec({
+    program: process.execPath,
+    args: ["-e", "process.stdout.write('out\\n');process.stderr.write('err\\n')"],
+  }), {
+    onOutput: async (event) => chunks.push(event),
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(new Set(chunks.map((event) => event.channel)), new Set(["stdout", "stderr"]));
+  assert.match(chunks.map((event) => event.chunk).join(""), /out/);
+  assert.match(chunks.map((event) => event.chunk).join(""), /err/);
+});
+
 test("LocalWorkspaceAdapter 拒绝 workspace 外 cwd 和越界符号链接", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-local-exec-root-"));
   const outside = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-local-exec-outside-"));
@@ -410,6 +429,41 @@ test("run_shell 通过 WorkspaceExecution 接口执行并保留危险命令拒�
   assert.equal(calls[0].context.signal, controller.signal);
   await assert.rejects(tool.execute({ command: "sudo reboot" }, {}), /拒绝宿主提权或系统级破坏命令/);
   assert.equal(calls.length, 1);
+});
+
+test("真实 run_shell 输出经 Tool Host 形成脱敏的 Session 实时投影", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-stream-chain-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const registry = createToolRegistry({
+    workspace,
+    bundledSkills: path.join(workspace, "skills"),
+    workspaceExecution: new LocalWorkspaceAdapter({ workspace, environment: { PATH: process.env.PATH } }),
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-shell-stream-test", tools: ["run_shell"], decision: "allow" }] }),
+  });
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  let observedPreview = "";
+  session.subscribe((state) => {
+    observedPreview = state.toolStreams["shell-stream-chain"]?.preview || observedPreview;
+  });
+
+  const result = await host.execute({
+    id: "shell-stream-chain",
+    name: "run_shell",
+    arguments: { command: "printf 'step-one\\nAuthorization: Bearer private-token\\n'" },
+  }, { session });
+
+  assert.equal(result.status, "completed");
+  assert.match(observedPreview, /step-one/);
+  assert.match(observedPreview, /Bearer \[REDACTED\]/);
+  assert.doesNotMatch(observedPreview, /private-token/);
+  assert.equal(session.state.toolStreams["shell-stream-chain"], undefined);
+  assert.ok(session.state.events.some((event) => event.type === "tool.output_updated" && event.callId === "shell-stream-chain"));
 });
 
 test("可信网络扩展只在 Tool Host 审批后进入 Native ExecutionSpec", async (t) => {

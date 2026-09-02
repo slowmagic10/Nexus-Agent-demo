@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { assertArtifactStore } from "../artifacts/interface.js";
 import { beginFileChangeCapture, finishFileChangeCapture } from "../artifacts/file-change-manifest.js";
 import { redactSensitiveText } from "../security/redact.js";
+import { createToolOutputStream } from "./output-stream.js";
 import {
   consumeSessionGrant,
   createProjectGrant,
@@ -279,6 +280,16 @@ export class ToolHost {
       executionLease.release();
       throw error;
     }
+    let outputStream = createToolOutputStream({
+      call,
+      dispatch: (action) => session.dispatch(action),
+    });
+    const closeOutputStream = async () => {
+      if (!outputStream) return;
+      const current = outputStream;
+      outputStream = null;
+      await current.close();
+    };
     const started = performance.now();
     let implementationStarted = false;
     let finalizedChanges = null;
@@ -300,8 +311,10 @@ export class ToolHost {
           signal: executionSignal,
           sourceCursor,
           callId: call.id,
+          onOutput: (event) => outputStream?.append(event),
         });
       }, executionSignal);
+      await closeOutputStream();
       return await finishExecution({
         ok: true,
         status: "completed",
@@ -309,6 +322,7 @@ export class ToolHost {
         durationMs: Math.round(performance.now() - started),
       });
     } catch (error) {
+      await closeOutputStream();
       const durationMs = Math.round(performance.now() - started);
       if (signal?.aborted) {
         if (!implementationStarted) await cancelledBeforeStart(finish, call, signal, durationMs);

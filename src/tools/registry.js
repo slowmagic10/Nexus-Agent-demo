@@ -359,7 +359,7 @@ export function createToolRegistry({
       ],
     },
     parameters: objectSchema({ command: { type: "string" } }, ["command"]),
-    execute: async ({ command }, context) => executeShell(execution, policyFor(context), command, context.signal),
+    execute: async ({ command }, context) => executeShell(execution, policyFor(context), command, context.signal, context.onOutput),
   });
 
   define({
@@ -599,7 +599,7 @@ async function discoverSkills(roots) {
   return found;
 }
 
-async function executeShell(execution, accessPolicy, command, signal) {
+async function executeShell(execution, accessPolicy, command, signal, onOutput) {
   const classification = accessPolicy.classifyShell(command);
   if (classification.decision === "deny") throw new Error(classification.reason);
   const result = await execution.execute(createExecutionSpec({
@@ -612,7 +612,7 @@ async function executeShell(execution, accessPolicy, command, signal) {
       ? { env: { PATH: SAFE_READ_PATH } }
       : {}),
     maxOutputChars: 1_000_000,
-  }), { signal });
+  }), { signal, onOutput });
   const summary = result.output.trim() || "（无输出）";
   if (result.exitCode === 0) return summary;
   throw new Error(`退出码 ${result.exitCode}\n${summary}`);

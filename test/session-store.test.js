@@ -199,7 +199,7 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 14);
+    assert.equal(restored.schemaVersion, 15);
     assert.equal(restored.agentProfile.id, "legacy-default");
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
@@ -233,7 +233,7 @@ test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 14);
+  assert.equal(migrated.schemaVersion, 15);
   assert.equal(migrated.agentProfile.id, "legacy-default");
   assert.equal(migrated.toolGrants[0].usage, "single_use");
   assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
@@ -248,11 +248,23 @@ test("schema v12 升级时保留 Agent Profile 并初始化 durable summary", ()
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 14);
+  assert.equal(migrated.schemaVersion, 15);
   assert.equal(migrated.agentProfile.version, profileVersion);
   assert.equal(migrated.contextSummary, null);
   assert.equal(migrated.modelStream, null);
   assert.deepEqual(migrated.modelStreamChunks, []);
+  assert.deepEqual(migrated.toolStreams, {});
+});
+
+test("schema v14 升级时初始化 Tool Output Stream 投影", () => {
+  const state = createSession({ provider: "demo", workspace: "/tmp" });
+  state.schemaVersion = 14;
+  delete state.toolStreams;
+
+  const migrated = migrateSessionState(state);
+
+  assert.equal(migrated.schemaVersion, 15);
+  assert.deepEqual(migrated.toolStreams, {});
 });
 
 test("Gateway 恢复时保留模型部分输出并标记为 interrupted", () => {

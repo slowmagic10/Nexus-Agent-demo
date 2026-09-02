@@ -83,7 +83,7 @@ export class NativeSandboxAdapter {
     };
   }
 
-  async execute(spec, { signal } = {}) {
+  async execute(spec, { signal, onOutput } = {}) {
     const normalized = createExecutionSpec(spec);
     if (signal?.aborted) return Promise.reject(signal.reason || new Error("任务已取消"));
     let result;
@@ -111,7 +111,7 @@ export class NativeSandboxAdapter {
         env: normalized.env,
         timeoutMs: normalized.timeoutMs,
         maxOutputChars: normalized.maxOutputChars,
-      }), { signal });
+      }), { signal, onOutput });
     } catch (error) {
       if (error?.code === "spawn_failed") {
         throw new WorkspaceExecutionError("macOS sandbox-exec 不可用；不会降级到本机执行。", {

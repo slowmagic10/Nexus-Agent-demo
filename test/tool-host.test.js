@@ -113,6 +113,36 @@ test("Tool Host 将 Approval 绑定 args hash，并统一脱敏执行结果", as
   assert.ok(session.state.events.some((event) => event.type === "tool.execution_started"));
 });
 
+test("Tool Host 将执行中输出写入 durable Tool Output Stream", async () => {
+  const { host, session } = fixture({
+    name: "streaming_read",
+    description: "输出进度",
+    parameters: objectSchema({}),
+    approval: "never",
+    effects: ["read"],
+    idempotency: "safe",
+    capability: { risk: "R0", readOnly: true, resources: [{ kind: "session", access: "read" }] },
+    execute: async (_arguments, context) => {
+      await context.onOutput({ channel: "stdout", chunk: "Authorization: Bearer private-token\nprogress\n" });
+      return "done";
+    },
+  });
+  let observedPreview = "";
+  session.subscribe((state) => {
+    observedPreview = state.toolStreams["call-streaming-read"]?.preview || observedPreview;
+  });
+
+  const result = await host.execute({ id: "call-streaming-read", name: "streaming_read", arguments: {} }, { session });
+
+  assert.equal(result.status, "completed");
+  assert.equal(session.state.toolStreams["call-streaming-read"], undefined);
+  const output = session.state.events.find((event) => event.type === "tool.output_updated");
+  assert.ok(output);
+  assert.match(observedPreview, /Bearer \[REDACTED\]/);
+  assert.doesNotMatch(observedPreview, /private-token/);
+  assert.match(observedPreview, /progress/);
+});
+
 test("Approval 自动签发的 call-bound Grant 不能重放", async () => {
   let approvals = 0;
   let executions = 0;

@@ -16,6 +16,11 @@ const FILESYSTEM_MODES = new Set(["workspace-write", "read-only"]);
  * @property {readonly {host: string, port: number}[]} networkTargets
  */
 
+/**
+ * WorkspaceExecution context 可选提供 onOutput({channel, chunk})，Adapter 必须按观察顺序发布 stdout/stderr，
+ * 并在 execute settle 前等待已发布通知闭合；通知失败不能改变子进程执行结果。
+ */
+
 export function createExecutionSpec(input) {
   if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error("ExecutionSpec 必须是对象");
   const unknown = Object.keys(input).find((key) => !EXECUTION_SPEC_KEYS.has(key));

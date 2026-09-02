@@ -11,7 +11,7 @@ import {
 } from "./agent-profile.js";
 import { CONTEXT_SUMMARY_VERSION, normalizeSemanticSummary } from "./context-summary.js";
 
-export const SESSION_SCHEMA_VERSION = 14;
+export const SESSION_SCHEMA_VERSION = 15;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
 export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", agentProfile, id, createdAt }) {
@@ -44,6 +44,7 @@ export function createSession({ provider, workspace, memoryScope, permissionProf
     messages: [],
     modelStream: null,
     modelStreamChunks: [],
+    toolStreams: {},
     events: [],
     memory: [],
     contextMemory: [],
@@ -90,6 +91,7 @@ export function reduceSession(state, action) {
       next.turnStartedAt = at;
       next.modelStream = null;
       next.modelStreamChunks = [];
+      next.toolStreams = {};
       next.messages.push({ role: "user", content: action.content });
       next.objective = {
         id: `objective-${next.events.length + 1}`,
@@ -304,6 +306,18 @@ export function reduceSession(state, action) {
       });
       break;
     case "TOOL_EXECUTION_STARTED":
+      next.toolStreams ||= {};
+      next.toolStreams[action.call.id] = {
+        callId: action.call.id,
+        tool: action.call.name,
+        status: "streaming",
+        preview: "",
+        capturedChars: 0,
+        truncated: false,
+        channel: null,
+        startedAt: at,
+        updatedAt: at,
+      };
       emit("tool.execution_started", {
         callId: action.call.id,
         tool: action.call.name,
@@ -318,6 +332,27 @@ export function reduceSession(state, action) {
         grantScope: action.grantScope || null,
       });
       break;
+    case "TOOL_OUTPUT_UPDATED": {
+      const stream = next.toolStreams?.[action.callId];
+      if (!stream || stream.status !== "streaming") throw new Error(`当前没有可写入的 Tool Output Stream：${action.callId}`);
+      if (typeof action.preview !== "string" || !action.preview) throw new Error("Tool Output Stream preview 必须是非空字符串");
+      if (!Number.isSafeInteger(action.capturedChars) || action.capturedChars < 0) throw new Error("Tool Output Stream capturedChars 无效");
+      if (!["stdout", "stderr"].includes(action.channel)) throw new Error("Tool Output Stream channel 无效");
+      stream.preview = action.preview;
+      stream.capturedChars = action.capturedChars;
+      stream.truncated = action.truncated === true;
+      stream.channel = action.channel;
+      stream.updatedAt = at;
+      emit("tool.output_updated", {
+        callId: action.callId,
+        tool: action.tool || stream.tool,
+        capturedChars: action.capturedChars,
+        previewChars: action.preview.length,
+        truncated: action.truncated === true,
+        channel: action.channel,
+      });
+      break;
+    }
     case "TOOL_APPROVAL_STALE":
       emit("approval.stale", {
         callId: action.call.id,
@@ -459,6 +494,7 @@ export function reduceSession(state, action) {
       break;
     }
     case "TOOL_RESULT":
+      if (next.toolStreams) delete next.toolStreams[action.call.id];
       next.messages.push({ role: "tool", tool_call_id: action.call.id, content: action.result });
       next.phase = "thinking";
       next.metrics.toolDurationMs += action.durationMs || 0;
@@ -716,6 +752,7 @@ export function reduceSession(state, action) {
       break;
     }
     case "COMPLETED":
+      next.toolStreams = {};
       next.phase = "completed";
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
@@ -731,6 +768,7 @@ export function reduceSession(state, action) {
         });
       }
       next.phase = "failed";
+      next.toolStreams = {};
       if (next.modelStream?.status === "streaming") {
         next.modelStream.status = "failed";
         next.modelStream.updatedAt = at;
@@ -751,6 +789,7 @@ export function reduceSession(state, action) {
         });
       }
       next.phase = "cancelled";
+      next.toolStreams = {};
       if (next.modelStream?.status === "streaming") {
         next.modelStream.status = "cancelled";
         next.modelStream.updatedAt = at;
@@ -798,6 +837,7 @@ export function reduceSession(state, action) {
       next.pendingMemoryMutations ||= [];
       next.memoryMutationIssues ||= [];
       next.toolGrants ||= [];
+      next.toolStreams = {};
       next.metrics = {
         inputTokens: 0,
         outputTokens: 0,
@@ -901,6 +941,14 @@ export function migrateSessionState(state) {
     assertAgentProfileSnapshot(state.agentProfile);
     return state;
   }
+  if (state.schemaVersion === 14) {
+    assertAgentProfileSnapshot(state.agentProfile);
+    return {
+      ...state,
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      toolStreams: {},
+    };
+  }
   if (state.schemaVersion === 13) {
     assertAgentProfileSnapshot(state.agentProfile);
     return {
@@ -908,6 +956,7 @@ export function migrateSessionState(state) {
       schemaVersion: SESSION_SCHEMA_VERSION,
       modelStream: null,
       modelStreamChunks: [],
+      toolStreams: {},
     };
   }
   if (state.schemaVersion === 12) {
@@ -918,6 +967,7 @@ export function migrateSessionState(state) {
       contextSummary: state.contextSummary || null,
       modelStream: null,
       modelStreamChunks: [],
+      toolStreams: {},
     };
   }
   if ([2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(state.schemaVersion)) {
@@ -935,6 +985,7 @@ export function migrateSessionState(state) {
       contextSummary: null,
       modelStream: null,
       modelStreamChunks: [],
+      toolStreams: {},
       pendingMemoryMutations: state.pendingMemoryMutations || [],
       memoryMutationIssues: migrateMemoryMutationIssues(state.memoryMutationIssues || []),
       toolGrants: migrateToolGrants(state.toolGrants || []),
@@ -1104,6 +1155,7 @@ export function createSessionBranch(parentState, {
     contextSummary: null,
     modelStream: null,
     modelStreamChunks: [],
+    toolStreams: {},
     memoryScope: createMemoryScope({ ...parent.memoryScope, workspace }),
     pendingMemoryMutations: [],
     memoryMutationIssues: [],

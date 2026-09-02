@@ -80,9 +80,9 @@ _Avoid_: Assistant prose checklist, workflow DAG, UI-only todo list
 Parent Session 通过内置 `delegate_task` 创建一个拥有独立 Journal 的 Child Session，并只传显式 context subset、受 Parent 上限约束的子预算和单一 Objective。Parent 等待 Child 终态并通过工具结果归并；Child 的 Approval 代理到 Parent，Parent 取消会级联取消 Child。Child 不暴露 `delegate_task`，恢复时未闭合委派标记为 interrupted 且不自动重放。Child 的 durable Profile 预算也是恢复上限；有效预算取 durable Child 与当前同名 Profile 的更严格值，重启只能保持或收紧，不能扩张。
 _Avoid_: Copying parent transcript, nested delegation, hidden child approval, automatic replay after interruption
 
-**Client Projection**:
-客户端依据 durable event patch 维护的会话展示状态，不是恢复事实来源。
-_Avoid_: Source of truth, session snapshot
+**Client Session Projection**:
+浏览器对一个已选 Agent Session 的只读 durable 投影。它公开 `select / refresh / close / query` 与当前 snapshot；内部原子读取 baseline 和 cursor、按 cursor 连接 SSE、只应用连续 patch、忽略重复或过期选择/事件源，并在游标缺口或无效 patch 时重新读取 baseline。Session-scoped feature query 绑定当前 Session 与 Projection revision，同一 query key 只保留最新请求，选择、刷新或关闭会取消全部旧请求。它复用共享 State Patch Module，不拥有 DOM、Memory/Grant 等 feature data，也不是恢复事实来源。
+_Avoid_: UI-owned EventSource, browser reducer, patch without cursor, stale selection overwriting the current view, all-Web global store, source of truth
 
 **Session Checkpoint**:
 从某个 durable event cursor 派生并带校验和的恢复加速投影；它可以丢弃或重建，不能替代 session journal 的事实地位。
@@ -172,6 +172,10 @@ _Avoid_: Project grants stored in the repository, raw secret-bearing shell comma
 有副作用且非 safe 的工具在 timeout、cancel 或进程中断时无法证明是否生效的终态。它写入 durable audit，补全工具协议，并禁止自动重放。
 只有 Adapter Implementation 已经启动且结果不可证明时才进入 unknown；启动前取消属于确定未执行，补全 cancelled result。
 _Avoid_: Timeout means no side effect, automatic replay after crash
+
+**Tool Output Stream**:
+WorkspaceExecution 在运行期间发布有序的 stdout/stderr observation，Tool Host 把它收敛为有界、整行发布且先脱敏再持久化的 durable preview。Session 的 `toolStreams` 只是尚未闭合 Tool Call 的实时投影，最终 Tool Result/Artifact 仍拥有完整结果并在闭合时取代该投影；取消、超时和 `execution_unknown` 继续使用同一条工具终态链路。浏览器只消费 Session State Patch，不直接读取子进程，也不把原始 chunk 保存到客户端私有状态。
+_Avoid_: Browser-only terminal output, raw chunk per journal event, persisting incomplete credential-bearing lines, replacing final Tool Result with a live preview
 
 **Config Composition**:
 把内置默认值、workspace profile、本机私有配置、环境变量和 CLI 覆盖合成为唯一 RuntimeConfig 的 deep Module。每个 leaf 字段保留最终来源；CLI/Gateway 只消费规范化结果，inspection 永不返回原始 Secret。workspace 内 JSON 配置不能启用 MCP、切换 WorkspaceExecution 或选择 Permission Profile，只有受信任环境或显式 CLI 可以。显式 `--demo` 是最高优先级的强制离线选择：所有 Named Agent Profile 保留行为配置但删除 Provider override，Thinking 归一为 `provider-default`；同层 `--provider`/`--provider-thinking` 冲突必须拒绝。

@@ -1,4 +1,3 @@
-import { applyStatePatch } from "/state-patch.js";
 import {
   composerActionState,
   shouldCancelRun,
@@ -9,13 +8,11 @@ import { objectivePlanViewModel } from "/plan-view.js";
 import { profileDriftViewModel, providerThinkingLabel } from "/profile-view.js";
 import { artifactIdFromToolResult } from "/artifact-view.js";
 import { contextObservabilityViewModel } from "/context-view.js";
+import { createSessionProjection } from "/session-projection.js";
+import { createToolTranscriptCursor } from "/tool-transcript.js";
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
-  sessionId: null,
-  session: null,
-  cursor: 0,
-  source: null,
   runtime: null,
   selectedAgentProfileId: "default",
   selectedPermissionProfile: "workspace-auto",
@@ -58,6 +55,15 @@ const elements = {
   agentProfileSelect: $("#agent-profile-select"),
 };
 
+const sessionProjection = createSessionProjection({
+  readSession: (id) => api(`/sessions/${encodeURIComponent(id)}`),
+  eventSourceFactory: (url) => new EventSource(url),
+  onChange: ({ session }) => renderSession(session),
+  onEvent: handleSessionEvent,
+  onDisconnect: (error) => toast(error.message),
+});
+window.addEventListener("beforeunload", () => sessionProjection.close(), { once: true });
+
 applyTheme(savedTheme());
 $("#new-session").addEventListener("click", createSession);
 elements.form.addEventListener("submit", sendMessage);
@@ -91,7 +97,7 @@ elements.backdrop.addEventListener("click", closeInspector);
 $("#memory-form").addEventListener("submit", addMemory);
 document.addEventListener("keydown", (event) => {
   if (shouldCancelRun(event, {
-    phase: state.session?.phase,
+    phase: sessionProjection.phase,
     cancelling: state.cancelling,
     overlayOpen: isOverlayOpen(),
   })) {
@@ -162,7 +168,7 @@ async function loadSessions() {
 
 function sessionButton(session) {
   const button = document.createElement("button");
-  button.className = `session-item${session.id === state.sessionId ? " active" : ""}`;
+  button.className = `session-item${session.id === sessionProjection.sessionId ? " active" : ""}`;
   button.dataset.sessionId = session.id;
 
   const row = document.createElement("span");
@@ -197,12 +203,9 @@ async function createSession() {
 }
 
 async function selectSession(id) {
-  state.sessionId = id;
-  const { session, cursor } = await api(`/sessions/${encodeURIComponent(id)}`);
-  state.cursor = cursor;
-  renderSession(session);
-  connectEvents();
-  await Promise.all([
+  const selected = await sessionProjection.select(id);
+  if (!selected) return;
+  await Promise.allSettled([
     loadSessions(),
     loadGrants(),
     loadMemories(),
@@ -211,40 +214,17 @@ async function selectSession(id) {
   ]);
 }
 
-function connectEvents() {
-  state.source?.close();
-  state.source = new EventSource(`/sessions/${encodeURIComponent(state.sessionId)}/events?after=${state.cursor}`);
-  state.source.addEventListener("session_event", handleSessionEvent);
-  state.source.onerror = () => toast("事件流暂时断开，浏览器将自动重连");
-}
-
-async function handleSessionEvent(message) {
-  const event = JSON.parse(message.data);
-  if (event.cursor <= state.cursor) return;
-  if (event.baseline) {
-    state.session = event.baseline;
-  } else if (event.patch) {
-    state.session = applyStatePatch(state.session, event.patch);
-  } else {
-    const current = await api(`/sessions/${encodeURIComponent(state.sessionId)}`);
-    state.session = current.session;
-    state.cursor = current.cursor;
-    renderSession(state.session);
-    return;
-  }
-  state.cursor = event.cursor;
-  renderSession(state.session);
+async function handleSessionEvent(event) {
   if (["MEMORY_CANDIDATE_CREATED", "MEMORY_CANDIDATE_APPROVED", "MEMORY_CANDIDATE_REJECTED"].includes(event.type)) {
     await Promise.allSettled([loadCandidates(), loadMemories()]);
   }
   if (["TOOL_GRANT_ISSUED", "TOOL_GRANT_CONSUMED", "TOOL_GRANT_REVOKED", "TOOL_PROJECT_GRANT_ISSUED", "TOOL_PROJECT_GRANT_REVOKED"].includes(event.type)) {
-    await loadGrants();
+    await Promise.allSettled([loadGrants()]);
   }
   if (state.inspectorTab === "evaluation") scheduleEvaluation();
 }
 
 function renderSession(session) {
-  state.session = session;
   state.selectedPermissionProfile = session.permissionProfile || state.runtime?.permission.defaultProfile || "workspace-auto";
   const title = sessionTitle(session);
   elements.title.textContent = title;
@@ -268,6 +248,7 @@ function renderSession(session) {
     session.events,
     session.modelStream,
     session.modelStreamChunks,
+    session.toolStreams,
   );
   renderObjectivePlan(session.objective, session.plan, session.delegations);
   renderContextObservability(session);
@@ -366,15 +347,15 @@ async function applyPermissionMode(profile, { confirmed = false } = {}) {
   if (!option) return;
   option.disabled = true;
   try {
-    if (state.sessionId) {
-      const { session } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/permission-profile`, {
+    if (sessionProjection.sessionId) {
+      await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/permission-profile`, {
         method: "POST",
         body: {
           profile,
           ...(confirmed ? { confirmation: "danger-full-access" } : {}),
         },
       });
-      renderSession(session);
+      await sessionProjection.refresh();
     } else {
       state.selectedPermissionProfile = profile;
       renderPermissionControl();
@@ -411,8 +392,8 @@ async function confirmDangerFullAccess() {
 }
 
 function renderPermissionControl() {
-  const profile = state.session?.permissionProfile || state.selectedPermissionProfile;
-  const busy = ["thinking", "executing", "awaiting_approval"].includes(state.session?.phase);
+  const profile = sessionProjection.permissionProfile || state.selectedPermissionProfile;
+  const busy = ["thinking", "executing", "awaiting_approval"].includes(sessionProjection.phase);
   elements.permissionLabel.textContent = permissionLabel(profile);
   elements.permissionTrigger.classList.toggle("dangerous", profile === "danger-full-access");
   elements.permissionTrigger.disabled = !state.runtime || busy;
@@ -451,20 +432,13 @@ function updateSelectedSession(session, title) {
   item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
 }
 
-function renderMessages(messages, pendingApproval, terminalError, events = [], modelStream = null, modelStreamChunks = []) {
+function renderMessages(messages, pendingApproval, terminalError, events = [], modelStream = null, modelStreamChunks = [], toolStreams = {}) {
   if (!messages.length) {
     elements.messages.replaceChildren(createWelcome());
     return;
   }
 
-  const toolResults = new Map(
-    messages
-      .filter((message) => message.role === "tool" && message.tool_call_id)
-      .map((message) => [message.tool_call_id, message]),
-  );
-  const fileChanges = new Map(events
-    .filter((event) => event.callId && event.fileChanges)
-    .map((event) => [event.callId, event.fileChanges]));
+  const toolTranscript = createToolTranscriptCursor(messages, events);
   const rendered = [];
   let approvalRendered = false;
 
@@ -482,8 +456,15 @@ function renderMessages(messages, pendingApproval, terminalError, events = [], m
       if (message.content) body.append(renderMarkdown(message.content));
       for (const call of message.tool_calls || []) {
         const normalized = normalizeToolCall(call);
+        const transcript = toolTranscript.next(normalized.id);
         const pending = pendingApproval?.id === normalized.id ? pendingApproval : null;
-        body.append(toolCard(normalized, toolResults.get(normalized.id), pending, fileChanges.get(normalized.id)));
+        body.append(toolCard(
+          normalized,
+          transcript.result,
+          pending,
+          transcript.fileChanges,
+          toolStreams?.[normalized.id],
+        ));
         approvalRendered ||= Boolean(pending);
       }
       row.append(avatar, body);
@@ -543,7 +524,7 @@ function renderMessages(messages, pendingApproval, terminalError, events = [], m
     rendered.push(alert);
   }
 
-  if (["thinking", "executing"].includes(state.session?.phase) && !streamedText) rendered.push(thinkingIndicator());
+  if (["thinking", "executing"].includes(sessionProjection.phase) && !streamedText) rendered.push(thinkingIndicator());
   elements.messages.replaceChildren(...rendered);
   requestAnimationFrame(() => { elements.messages.scrollTop = elements.messages.scrollHeight; });
 }
@@ -731,7 +712,7 @@ function renderContextObservability(session) {
 }
 
 async function loadEvaluation() {
-  if (!state.sessionId) {
+  if (!sessionProjection.sessionId) {
     const empty = document.createElement("div");
     empty.className = "drawer-empty";
     empty.textContent = "请先选择一个任务。";
@@ -739,8 +720,12 @@ async function loadEvaluation() {
     return;
   }
   try {
-    const { evaluation } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/evaluation`, {}, { silent: true });
-    if (state.sessionId !== evaluation.sessionId) return;
+    const current = await sessionProjection.query("evaluation", (sessionId, { signal }) => (
+      api(`/sessions/${encodeURIComponent(sessionId)}/evaluation`, { signal }, { silent: true })
+    ));
+    if (!current) return;
+    const { evaluation } = current.value;
+    if (current.sessionId !== evaluation.sessionId) return;
     renderEvaluation(evaluation);
   } catch {
     const failed = document.createElement("div");
@@ -910,10 +895,10 @@ function contextMemoryRow(label, section) {
   return row;
 }
 
-function toolCard(call, result, pending, fileChanges = null) {
+function toolCard(call, result, pending, fileChanges = null, outputStream = null) {
   const details = document.createElement("details");
   details.className = `tool-card ${pending ? "approval-needed" : result ? toolResultClass(result.content) : "running"}`;
-  details.open = Boolean(pending);
+  details.open = Boolean(pending || outputStream?.preview);
 
   const summary = document.createElement("summary");
   const icon = document.createElement("span");
@@ -924,7 +909,13 @@ function toolCard(call, result, pending, fileChanges = null) {
   name.textContent = toolLabel(call.name);
   const status = document.createElement("span");
   status.className = "tool-status";
-  status.textContent = pending ? "等待批准" : result ? (toolResultClass(result.content) === "failed" ? "未完成" : "已完成") : "运行中";
+  status.textContent = pending
+    ? "等待批准"
+    : result
+      ? (toolResultClass(result.content) === "failed" ? "未完成" : "已完成")
+      : outputStream?.capturedChars
+        ? `运行中 · ${outputStream.capturedChars} 字符`
+        : "运行中";
   const chevron = document.createElement("span");
   chevron.className = "chevron";
   chevron.textContent = "⌄";
@@ -935,6 +926,15 @@ function toolCard(call, result, pending, fileChanges = null) {
   const args = document.createElement("pre");
   args.textContent = formatToolArguments(call.arguments);
   content.append(args);
+  if (!result && outputStream?.preview) {
+    const outputLabel = document.createElement("span");
+    outputLabel.className = "tool-output-label";
+    outputLabel.textContent = outputStream.truncated ? "实时输出 · 预览已满" : "实时输出";
+    const output = document.createElement("pre");
+    output.className = "tool-live-output";
+    output.textContent = outputStream.preview;
+    content.append(outputLabel, output);
+  }
   if (result) {
     const outputLabel = document.createElement("span");
     outputLabel.className = "tool-output-label";
@@ -943,7 +943,7 @@ function toolCard(call, result, pending, fileChanges = null) {
     output.textContent = result.content || "工具没有返回内容";
     content.append(outputLabel, output);
     const artifactId = artifactIdFromToolResult(result.content);
-    if (artifactId && state.sessionId) {
+    if (artifactId && sessionProjection.sessionId) {
       const load = document.createElement("button");
       load.type = "button";
       load.className = "artifact-button";
@@ -952,7 +952,7 @@ function toolCard(call, result, pending, fileChanges = null) {
         load.disabled = true;
         load.textContent = "加载中…";
         try {
-          const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/artifacts/${encodeURIComponent(artifactId)}`);
+          const payload = await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/artifacts/${encodeURIComponent(artifactId)}`);
           output.textContent = payload.artifact.content;
           load.textContent = `已加载完整输出 · ${payload.artifact.byteSize} 字节`;
         } catch (error) {
@@ -994,7 +994,7 @@ function fileChangePanel(manifest) {
     panel.append(list);
   }
 
-  if (manifest.diffArtifact?.id && state.sessionId) {
+  if (manifest.diffArtifact?.id && sessionProjection.sessionId) {
     const load = document.createElement("button");
     load.type = "button";
     load.className = "artifact-button";
@@ -1003,7 +1003,7 @@ function fileChangePanel(manifest) {
       load.disabled = true;
       load.textContent = "加载中…";
       try {
-        const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/artifacts/${encodeURIComponent(manifest.diffArtifact.id)}`);
+        const payload = await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/artifacts/${encodeURIComponent(manifest.diffArtifact.id)}`);
         const diff = document.createElement("pre");
         diff.className = "file-diff";
         diff.textContent = payload.artifact.content;
@@ -1096,7 +1096,7 @@ function renderEvents(events) {
 async function useStarter(event) {
   const button = event.target.closest("[data-prompt]");
   if (!button) return;
-  if (!state.sessionId) await createSession();
+  if (!sessionProjection.sessionId) await createSession();
   elements.input.value = button.dataset.prompt;
   elements.input.focus();
 }
@@ -1104,12 +1104,12 @@ async function useStarter(event) {
 async function sendMessage(event) {
   event.preventDefault();
   const content = elements.input.value.trim();
-  if (!content || !state.sessionId) return;
+  if (!content || !sessionProjection.sessionId) return;
   elements.input.value = "";
   elements.input.disabled = true;
   elements.composerAction.disabled = true;
   try {
-    await api(`/sessions/${encodeURIComponent(state.sessionId)}/messages`, {
+    await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/messages`, {
       method: "POST",
       body: { content },
     });
@@ -1121,7 +1121,7 @@ async function sendMessage(event) {
 }
 
 function handleComposerAction() {
-  const action = composerActionState(state.session?.phase, { cancelling: state.cancelling });
+  const action = composerActionState(sessionProjection.phase, { cancelling: state.cancelling });
   if (action.mode === "stop") {
     void cancelRun();
     return;
@@ -1132,7 +1132,7 @@ function handleComposerAction() {
 async function decide(callId, approved, scope, buttons) {
   buttons.forEach((button) => { button.disabled = true; });
   try {
-    await api(`/sessions/${encodeURIComponent(state.sessionId)}/approvals/${encodeURIComponent(callId)}`, {
+    await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/approvals/${encodeURIComponent(callId)}`, {
       method: "POST",
       body: { approved, scope },
     });
@@ -1142,12 +1142,12 @@ async function decide(callId, approved, scope, buttons) {
 }
 
 async function cancelRun() {
-  const action = composerActionState(state.session?.phase, { cancelling: state.cancelling });
-  if (!state.sessionId || action.mode !== "stop" || state.cancelling) return;
+  const action = composerActionState(sessionProjection.phase, { cancelling: state.cancelling });
+  if (!sessionProjection.sessionId || action.mode !== "stop" || state.cancelling) return;
   state.cancelling = true;
   renderComposerAction();
   try {
-    await api(`/sessions/${encodeURIComponent(state.sessionId)}/cancel`, { method: "POST", body: {} });
+    await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/cancel`, { method: "POST", body: {} });
   } catch {
     state.cancelling = false;
     renderComposerAction();
@@ -1155,9 +1155,9 @@ async function cancelRun() {
 }
 
 function renderComposerAction() {
-  const action = composerActionState(state.session?.phase, { cancelling: state.cancelling });
+  const action = composerActionState(sessionProjection.phase, { cancelling: state.cancelling });
   elements.composerAction.textContent = action.symbol;
-  elements.composerAction.disabled = !state.sessionId || action.disabled;
+  elements.composerAction.disabled = !sessionProjection.sessionId || action.disabled;
   elements.composerAction.setAttribute("aria-label", action.label);
   elements.composerAction.title = action.mode === "stop" ? "停止当前任务（Esc）" : "发送消息（Enter）";
   elements.composerAction.classList.toggle("stop-button", action.mode === "stop");
@@ -1171,24 +1171,28 @@ function isOverlayOpen() {
 }
 
 async function exportSession() {
-  const payload = await api(`/sessions/${encodeURIComponent(state.sessionId)}/export`);
+  const payload = await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/export`);
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
-  link.download = `${state.sessionId}.journal.json`;
+  link.download = `${sessionProjection.sessionId}.journal.json`;
   link.click();
   URL.revokeObjectURL(link.href);
 }
 
 async function loadMemories() {
-  if (!state.sessionId) {
+  if (!sessionProjection.sessionId) {
     const empty = document.createElement("div");
     empty.className = "drawer-empty";
     empty.textContent = "请先选择一个任务。";
     elements.memoryList.replaceChildren(empty);
     return;
   }
-  const { memories } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories`);
+  const current = await sessionProjection.query("memories", (sessionId, { signal }) => (
+    api(`/sessions/${encodeURIComponent(sessionId)}/memories`, { signal })
+  ));
+  if (!current) return;
+  const { sessionId, value: { memories } } = current;
   if (!memories.length) {
     const empty = document.createElement("div");
     empty.className = "drawer-empty";
@@ -1205,13 +1209,13 @@ async function loadMemories() {
     pin.className = "memory-pin";
     pin.textContent = memory.pinned ? "取消固定" : "固定";
     pin.addEventListener("click", async () => {
-      if (!state.sessionId) {
-        toast("请先选择一个任务再管理固定记忆");
+      if (sessionProjection.sessionId !== sessionId) {
+        toast("任务已经切换，请在当前任务中重新操作");
         return;
       }
       pin.disabled = true;
       try {
-        await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories/${encodeURIComponent(memory.id)}/pin`, {
+        await api(`/sessions/${encodeURIComponent(sessionId)}/memories/${encodeURIComponent(memory.id)}/pin`, {
           method: "POST",
           body: { pinned: !memory.pinned },
         });
@@ -1223,7 +1227,8 @@ async function loadMemories() {
     const remove = document.createElement("button");
     remove.textContent = "删除";
     remove.addEventListener("click", async () => {
-      await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories/${encodeURIComponent(memory.id)}`, { method: "DELETE" });
+      if (sessionProjection.sessionId !== sessionId) return;
+      await api(`/sessions/${encodeURIComponent(sessionId)}/memories/${encodeURIComponent(memory.id)}`, { method: "DELETE" });
       await loadMemories();
     });
     box.append(text, pin, remove);
@@ -1232,14 +1237,18 @@ async function loadMemories() {
 }
 
 async function loadCandidates() {
-  if (!state.sessionId) {
+  if (!sessionProjection.sessionId) {
     const empty = document.createElement("div");
     empty.className = "candidate-empty";
     empty.textContent = "请先选择一个任务。";
     elements.candidateList.replaceChildren(empty);
     return;
   }
-  const { candidates } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/memory-candidates`);
+  const current = await sessionProjection.query("memory-candidates", (sessionId, { signal }) => (
+    api(`/sessions/${encodeURIComponent(sessionId)}/memory-candidates`, { signal })
+  ));
+  if (!current) return;
+  const { sessionId, value: { candidates } } = current;
   if (!candidates.length) {
     const empty = document.createElement("div");
     empty.className = "candidate-empty";
@@ -1263,14 +1272,14 @@ async function loadCandidates() {
     const reject = document.createElement("button");
     reject.textContent = "忽略";
     const decideCandidate = async (action) => {
-      if (!state.sessionId) {
-        toast("请先选择一个任务再处理候选记忆");
+      if (sessionProjection.sessionId !== sessionId) {
+        toast("任务已经切换，请在当前任务中重新操作");
         return;
       }
       approve.disabled = true;
       reject.disabled = true;
       try {
-        await api(`/sessions/${encodeURIComponent(state.sessionId)}/memory-candidates/${encodeURIComponent(candidate.id)}/${action}`, {
+        await api(`/sessions/${encodeURIComponent(sessionId)}/memory-candidates/${encodeURIComponent(candidate.id)}/${action}`, {
           method: "POST",
           body: action === "reject" ? { reason: "用户在 Web UI 中忽略候选" } : {},
         });
@@ -1290,20 +1299,21 @@ async function loadCandidates() {
 
 async function addMemory(event) {
   event.preventDefault();
-  if (!state.sessionId) {
+  if (!sessionProjection.sessionId) {
     toast("请先选择一个任务再新增长期记忆");
     return;
   }
   const input = $("#memory-input");
   const content = input.value.trim();
   if (!content) return;
-  await api(`/sessions/${encodeURIComponent(state.sessionId)}/memories`, { method: "POST", body: { content, tags: [] } });
+  const sessionId = sessionProjection.sessionId;
+  await api(`/sessions/${encodeURIComponent(sessionId)}/memories`, { method: "POST", body: { content, tags: [] } });
   input.value = "";
-  await loadMemories();
+  if (sessionProjection.sessionId === sessionId) await loadMemories();
 }
 
 async function loadGrants() {
-  if (!state.sessionId) {
+  if (!sessionProjection.sessionId) {
     elements.grantCount.textContent = "0";
     elements.grantSummary.textContent = "选择任务后查看";
     const empty = document.createElement("div");
@@ -1312,11 +1322,14 @@ async function loadGrants() {
     elements.grantList.replaceChildren(empty);
     return;
   }
-  const { grants } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/grants`);
-  renderGrants(grants);
+  const current = await sessionProjection.query("grants", (sessionId, { signal }) => (
+    api(`/sessions/${encodeURIComponent(sessionId)}/grants`, { signal })
+  ));
+  if (!current) return;
+  renderGrants(current.value.grants, current.sessionId);
 }
 
-function renderGrants(grants = {}) {
+function renderGrants(grants = {}, sessionId = sessionProjection.sessionId) {
   const views = [
     ...(grants.session || []).map((grant) => grantViewModel(grant, { scope: grant.scope || (grant.callId || grant.argsHash ? "once" : "session") })),
     ...(grants.project || []).map((grant) => grantViewModel(grant, { scope: "project" })),
@@ -1330,11 +1343,11 @@ function renderGrants(grants = {}) {
     elements.grantList.replaceChildren(empty);
     return;
   }
-  elements.grantList.replaceChildren(...views.map(grantCard));
-  setGrantActionAvailability(["thinking", "executing", "awaiting_approval"].includes(state.session?.phase));
+  elements.grantList.replaceChildren(...views.map((grant) => grantCard(grant, sessionId)));
+  setGrantActionAvailability(["thinking", "executing", "awaiting_approval"].includes(sessionProjection.phase));
 }
 
-function grantCard(grant) {
+function grantCard(grant, sessionId) {
   const box = document.createElement("section");
   box.className = "grant-card";
   const head = document.createElement("div");
@@ -1389,13 +1402,15 @@ function grantCard(grant) {
     revoke.focus();
   });
   confirm.addEventListener("click", async () => {
+    if (sessionProjection.sessionId !== sessionId) return;
     for (const button of [cancel, confirm]) button.disabled = true;
     try {
-      const { grants } = await api(`/sessions/${encodeURIComponent(state.sessionId)}/grants/${encodeURIComponent(grant.id)}/revoke`, {
+      const { grants } = await api(`/sessions/${encodeURIComponent(sessionId)}/grants/${encodeURIComponent(grant.id)}/revoke`, {
         method: "POST",
         body: { scope: grant.scope, reason: "用户在 Web UI 中撤销授权" },
       });
-      renderGrants(grants);
+      if (sessionProjection.sessionId !== sessionId) return;
+      renderGrants(grants, sessionId);
       toast("授权已撤销；下次匹配操作将重新请求批准");
     } catch {
       for (const button of [cancel, confirm]) button.disabled = false;
@@ -1440,7 +1455,7 @@ function selectTab(name) {
   $("#evaluation-view").classList.toggle("hidden", name !== "evaluation");
   $("#memory-view").classList.toggle("hidden", name !== "memory");
   $("#grants-view").classList.toggle("hidden", name !== "grants");
-  if (name === "grants") void loadGrants();
+  if (name === "grants") void Promise.allSettled([loadGrants()]);
   if (name === "evaluation") void loadEvaluation();
   if (name === "memory") void Promise.allSettled([loadMemories(), loadCandidates()]);
 }
@@ -1691,6 +1706,7 @@ function eventLabel(type) {
     "tool.validation_failed": "工具参数无效",
     "tool.authorization_decided": "工具策略决策",
     "tool.execution_started": "开始执行工具",
+    "tool.output_updated": "更新工具实时输出",
     "tool.execution_unknown": "工具结果未知",
     "tool.completed": "工具完成",
     "tool.file_changes_inherited": "继承文件变更",
@@ -1738,7 +1754,7 @@ async function api(url, options = {}, { silent = false } = {}) {
   try {
     response = await fetch(url, init);
   } catch (error) {
-    if (!silent) toast("无法连接本地 Gateway");
+    if (!silent && error?.name !== "AbortError") toast("无法连接本地 Gateway");
     throw error;
   }
   const payload = await response.json();
