@@ -256,12 +256,15 @@ function parseStreamEvent(data) {
 
 function normalizeUsage(value) {
   if (!value) return null;
-  const inputTokens = value.inputTokens ?? value.input_tokens ?? 0;
-  const outputTokens = value.outputTokens ?? value.output_tokens ?? 0;
+  const reportedInput = value.inputTokens ?? value.input_tokens;
+  const reportedOutput = value.outputTokens ?? value.output_tokens;
+  if (reportedInput === undefined && reportedOutput === undefined) return null;
   return {
-    inputTokens,
-    outputTokens,
-    totalTokens: value.totalTokens ?? value.total_tokens ?? inputTokens + outputTokens,
+    ...(reportedInput === undefined ? {} : { inputTokens: reportedInput }),
+    ...(reportedOutput === undefined ? {} : { outputTokens: reportedOutput }),
+    ...(reportedInput === undefined || reportedOutput === undefined
+      ? {}
+      : { totalTokens: value.totalTokens ?? value.total_tokens ?? reportedInput + reportedOutput }),
   };
 }
 

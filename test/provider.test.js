@@ -74,6 +74,38 @@ test("OpenAI-compatible Streaming 在兼容端返回 JSON 时安全降级为单�
   assert.equal(events.at(-1).response.usage.totalTokens, 5);
 });
 
+test("OpenAI-compatible JSON fallback 缺少 usage 时保留为空以启用 Runtime 估算", async () => {
+  const provider = new OpenAICompatibleProvider({
+    apiKey: "test-key",
+    baseUrl: "https://example.com/v1",
+    model: "test-model",
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: "没有 usage", tool_calls: [] }, finish_reason: "stop" }],
+    }), { headers: { "content-type": "application/json" } }),
+  });
+
+  const events = [];
+  for await (const event of provider.stream({ systemPrompt: "system", messages: [], tools: [] })) events.push(event);
+
+  assert.equal(events.at(-1).response.usage, null);
+});
+
+test("OpenAI-compatible 保留单分量 usage 的缺失状态", async () => {
+  const provider = new OpenAICompatibleProvider({
+    apiKey: "test-key",
+    baseUrl: "https://example.com/v1",
+    model: "test-model",
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: "partial usage", tool_calls: [] }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 7 },
+    }), { headers: { "content-type": "application/json" } }),
+  });
+
+  const result = await provider.complete({ systemPrompt: "system", messages: [], tools: [] });
+
+  assert.deepEqual(result.usage, { inputTokens: 7 });
+});
+
 test("OpenAI-compatible Streaming 在 SSE 截断且没有明确终态时失败", async () => {
   const provider = new OpenAICompatibleProvider({
     apiKey: "test-key",

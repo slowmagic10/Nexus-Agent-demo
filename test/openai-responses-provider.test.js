@@ -152,6 +152,23 @@ test("OpenAI Responses Adapter 的非流式 complete 与 JSON streaming fallback
   assert.equal(requests[1].stream, true);
 });
 
+test("OpenAI Responses 保留单分量 usage 的缺失状态", async () => {
+  const provider = new OpenAIResponsesProvider({
+    apiKey: "test-key",
+    baseUrl: "https://api.openai.com/v1",
+    model: "gpt-test",
+    fetchImpl: async () => new Response(JSON.stringify({
+      status: "completed",
+      output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "partial usage" }] }],
+      usage: { output_tokens: 5 },
+    }), { headers: { "content-type": "application/json" } }),
+  });
+
+  const result = await provider.complete({ systemPrompt: "system", messages: [], tools: [] });
+
+  assert.deepEqual(result.usage, { outputTokens: 5 });
+});
+
 test("OpenAI Responses incomplete 即使携带函数调用也保留非正常终态", async () => {
   const provider = new OpenAIResponsesProvider({
     apiKey: "test-key",

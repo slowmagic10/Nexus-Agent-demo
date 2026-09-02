@@ -132,6 +132,80 @@ test("Context Lifecycle 拒绝非法 Provider Token usage，预算指标不被�
   assert.equal(session.state.events.some((event) => event.type === "model.completed"), false);
 });
 
+test("Context Lifecycle 在 Provider usage 缺少计数时回退本地估算", async () => {
+  const session = createAgentSession(withMessages([
+    { type: "USER_MESSAGE", content: "usage fallback test" },
+  ]));
+  const lifecycle = new ContextLifecycle({
+    session,
+    provider: { name: "context-test", complete: async () => ({}) },
+    systemPrompt: () => "system",
+    getTools: () => [],
+    retrieveMemory: async () => [],
+    requestModel: async () => ({
+      text: "本地估算不能为零",
+      toolCalls: [],
+      finishReason: "stop",
+      usage: {},
+    }),
+  });
+  const turn = await lifecycle.startTurn({ query: "usage fallback test", signal: new AbortController().signal });
+
+  await turn.completeModelStep();
+
+  assert.ok(session.state.metrics.inputTokens > 0);
+  assert.ok(session.state.metrics.outputTokens > 0);
+  assert.equal(
+    session.state.metrics.totalTokens,
+    session.state.metrics.inputTokens + session.state.metrics.outputTokens,
+  );
+});
+
+test("Context Lifecycle 对 Provider 部分 usage 逐分量回退本地估算", async () => {
+  for (const scenario of [
+    {
+      usage: { inputTokens: 7 },
+      assertMetrics: (metrics) => {
+        assert.equal(metrics.inputTokens, 7);
+        assert.ok(metrics.outputTokens > 0);
+      },
+    },
+    {
+      usage: { outputTokens: 5 },
+      assertMetrics: (metrics) => {
+        assert.ok(metrics.inputTokens > 0);
+        assert.equal(metrics.outputTokens, 5);
+      },
+    },
+  ]) {
+    const session = createAgentSession(withMessages([
+      { type: "USER_MESSAGE", content: "partial usage test" },
+    ]));
+    const lifecycle = new ContextLifecycle({
+      session,
+      provider: { name: "context-test", complete: async () => ({}) },
+      systemPrompt: () => "system",
+      getTools: () => [],
+      retrieveMemory: async () => [],
+      requestModel: async () => ({
+        text: "这是需要计入预算的长输出".repeat(20),
+        toolCalls: [],
+        finishReason: "stop",
+        usage: scenario.usage,
+      }),
+    });
+    const turn = await lifecycle.startTurn({ query: "partial usage test", signal: new AbortController().signal });
+
+    await turn.completeModelStep();
+
+    scenario.assertMetrics(session.state.metrics);
+    assert.equal(
+      session.state.metrics.totalTokens,
+      session.state.metrics.inputTokens + session.state.metrics.outputTokens,
+    );
+  }
+});
+
 test("Context Lifecycle 拒绝分量求和后越过安全整数的 Token usage", async () => {
   const session = createAgentSession(withMessages([
     { type: "USER_MESSAGE", content: "usage overflow test" },

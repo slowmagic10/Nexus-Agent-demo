@@ -181,12 +181,16 @@ function normalizeStreamToolCalls(toolCalls) {
 }
 
 function normalizeUsage(value) {
-  const inputTokens = value?.inputTokens ?? value?.prompt_tokens ?? 0;
-  const outputTokens = value?.outputTokens ?? value?.completion_tokens ?? 0;
+  if (!value) return null;
+  const reportedInput = value.inputTokens ?? value.prompt_tokens;
+  const reportedOutput = value.outputTokens ?? value.completion_tokens;
+  if (reportedInput === undefined && reportedOutput === undefined) return null;
   return {
-    inputTokens,
-    outputTokens,
-    totalTokens: value?.totalTokens ?? value?.total_tokens ?? inputTokens + outputTokens,
+    ...(reportedInput === undefined ? {} : { inputTokens: reportedInput }),
+    ...(reportedOutput === undefined ? {} : { outputTokens: reportedOutput }),
+    ...(reportedInput === undefined || reportedOutput === undefined
+      ? {}
+      : { totalTokens: value.totalTokens ?? value.total_tokens ?? reportedInput + reportedOutput }),
   };
 }
 

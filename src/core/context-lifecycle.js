@@ -252,18 +252,26 @@ function raceWithSignal(operation, signal) {
 }
 
 function normalizeUsage(usage, messages, text) {
+  const estimatedInputTokens = Math.ceil(JSON.stringify(messages).length / 4);
+  const estimatedOutputTokens = Math.ceil(String(text || "").length / 4);
   if (usage) {
-    const inputTokens = usage.inputTokens ?? usage.prompt_tokens ?? 0;
-    const outputTokens = usage.outputTokens ?? usage.completion_tokens ?? 0;
-    assertTokenCount(inputTokens, "inputTokens");
-    assertTokenCount(outputTokens, "outputTokens");
-    const totalTokens = inputTokens + outputTokens;
-    assertTokenCount(totalTokens, "totalTokens");
-    return { inputTokens, outputTokens, totalTokens };
+    const reportedInput = usage.inputTokens ?? usage.prompt_tokens;
+    const reportedOutput = usage.outputTokens ?? usage.completion_tokens;
+    if (reportedInput !== undefined || reportedOutput !== undefined) {
+      const inputTokens = reportedInput ?? estimatedInputTokens;
+      const outputTokens = reportedOutput ?? estimatedOutputTokens;
+      assertTokenCount(inputTokens, "inputTokens");
+      assertTokenCount(outputTokens, "outputTokens");
+      const totalTokens = inputTokens + outputTokens;
+      assertTokenCount(totalTokens, "totalTokens");
+      return { inputTokens, outputTokens, totalTokens };
+    }
   }
-  const inputTokens = Math.ceil(JSON.stringify(messages).length / 4);
-  const outputTokens = Math.ceil(String(text || "").length / 4);
-  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens };
+  return {
+    inputTokens: estimatedInputTokens,
+    outputTokens: estimatedOutputTokens,
+    totalTokens: estimatedInputTokens + estimatedOutputTokens,
+  };
 }
 
 function assertTokenCount(value, field) {
