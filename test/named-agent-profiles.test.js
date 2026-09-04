@@ -36,6 +36,35 @@ test("具名 Agent Profile 继承默认值并只公开安全摘要", () => {
   assert.match(prompt, /private review instruction/);
 });
 
+test("具名 Agent Profile 继承并可覆盖 Provider Context Window", () => {
+  const catalog = normalizeNamedAgentProfiles({
+    inherited: {
+      provider: { model: "inherited-model" },
+    },
+    million: {
+      provider: { model: "million-model", contextWindowTokens: 1_000_000 },
+    },
+  }, {
+    defaultId: "million",
+    defaultProvider: {
+      type: "openai-compatible",
+      apiKey: "local-secret",
+      baseUrl: "http://127.0.0.1:18001/v1",
+      model: "base-model",
+      thinking: "disabled",
+      contextWindowTokens: 262_144,
+    },
+  });
+
+  assert.equal(catalog.profiles.find((profile) => profile.id === "default").provider.contextWindowTokens, 262_144);
+  assert.equal(catalog.profiles.find((profile) => profile.id === "inherited").provider.contextWindowTokens, 262_144);
+  assert.equal(catalog.profiles.find((profile) => profile.id === "million").provider.contextWindowTokens, 1_000_000);
+  assert.equal(
+    inspectNamedAgentProfiles(catalog).profiles.find((profile) => profile.id === "million").provider.contextWindowTokens,
+    1_000_000,
+  );
+});
+
 test("具名 Agent Profile 拒绝危险权限、未知字段和不存在的默认项", () => {
   assert.throws(() => normalizeNamedAgentProfiles({ root: { permissionProfile: "danger-full-access" } }), /安全档位/);
   assert.throws(() => normalizeNamedAgentProfiles({ review: { provider: { unexpected: true } } }), /未知字段 unexpected/);
@@ -44,4 +73,7 @@ test("具名 Agent Profile 拒绝危险权限、未知字段和不存在的默�
   assert.throws(() => normalizeNamedAgentProfiles({ review: {
     provider: { type: "openai-responses", apiKey: "test", baseUrl: "https://example.com/v1", thinking: "enabled" },
   } }), /只支持 openai-compatible/);
+  assert.throws(() => normalizeNamedAgentProfiles({ review: {
+    provider: { contextWindowTokens: 0 },
+  } }), /contextWindowTokens.*正整数/);
 });

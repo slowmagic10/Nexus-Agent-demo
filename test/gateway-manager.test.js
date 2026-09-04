@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { normalizeNamedAgentProfiles } from "../src/core/named-agent-profiles.js";
 import { GatewaySessionManager } from "../src/gateway/session-manager.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 import {
@@ -11,6 +12,77 @@ import {
   issueSessionGrant,
 } from "../src/tools/authorization.js";
 import { ProjectGrantStore } from "../src/tools/project-grant-store.js";
+
+test("Gateway runtimeInfo 暴露当前 Model Context 预算", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-context-window-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: { name: "context-window-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "test",
+    store,
+    maxInputTokens: 1_000_000,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  assert.equal(manager.runtimeInfo().runtime.maxInputTokens, 1_000_000);
+});
+
+test("Gateway 让具名 Agent Profile 使用各自的 Model Context 预算", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-profile-context-window-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const provider = { name: "profile-context-provider", complete: async () => ({ text: "完成", toolCalls: [] }) };
+  const toolHost = { schemas: () => [], execute: async () => { throw new Error("不应执行"); } };
+  const agentProfiles = normalizeNamedAgentProfiles({
+    large: { provider: { contextWindowTokens: 1_000_000 } },
+  }, {
+    defaultProvider: {
+      type: "demo",
+      apiKey: null,
+      baseUrl: null,
+      model: "offline-demo",
+      contextWindowTokens: 32_000,
+    },
+  });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider,
+    providerDescriptor: {
+      name: provider.name,
+      adapter: "demo",
+      model: "offline-demo",
+      contextWindowTokens: 32_000,
+    },
+    agentProfiles,
+    tools: { schemas: () => [], get: () => null },
+    permissionToolHosts: { "workspace-auto": toolHost },
+    defaultPermissionProfile: "workspace-auto",
+    systemPrompt: () => "test",
+    store,
+    maxInputTokens: 32_000,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const session = await manager.create({ agentProfileId: "large" });
+  await manager.sendMessage(session.id, "只回复完成");
+  await waitFor(async () => (await manager.get(session.id)).phase === "completed");
+
+  const restored = store.load(session.id);
+  const contextPlan = restored.events.findLast((event) => event.type === "model.context_prepared");
+  assert.equal(contextPlan.maxInputTokens, 1_000_000);
+  const profile = manager.runtimeInfo().agentProfiles.profiles.find((item) => item.id === "large");
+  assert.equal(profile.maxInputTokens, 1_000_000);
+  assert.equal(profile.provider.contextWindowTokens, 1_000_000);
+});
 
 test("Gateway 可持久化安全的自定义 Session Display Title", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-title-"));

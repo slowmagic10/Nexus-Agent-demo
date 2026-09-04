@@ -1,13 +1,16 @@
 const DEFAULT_MAX_STEPS = Infinity;
 const DEFAULT_MAX_TOKENS_PER_TURN = Infinity;
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 32_000;
 const UNLIMITED_VALUES = new Set(["0", "unlimited", "infinite", "none", "无限", "不限制"]);
 
 export function readRuntimeOptions(args = [], env = {}) {
   const argument = valueArg(args, "max-steps");
   const tokenArgument = valueArg(args, "max-tokens-per-turn");
+  const contextWindowArgument = valueArg(args, "context-window-tokens");
   return {
     maxSteps: parseMaxSteps(argument ?? env.NEXUS_MAX_STEPS),
     maxTokensPerTurn: parseMaxTokensPerTurn(tokenArgument ?? env.NEXUS_MAX_TOKENS_PER_TURN),
+    maxInputTokens: parseContextWindowTokens(contextWindowArgument ?? env.NEXUS_CONTEXT_WINDOW_TOKENS),
   };
 }
 
@@ -47,6 +50,19 @@ export function parseMaxTokensPerTurn(value, fallback = DEFAULT_MAX_TOKENS_PER_T
 
 export function formatMaxTokensPerTurn(value) {
   return value === Infinity ? "不限制" : String(value);
+}
+
+export function parseContextWindowTokens(value, fallback = DEFAULT_CONTEXT_WINDOW_TOKENS) {
+  if (value === undefined || value === null || String(value).trim() === "") return fallback;
+  const normalized = String(value).trim();
+  if (!/^\d+$/.test(normalized)) {
+    throw new Error("provider.contextWindowTokens 必须是正整数");
+  }
+  const tokens = Number(normalized);
+  if (!Number.isSafeInteger(tokens) || tokens < 1) {
+    throw new Error("provider.contextWindowTokens 必须是安全的正整数");
+  }
+  return tokens;
 }
 
 function valueArg(values, name) {

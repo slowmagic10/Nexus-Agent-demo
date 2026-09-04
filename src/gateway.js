@@ -47,6 +47,7 @@ console.log(`Projects Root：${catalog.root}`);
 console.log(`默认 Workspace：${config.workspace}`);
 console.log(`单次任务步骤上限：${formatMaxSteps(config.runtime.maxSteps)}`);
 console.log(`单次任务累计 Token 预算：${config.runtime.maxTokensPerTurn === Infinity ? "不限制" : config.runtime.maxTokensPerTurn}`);
+console.log(`模型 Context Window：${config.provider.contextWindowTokens} tokens`);
 console.log(`Workspace 执行环境：${config.execution.type}`);
 console.log(`权限档位：${config.permission.profile}`);
 console.log(`默认 Agent Profile：${config.agents.defaultProfile}（共 ${config.agents.profiles.length} 个）`);
@@ -82,6 +83,11 @@ async function createProjectManager(project) {
     environment: process.env,
   });
   const { workspace, baseMemoryScope: memoryScope, agentProviders, defaultProviderBinding, store } = assembly;
+  const defaultAgentProfile = projectConfig.agents.profiles.find((profile) => profile.id === projectConfig.agents.defaultProfile);
+  const maxInputTokens = defaultAgentProfile?.provider?.contextWindowTokens
+    ?? projectConfig.runtime.maxInputTokens
+    ?? projectConfig.provider.contextWindowTokens
+    ?? 32_000;
   const enabledPermissionProfiles = ["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto"];
   if (projectConfig.execution.type === "local") enabledPermissionProfiles.push("danger-full-access");
   let projectManager = null;
@@ -111,6 +117,7 @@ async function createProjectManager(project) {
       memoryScope,
       maxSteps: projectConfig.runtime.maxSteps,
       maxTokensPerTurn: projectConfig.runtime.maxTokensPerTurn,
+      maxInputTokens,
       runtimeFactory: (options) => assembly.createAgentRuntime(options),
     });
     return {

@@ -49,11 +49,11 @@ _Avoid_: Hidden patch paths, partial preflight writes, fuzzy replacement, claimi
 _Avoid_: Full state, UI state, prompt state
 
 **Context Window Plan**:
-一次模型请求对 Model Context 的确定性成本投影；固定计算 system prompt、Skills、工具 schema 和完整 turn 成本，以配置值作为历史压缩的软目标，只选择连续的最近完整 turn，并记录包含与省略数量。估算超过目标不会阻止当前请求，真实上下文上限由 Provider 响应决定。
+一次模型请求对 Model Context 的确定性成本投影；固定计算 system prompt、Skills、工具 schema 和完整 turn 成本。`provider.contextWindowTokens` 描述当前模型声明的单请求窗口能力，默认兼容值为 32,000，可由全局或具名 Agent Profile 独立配置；它与累计 Turn Budget 不是同一个概念。Context Lifecycle 在窗口内仍执行有界工具历史投影，并在需要省略完整旧轮次时使用语义摘要与连续的最近完整 turn。估算超过目标不会阻止当前请求，若 Provider 返回真实 overflow 再收紧并重试一次。
 _Avoid_: Message slice, token truncation
 
 **Historical Tool Transcript Projection**:
-Context Lifecycle 在 Context Window Plan 之前对已完成历史 turn 生成的确定性有界投影。旧 turn 只有在整个投影确实更省 Token 时，才把完整 assistant tool call 与对应 tool result 一起改写为带工具名、参数/结果短预览的普通 assistant 历史记录，避免留下孤立 tool message。用户消息、最终回答和消息位置不变，完整参数与结果仍只存在于 Durable Session Event；每次 Model Context 计划记录版本、投影调用/结果数量及实际估算 Token 节省。它不调用模型、不修改 Journal，也不替代语义摘要或 Artifact。
+Context Lifecycle 在 Context Window Plan 之前对已完成历史 turn 生成的确定性有界投影。即使 Provider 拥有大窗口，旧 turn 也只有在整个投影确实更省 Token 时，才把完整 assistant tool call 与对应 tool result 一起改写为带工具名、参数/结果短预览的普通 assistant 历史记录，避免把低价值原始日志反复发送或留下孤立 tool message。用户消息、最终回答和消息位置不变，完整参数与结果继续保存在 Durable Session Event/Artifact；每次 Model Context 计划记录版本、投影调用/结果数量及实际估算 Token 节省。它不调用模型、不修改 Journal，也不替代语义摘要或 Artifact。
 _Avoid_: Mutating durable messages, orphan tool results, claiming character count equals token savings
 
 **Active Tool Transcript Projection**:
@@ -65,7 +65,7 @@ _Avoid_: Keeping only the last message, orphan tool results, compacting the late
 _Avoid_: Agent loop coordinating summary batches, caller-owned overflow retries, resetting tightened budget between tool rounds, pass-through context wrapper
 
 **Turn Budget**:
-一次用户任务内所有模型调用的累计 Token 成本边界，与单次请求的 Context Window Plan 和工具循环 `maxSteps` 分别配置。步骤与累计 Token 默认均为 unlimited；用户显式设置边界后，达到边界的新工具调用必须在 Adapter 启动前停止并闭合模型工具协议，最终模型回答不能因事后预算检查而丢失。
+一次用户任务内所有模型调用的累计 Token 成本边界，与单次请求的 `provider.contextWindowTokens`、Context Window Plan 和工具循环 `maxSteps` 分别配置。步骤与累计 Token 默认均为 unlimited；用户显式设置边界后，达到边界的新工具调用必须在 Adapter 启动前停止并闭合模型工具协议，最终模型回答不能因事后预算检查而丢失。扩大模型窗口不得隐式扩大累计成本边界，反之累计预算也不得伪装成模型窗口。
 _Avoid_: Hidden cap, context window equals cumulative cost, dropping a paid final response
 
 **Objective**:

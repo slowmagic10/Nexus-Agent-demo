@@ -190,6 +190,10 @@ const memoryScope = selectedAgentProfile.id === "default"
   : createMemoryScope({ ...baseMemoryScope, agentId: selectedAgentProfile.id });
 const selectedProviderBinding = agentProviders.get(selectedAgentProfile.id);
 const provider = selectedProviderBinding.provider;
+const maxInputTokens = selectedAgentProfile.provider.contextWindowTokens
+  ?? config.runtime.maxInputTokens
+  ?? config.provider.contextWindowTokens
+  ?? 32_000;
 const activated = await assembly.activate({
   defaultPermissionProfile: selectedAgentProfile.permissionProfile,
   permissionProfileNames: [selectedAgentProfile.permissionProfile],
@@ -200,6 +204,7 @@ const agentProfile = createAgentProfileSnapshot({
   id: selectedAgentProfile.id,
   provider: {
     ...selectedProviderBinding.descriptor,
+    contextWindowTokens: maxInputTokens,
   },
   workspace,
   systemPrompt,
@@ -237,6 +242,7 @@ const runtime = assembly.createAgentRuntime({
   systemPrompt,
   maxSteps: selectedAgentProfile.maxSteps,
   maxTokensPerTurn: selectedAgentProfile.maxTokensPerTurn,
+  maxInputTokens,
 });
 
 ui.render(runtime.state);

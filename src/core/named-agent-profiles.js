@@ -2,6 +2,7 @@
 import {
   formatMaxSteps,
   formatMaxTokensPerTurn,
+  parseContextWindowTokens,
   parseMaxSteps,
   parseMaxTokensPerTurn,
 } from "../runtime-options.js";
@@ -27,6 +28,7 @@ export function normalizeNamedAgentProfiles(raw, {
     apiKey: null,
     baseUrl: null,
     model: "offline-demo",
+    contextWindowTokens: 32_000,
   },
 } = {}) {
   if (raw !== undefined && (!raw || typeof raw !== "object" || Array.isArray(raw))) {
@@ -76,6 +78,7 @@ export function inspectNamedAgentProfiles(catalog) {
         baseUrl: profile.provider.baseUrl,
         apiKey: profile.provider.apiKey ? "[REDACTED]" : null,
         thinking: profile.provider.thinking,
+        contextWindowTokens: profile.provider.contextWindowTokens,
       },
     })),
   };
@@ -127,7 +130,7 @@ function normalizeProvider(value, fallback, profileId) {
     throw new Error(`Agent Profile ${profileId}.provider 必须是对象`);
   }
   const override = value || {};
-  assertKnownKeys(override, new Set(["type", "apiKey", "baseUrl", "model", "thinking"]), `Agent Profile ${profileId}.provider`);
+  assertKnownKeys(override, new Set(["type", "apiKey", "baseUrl", "model", "thinking", "contextWindowTokens"]), `Agent Profile ${profileId}.provider`);
   let type = override.type ?? fallback.type;
   if (!PROVIDER_TYPES.has(type)) {
     throw new Error(`Agent Profile ${profileId}.provider.type 必须是 auto、demo、openai-compatible 或 openai-responses`);
@@ -140,6 +143,10 @@ function normalizeProvider(value, fallback, profileId) {
     baseUrl: override.baseUrl ?? fallback.baseUrl ?? null,
     model: override.model ?? fallback.model,
     thinking: override.thinking ?? (changedAdapter ? "provider-default" : fallback.thinking) ?? "provider-default",
+    contextWindowTokens: parseContextWindowTokens(
+      override.contextWindowTokens,
+      fallback.contextWindowTokens ?? 32_000,
+    ),
   };
   if (!PROVIDER_THINKING_MODES.has(provider.thinking)) {
     throw new Error(`Agent Profile ${profileId}.provider.thinking 必须是 provider-default、enabled 或 disabled`);
@@ -154,6 +161,7 @@ function normalizeProvider(value, fallback, profileId) {
       baseUrl: null,
       model: "offline-demo",
       thinking: "provider-default",
+      contextWindowTokens: provider.contextWindowTokens,
     });
   }
   if (provider.apiKey !== null && typeof provider.apiKey !== "string") {

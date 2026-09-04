@@ -4,6 +4,7 @@ import path from "node:path";
 import { createMemoryScope } from "../memory/scope.js";
 
 export const AGENT_PROFILE_SCHEMA_VERSION = 1;
+const DEFAULT_CONTEXT_WINDOW_TOKENS = 32_000;
 
 export function createAgentProfileSnapshot({
   id = "default",
@@ -96,6 +97,14 @@ export function compareAgentProfileSnapshots(previousProfile, currentProfile) {
   compareScalar(changes, "provider.model", "provider", "high", previous.provider.model, current.provider.model);
   compareScalar(
     changes,
+    "provider.contextWindowTokens",
+    "provider",
+    "medium",
+    previous.provider.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+    current.provider.contextWindowTokens ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+  );
+  compareScalar(
+    changes,
     "provider.thinking",
     "provider",
     "high",
@@ -133,11 +142,20 @@ function normalizeProvider(provider) {
     name,
     adapter: normalizeText(source.adapter || source.type || "unknown", "Agent Profile provider.adapter"),
     model: normalizeText(source.model || name, "Agent Profile provider.model"),
+    contextWindowTokens: normalizeContextWindowTokens(source.contextWindowTokens),
     thinking: normalizeProviderThinking(source.thinking),
     endpointHash: source.endpointHash == null && source.baseUrl == null
       ? null
       : normalizeEndpointHash(source.endpointHash || hashValue(String(source.baseUrl))),
   };
+}
+
+function normalizeContextWindowTokens(value) {
+  if (value === undefined || value === null) return DEFAULT_CONTEXT_WINDOW_TOKENS;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("Agent Profile provider.contextWindowTokens 必须是正整数");
+  }
+  return value;
 }
 
 function normalizeProviderThinking(value) {

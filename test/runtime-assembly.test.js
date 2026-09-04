@@ -86,3 +86,49 @@ test("Runtime Assembly 统一创建 Tool graph、AgentRuntime 和资源生命周
   await assembly.close();
   assert.deepEqual(activated.capabilityRuntime.list(), []);
 });
+
+test("Runtime Assembly 将配置的 Model Context 预算写入 durable Context Plan", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-runtime-assembly-context-window-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const composed = await composeRuntimeConfig({
+    root,
+    env: {},
+    args: ["--demo", `--workspace=${workspace}`, "--execution=local"],
+  });
+  const config = {
+    ...composed,
+    runtime: {
+      ...composed.runtime,
+      maxInputTokens: 1_000_000,
+    },
+  };
+  const assembly = await createRuntimeAssembly({
+    config,
+    bundledSkills: path.join(root, "skills"),
+    environment: { NEXUS_USER_DATA_DIR: path.join(workspace, "user-data") },
+  });
+  t.after(() => assembly.close());
+  const activated = await assembly.activate();
+  const provider = assembly.defaultProviderBinding.provider;
+  const state = createSession({
+    provider: provider.name,
+    workspace,
+    memoryScope: assembly.baseMemoryScope,
+    permissionProfile: "workspace-auto",
+  });
+  const session = new AgentSession({ state, reducer: reduceSession, journal: assembly.store });
+  const runtime = assembly.createAgentRuntime({
+    session,
+    provider,
+    toolHost: activated.toolHost,
+    systemPrompt: activated.systemPrompt,
+    maxSteps: 2,
+    maxTokensPerTurn: Infinity,
+  });
+
+  await runtime.runTurn("只回复一句完成");
+
+  const restored = assembly.store.load(session.id);
+  const contextPlan = restored.events.findLast((event) => event.type === "model.context_prepared");
+  assert.equal(contextPlan.maxInputTokens, 1_000_000);
+});

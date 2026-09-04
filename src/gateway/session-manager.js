@@ -60,9 +60,10 @@ const PERMISSION_MODE_INFO = Object.freeze([
     dangerous: true,
   }),
 ]);
+const DEFAULT_MAX_INPUT_TOKENS = 32_000;
 
 export class GatewaySessionManager {
-  constructor({ workspace, provider, providerDescriptor, agentProfile, agentProfiles, agentProviders, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, artifactStore = store?.artifacts, memoryScope, maxSteps, maxTokensPerTurn, memoryFlushPolicy, runtimeFactory = null }) {
+  constructor({ workspace, provider, providerDescriptor, agentProfile, agentProfiles, agentProviders, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, artifactStore = store?.artifacts, memoryScope, maxSteps, maxTokensPerTurn, maxInputTokens, memoryFlushPolicy, runtimeFactory = null }) {
     this.workspace = workspace;
     this.provider = provider;
     this.systemPrompt = systemPrompt;
@@ -89,6 +90,12 @@ export class GatewaySessionManager {
     this.executionInfo = executionInfo;
     this.maxSteps = maxSteps ?? Infinity;
     this.maxTokensPerTurn = maxTokensPerTurn ?? Infinity;
+    this.maxInputTokens = normalizeMaxInputTokens(
+      maxInputTokens
+      ?? agentProfile?.provider?.contextWindowTokens
+      ?? providerDescriptor?.contextWindowTokens
+      ?? DEFAULT_MAX_INPUT_TOKENS,
+    );
     if (runtimeFactory !== null && typeof runtimeFactory !== "function") {
       throw new Error("Gateway Session Manager runtimeFactory 必须是函数或 null");
     }
@@ -112,6 +119,7 @@ export class GatewaySessionManager {
       memoryScope: this.defaultMemoryScope,
       maxSteps: this.maxSteps,
       maxTokensPerTurn: this.maxTokensPerTurn,
+      maxInputTokens: this.maxInputTokens,
     });
     this.defaultAgentProfileId = runtimeProfiles.defaultProfile;
     this.agentProfiles = new Map(runtimeProfiles.profiles.map((profile) => [profile.id, profile]));
@@ -201,6 +209,7 @@ export class GatewaySessionManager {
       runtime: {
         maxSteps: this.maxSteps === Infinity ? "unlimited" : this.maxSteps,
         maxTokensPerTurn: this.maxTokensPerTurn === Infinity ? "unlimited" : this.maxTokensPerTurn,
+        maxInputTokens: this.agentProfiles.get(this.defaultAgentProfileId)?.maxInputTokens ?? this.maxInputTokens,
       },
       agentProfile: {
         id: profile.id,
@@ -219,6 +228,7 @@ export class GatewaySessionManager {
             permissionProfile: item.permissionProfile,
             maxSteps: durableLimit(item.maxSteps),
             maxTokensPerTurn: durableLimit(item.maxTokensPerTurn),
+            maxInputTokens: item.maxInputTokens,
             provider: snapshot.provider,
             version: snapshot.version,
           };
@@ -713,6 +723,7 @@ export class GatewaySessionManager {
       memoryFlushPolicy: runtimeProfile.memoryFlushPolicy,
       maxSteps,
       maxTokensPerTurn,
+      maxInputTokens: runtimeProfile.maxInputTokens,
     };
     entry.runtime = this.runtimeFactory
       ? this.runtimeFactory(runtimeOptions)
@@ -899,6 +910,7 @@ function createRuntimeAgentProfiles({
   memoryScope,
   maxSteps,
   maxTokensPerTurn,
+  maxInputTokens,
 }) {
   if (snapshot) {
     const fixed = assertAgentProfileSnapshot(snapshot);
@@ -911,6 +923,7 @@ function createRuntimeAgentProfiles({
         permissionProfile: fixed.permission.defaultProfile,
         maxSteps: runtimeLimit(fixed.budgets.maxSteps),
         maxTokensPerTurn: runtimeLimit(fixed.budgets.maxTokensPerTurn),
+        maxInputTokens: normalizeMaxInputTokens(fixed.provider.contextWindowTokens ?? maxInputTokens),
         memoryScope: fixed.memoryScope,
         systemPrompt,
         provider: providerClient,
@@ -953,11 +966,20 @@ function createRuntimeAgentProfiles({
     if (!binding?.provider || typeof binding.provider.complete !== "function") {
       throw new Error(`Agent Profile ${definition.id} 缺少可用 Provider`);
     }
-    const descriptor = binding.descriptor || {
+    const baseDescriptor = binding.descriptor || {
       name: binding.provider.name,
       adapter: binding.provider.constructor?.name || "unknown",
       model: binding.provider.model || binding.provider.name,
       baseUrl: binding.provider.baseUrl || null,
+    };
+    const profileMaxInputTokens = normalizeMaxInputTokens(
+      definition.provider?.contextWindowTokens
+      ?? baseDescriptor.contextWindowTokens
+      ?? maxInputTokens,
+    );
+    const descriptor = {
+      ...baseDescriptor,
+      contextWindowTokens: profileMaxInputTokens,
     };
     const snapshotFactory = () => createAgentProfileSnapshot({
       id: definition.id,
@@ -980,6 +1002,7 @@ function createRuntimeAgentProfiles({
       permissionProfile: profilePermission,
       maxSteps: profileMaxSteps,
       maxTokensPerTurn: profileMaxTokens,
+      maxInputTokens: profileMaxInputTokens,
       memoryScope: profileMemoryScope,
       systemPrompt: profileSystemPrompt,
       provider: binding.provider,
@@ -988,6 +1011,13 @@ function createRuntimeAgentProfiles({
     };
   });
   return { defaultProfile, profiles };
+}
+
+function normalizeMaxInputTokens(value) {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("Gateway Model Context maxInputTokens 必须是正整数");
+  }
+  return value;
 }
 
 function runtimeLimit(value) {

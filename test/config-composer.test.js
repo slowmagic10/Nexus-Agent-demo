@@ -16,6 +16,7 @@ test("Config Composition 默认生成可运行的 Demo 配置", async () => {
   assert.equal(config.workspace, "/tmp");
   assert.equal(config.provider.type, "demo");
   assert.equal(config.provider.model, "gpt-4.1-mini");
+  assert.equal(config.provider.contextWindowTokens, 32_000);
   assert.equal(config.runtime.maxSteps, Infinity);
   assert.equal(config.runtime.maxTokensPerTurn, Infinity);
   assert.deepEqual(config.execution, { type: "native", dockerImage: null });
@@ -24,6 +25,66 @@ test("Config Composition 默认生成可运行的 Demo 配置", async () => {
   assert.equal(config.gateway.port, 4317);
   assert.equal(config.sources["provider.type"], "derived:default");
   assert.equal(createConfiguredProvider(config).name, "offline-demo");
+});
+
+test("Provider Context Window 支持 JSON、环境变量与 CLI 的确定优先级", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-context-window-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
+    provider: { contextWindowTokens: 131_072 },
+  }), "utf8");
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    provider: { contextWindowTokens: 262_144 },
+  }), "utf8");
+
+  const fromEnvironment = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_CONTEXT_WINDOW_TOKENS: "1000000" },
+  });
+  assert.equal(fromEnvironment.provider.contextWindowTokens, 1_000_000);
+  assert.equal(fromEnvironment.sources["provider.contextWindowTokens"], "environment");
+  assert.ok(fromEnvironment.agents.profiles.every((profile) => profile.provider.contextWindowTokens === 1_000_000));
+  assert.equal(inspectRuntimeConfig(fromEnvironment).provider.contextWindowTokens, 1_000_000);
+
+  const fromCli = await composeRuntimeConfig({
+    root: workspace,
+    env: { NEXUS_CONTEXT_WINDOW_TOKENS: "1000000" },
+    args: ["--context-window-tokens=900000"],
+  });
+  assert.equal(fromCli.provider.contextWindowTokens, 900_000);
+  assert.equal(fromCli.sources["provider.contextWindowTokens"], "cli");
+
+  const fromLocalJson = await composeRuntimeConfig({ root: workspace, env: {} });
+  assert.equal(fromLocalJson.provider.contextWindowTokens, 262_144);
+  assert.equal(fromLocalJson.sources["provider.contextWindowTokens"], "local_private");
+
+  await fs.rm(path.join(workspace, ".nexus", "config.local.json"));
+  const fromWorkspaceJson = await composeRuntimeConfig({ root: workspace, env: {} });
+  assert.equal(fromWorkspaceJson.provider.contextWindowTokens, 131_072);
+  assert.equal(fromWorkspaceJson.sources["provider.contextWindowTokens"], "workspace_profile");
+});
+
+test("Provider Context Window 非法配置会在启动前失败", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-context-window-invalid-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
+    provider: { contextWindowTokens: 0 },
+  }), "utf8");
+
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: {} }),
+    /contextWindowTokens.*正整数/,
+  );
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), "{}", "utf8");
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: { NEXUS_CONTEXT_WINDOW_TOKENS: "-1" } }),
+    /contextWindowTokens.*正整数/,
+  );
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: {}, args: ["--context-window-tokens=1.5"] }),
+    /contextWindowTokens.*正整数/,
+  );
 });
 
 test("CLI/Gateway 可启用独立 Projects Root 作为默认 Workspace", async () => {

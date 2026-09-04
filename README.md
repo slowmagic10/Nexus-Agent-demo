@@ -43,11 +43,14 @@ Nexus 不绑定特定模型厂商。仓库提供通用的 `.env.local.example`�
 OPENAI_API_KEY=你的API密钥
 OPENAI_BASE_URL=https://api.deepseek.com
 OPENAI_MODEL=deepseek-v4-flash
+NEXUS_CONTEXT_WINDOW_TOKENS=32000
 NEXUS_PROVIDER_THINKING=disabled
 NEXUS_MAX_STEPS=unlimited
 ```
 
 `NEXUS_PROVIDER_THINKING` 支持 `provider-default / enabled / disabled`。`provider-default` 不向服务端发送思考开关，保持 Provider 自身默认行为；[DeepSeek 当前文档](https://api-docs.deepseek.com/guides/thinking_mode/)说明思考默认启用且默认 effort 为 high，因此本地连续工具任务优先使用 `disabled`，复杂分析 Profile 可显式使用 `enabled`。该开关只对 OpenAI-compatible Adapter 生效；原生 Responses Adapter 若收到显式开关会在启动时拒绝配置，而不会静默忽略。CLI 也可使用 `--provider-thinking=disabled`。
+
+`NEXUS_CONTEXT_WINDOW_TOKENS` 声明当前模型真实支持的 Context Window，默认值为 `32000`，CLI 可用 `--context-window-tokens=1000000` 临时覆盖。该值不是累计任务 Token 限制：Nexus 仍会持续精简已闭合的旧工具记录、使用 Artifact 引用，并在接近窗口时组合语义摘要与最近完整轮次。当前本地 vLLM 若在 `/v1/models` 中报告 `max_model_len=1000000`，应将这里设置为 `1000000`，避免仍按历史默认值提前规划上下文。
 
 `--demo` 是强制离线模式：它会把 Thinking 重置为 `provider-default`，并忽略所有具名 Profile 的真实 Provider 覆盖，但保留 Profile 的指令、权限和预算。`--demo` 不能与显式 `--provider` 或 `--provider-thinking` 同时使用；环境文件中的真实 Provider 配置不会妨碍 Demo 启动。
 
@@ -78,7 +81,7 @@ npm run gateway:local
 
 单次任务的模型/工具循环次数与累计 Token 默认都不限制，Agent 会持续运行到模型确认完成、遇到阻塞、需要审批/用户输入或用户主动取消。会话中的用户消息轮次本身也没有总数限制。
 
-如果需要主动设置成本边界，可通过 `NEXUS_MAX_STEPS=20` / `--max-steps=20` 限制循环次数，通过 `NEXUS_MAX_TOKENS_PER_TURN=500000` / `--max-tokens-per-turn=500000` 限制累计 Token；`unlimited` 或 `0` 恢复为不限制。模型自身单次 Context Window、审批、取消和沙箱边界仍然生效。`run_shell` 默认不设置自动 deadline；需要上限时由模型或调用方显式传入 `timeout_ms`，其他工具自己的 deadline 不受影响。
+如果需要主动设置成本边界，可通过 `NEXUS_MAX_STEPS=20` / `--max-steps=20` 限制循环次数，通过 `NEXUS_MAX_TOKENS_PER_TURN=500000` / `--max-tokens-per-turn=500000` 限制累计 Token；`unlimited` 或 `0` 恢复为不限制。这两项与 `NEXUS_CONTEXT_WINDOW_TOKENS` 相互独立：前者控制一次任务的累计成本，后者描述单次模型请求的窗口能力。审批、取消和沙箱边界仍然生效。`run_shell` 默认不设置自动 deadline；需要上限时由模型或调用方显式传入 `timeout_ms`，其他工具自己的 deadline 不受影响。
 
 `run_shell` 是前台工具调用：省略 `timeout_ms` 时会持续等待命令退出，并通过现有 durable output stream 展示进度；例如 `{ "command": "npm test", "timeout_ms": 1800000 }` 可设置 30 分钟上限。无自动 deadline 不等于后台任务，用户仍可随时点击停止或按 `Esc`，取消会终止整个执行进程树并留下可恢复的终态记录。
 
@@ -93,7 +96,8 @@ Nexus 应用目录的 `.nexus/config.local.json` 还可以定义具名 Agent Pro
     "apiKey": "你的本机密钥",
     "baseUrl": "https://api.deepseek.com",
     "model": "deepseek-v4-flash",
-    "thinking": "disabled"
+    "thinking": "disabled",
+    "contextWindowTokens": 32000
   },
   "agents": {
     "default": "coding",
@@ -112,14 +116,14 @@ Nexus 应用目录的 `.nexus/config.local.json` 还可以定义具名 Agent Pro
         "permissionProfile": "read-only",
         "maxSteps": 20,
         "maxTokensPerTurn": 50000,
-        "provider": { "model": "deepseek-reasoner", "thinking": "enabled" }
+        "provider": { "model": "deepseek-reasoner", "thinking": "enabled", "contextWindowTokens": 65536 }
       }
     }
   }
 }
 ```
 
-Web 左侧的“新任务 Agent”用于显式选择；CLI 可使用 `--agent-profile=review` 或 `NEXUS_AGENT_PROFILE=review`。每个 Profile 的 `provider` 可覆盖 `type/apiKey/baseUrl/model/thinking`，未填写字段继承最终全局 Provider 配置，因此同一个 DeepSeek Key 通常只需配置一次。Profile 选择只在创建新 Session 时生效，恢复会话继续使用其 durable Profile；如果配置中已删除该 Profile，恢复会明确失败而不会静默换 Agent。`thinking` 会进入 durable Agent Profile Snapshot，恢复时的变化可在 Web 配置漂移中看到。`--print-config` 会脱敏所有 API Key，也不会打印指令正文。当前不根据任务内容自动选模型，不做 active turn 热切换、Provider fallback 或模型名/Endpoint 猜测。
+Web 左侧的“新任务 Agent”用于显式选择；CLI 可使用 `--agent-profile=review` 或 `NEXUS_AGENT_PROFILE=review`。每个 Profile 的 `provider` 可覆盖 `type/apiKey/baseUrl/model/thinking/contextWindowTokens`，未填写字段继承最终全局 Provider 配置，因此同一个 DeepSeek Key 通常只需配置一次。Profile 选择只在创建新 Session 时生效，恢复会话继续使用其 durable Profile；如果配置中已删除该 Profile，恢复会明确失败而不会静默换 Agent。`thinking` 与 `contextWindowTokens` 都会进入 durable Agent Profile Snapshot，恢复时的变化可在 Web 配置漂移中看到。`--print-config` 会脱敏所有 API Key，也不会打印指令正文。当前不根据任务内容自动选模型，不做 active turn 热切换、Provider fallback 或模型名/Endpoint 猜测。
 
 可用下面的命令查看最终生效配置及每个字段的来源；API Key 只会显示为 `[REDACTED]`：
 
@@ -187,7 +191,7 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 - Artifact：长 Shell、MCP、文件读取等成功或失败工具输出在 Tool Host 统一脱敏后保存到 Session 专属 SQLite Artifact Store，消息只保留预览和引用；模型可用 `read_artifact` 分段读取，Web 工具卡可加载完整输出。Portable Journal 可携带 Artifact，Import 与 Branch 会复制到目标 Session scope，运行时仍禁止直接跨 Session 访问。
 - 精确编辑：`edit_file` 通过唯一旧文本完成单文件局部替换；`apply_patch` 用一个结构化批次新增、精确更新或删除多个文件，同一路径可按顺序执行多个 update。批次先校验全部目标、权限、匹配次数和大小，再开始写入；符号链接别名造成的重复真实目标会拒绝，预检失败不修改文件，提交失败会回滚已经尝试的文件。它是进程内文件级补偿回滚，不承诺主机崩溃时的事务原子性。
 - 文件变更：`write_file`、`edit_file`、`apply_patch` 与 `run_shell` 执行后生成有界 File Change Manifest；Journal 保存新增/修改/删除摘要和哈希，脱敏文本 Diff 保存为 Artifact，Web 工具卡可按需查看。工作区内符号链接写入会追踪真实目标，Shell 创建、改指向或删除链接会记录链接变化。`.git/.nexus/node_modules/.env*` 不参与内容采集，超限会明确显示为不完整。
-- 模型上下文：Context Lifecycle deep Module 从 durable event 投影消息、记忆与 Skills，并在每个用户 turn 内统一管理历史/活动工具投影、Memory retrieval、窗口规划、语义摘要、模型审计与 overflow replan；Agent Loop 不再编排这些细节。已完成旧 turn 的工具协议会成对改写为有界历史记录；长任务的当前 turn 始终逐字保留最近两个完整工具轮，只在确实节省 Token 时精简更早、已经闭合的工具轮。完整内容继续保存在 Journal，用户目标、普通正文和最近 Observation 不变。默认把 32,000 estimated input tokens 作为历史压缩的软目标，超出时优先生成带覆盖位置的滚动结构化语义摘要，并与连续的最近完整 turn 一起进入模型；当前 turn 或固定上下文即使估算超出目标也会继续发送，不会被本地估算阻断。摘要失败会降级为 recent-turn 策略，原始 Journal 永不删除。每个最终 Provider 请求都计算确定性的 SHA-256 `contextHash`，durable audit 分开记录历史与活动工具投影节省和规划元数据，不复制 System Prompt、消息或工具正文。若 Provider 明确返回 Context overflow，Lifecycle 会进一步缩减完整旧 turn 并自动重试一次，且在本 turn 后续工具轮继续沿用收紧后的压缩目标；认证、限流、网络和普通模型错误不会进入该重试路径。
+- 模型上下文：Context Lifecycle deep Module 从 durable event 投影消息、记忆与 Skills，并在每个用户 turn 内统一管理历史/活动工具投影、Memory retrieval、窗口规划、语义摘要、模型审计与 overflow replan；Agent Loop 不再编排这些细节。Context Window 默认兼容值为 32,000，并可按 Provider 或具名 Profile 通过 `contextWindowTokens` 配置；当前本地 vLLM 配置为 1,000,000。窗口变大不等于停止优化：已完成旧 turn 的工具协议仍会成对改写为有界历史记录，长任务当前 turn 始终逐字保留最近两个完整工具轮，只在确实节省 Token 时精简更早、已经闭合的工具轮；完整内容继续保存在 Journal/Artifact，用户目标、普通正文和最近 Observation 不变。需要省略完整旧轮次时，Lifecycle 优先生成带覆盖位置的滚动结构化语义摘要，并与连续的最近完整 turn 一起进入模型；当前 turn 或固定上下文即使本地估算超过目标也会继续发送，不会被估算值直接截停。摘要失败会降级为 recent-turn 策略，原始 Journal 永不删除。每个最终 Provider 请求都计算确定性的 SHA-256 `contextHash`，durable audit 分开记录历史与活动工具投影节省和规划元数据，不复制 System Prompt、消息或工具正文。若 Provider 明确返回 Context overflow，Lifecycle 会进一步缩减完整旧 turn 并自动重试一次，且在本 turn 后续工具轮继续沿用收紧后的目标；认证、限流、网络和普通模型错误不会进入该重试路径。
 - 长期记忆：Pinned 与 Relevant Memory 按 Session scope 独立检索和预算，固定记忆优先进入 Context；两类都按不可信事实数据处理，不会提升为策略指令。Web 记忆面板的列表、新增、删除、固定、候选列表与候选处理全部绑定当前 Session/Profile 的 Memory Scope，不会落入默认 Agent 的全局 scope；固定状态经 durable outbox 修改并保留 Session 审计。
 - 工具安全：`read-only` 提供不可被 Policy/Grant/Approval 提升的只读闭环；`workspace-auto` 自动执行普通工作区写入与沙箱内常规 Shell；工作区删除、动态解释器、网络/安装/Git 写入审批并支持 Session Grant；秘密、宿主逃逸和系统破坏硬拒绝；工具支持可选 deadline 与取消信号，`run_shell` 默认无自动 deadline，可用 `timeout_ms` 显式限制。
 - Workspace 与 Skills：读取 `AGENTS.md`、`SOUL.md`，按需加载 `.nexus/skills/*/SKILL.md`。

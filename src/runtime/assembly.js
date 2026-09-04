@@ -171,6 +171,9 @@ class RuntimeAssembly {
     memoryFlushPolicy = null,
     maxSteps,
     maxTokensPerTurn,
+    maxInputTokens = this.config.runtime.maxInputTokens
+      ?? this.config.provider.contextWindowTokens
+      ?? 32_000,
   } = {}) {
     this.#assertOpen();
     if (!this.#activation) throw new Error("Runtime Assembly 尚未激活");
@@ -198,6 +201,7 @@ class RuntimeAssembly {
       flushMemory: (input) => flushPolicy.flush(input),
       maxSteps,
       maxTokensPerTurn,
+      maxInputTokens,
     });
   }
 

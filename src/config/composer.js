@@ -8,6 +8,7 @@ import { OpenAIResponsesProvider } from "../providers/openai-responses.js";
 import {
   formatMaxSteps,
   formatMaxTokensPerTurn,
+  parseContextWindowTokens,
   parseMaxSteps,
   parseMaxTokensPerTurn,
 } from "../runtime-options.js";
@@ -65,6 +66,7 @@ export async function composeRuntimeConfig({
     "provider.baseUrl": "https://api.openai.com/v1",
     "provider.model": "gpt-4.1-mini",
     "provider.thinking": "provider-default",
+    "provider.contextWindowTokens": 32_000,
     "runtime.maxSteps": Infinity,
     "runtime.maxTokensPerTurn": Infinity,
     "execution.type": "native",
@@ -102,6 +104,7 @@ export async function composeRuntimeConfig({
         baseUrl: values["provider.baseUrl"],
         model: values["provider.model"],
         thinking: values["provider.thinking"],
+        contextWindowTokens: values["provider.contextWindowTokens"],
       },
     },
   );
@@ -118,10 +121,12 @@ export async function composeRuntimeConfig({
       baseUrl: values["provider.baseUrl"],
       model: values["provider.model"],
       thinking: values["provider.thinking"],
+      contextWindowTokens: values["provider.contextWindowTokens"],
     },
     runtime: {
       maxSteps: values["runtime.maxSteps"],
       maxTokensPerTurn: values["runtime.maxTokensPerTurn"],
+      maxInputTokens: values["provider.contextWindowTokens"],
     },
     execution: {
       type: values["execution.type"],
@@ -172,7 +177,13 @@ function createProvider(provider) {
 
 function providerDescriptor(provider) {
   if (provider.type === "demo") {
-    return { name: "offline-demo", adapter: "demo", model: "offline-demo", baseUrl: null };
+    return {
+      name: "offline-demo",
+      adapter: "demo",
+      model: "offline-demo",
+      baseUrl: null,
+      contextWindowTokens: provider.contextWindowTokens,
+    };
   }
   return {
     name: `${provider.type}/${provider.model}`,
@@ -180,6 +191,7 @@ function providerDescriptor(provider) {
     model: provider.model,
     baseUrl: provider.baseUrl,
     thinking: provider.thinking,
+    contextWindowTokens: provider.contextWindowTokens,
   };
 }
 
@@ -193,10 +205,12 @@ export function inspectRuntimeConfig(config) {
       baseUrl: config.provider.baseUrl,
       model: config.provider.model,
       thinking: config.provider.thinking,
+      contextWindowTokens: config.provider.contextWindowTokens,
     },
     runtime: {
       maxSteps: formatMaxSteps(config.runtime.maxSteps),
       maxTokensPerTurn: formatMaxTokensPerTurn(config.runtime.maxTokensPerTurn),
+      maxInputTokens: config.runtime.maxInputTokens,
     },
     execution: { ...config.execution },
     permission: { ...config.permission },
@@ -222,7 +236,7 @@ async function readConfigFile(file, { label, allowApiKey, allowProviderEndpoint 
   const values = {};
   if (payload.provider !== undefined) {
     assertObject(payload.provider, `${label}.provider`);
-    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model", "thinking"]), `${label}.provider`);
+    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model", "thinking", "contextWindowTokens"]), `${label}.provider`);
     if (payload.provider.apiKey !== undefined && !allowApiKey) {
       throw new Error(`${label} 不允许保存 provider.apiKey；请使用 .env.local 或 Nexus 应用目录的 .nexus/config.local.json`);
     }
@@ -234,6 +248,7 @@ async function readConfigFile(file, { label, allowApiKey, allowProviderEndpoint 
     copyDefined(values, "provider.baseUrl", payload.provider.baseUrl);
     copyDefined(values, "provider.model", payload.provider.model);
     copyDefined(values, "provider.thinking", payload.provider.thinking);
+    copyDefined(values, "provider.contextWindowTokens", payload.provider.contextWindowTokens);
   }
   if (payload.runtime !== undefined) {
     assertObject(payload.runtime, `${label}.runtime`);
@@ -271,6 +286,7 @@ function applyEnvironment(values, sources, env, localEnvironment) {
     OPENAI_BASE_URL: "provider.baseUrl",
     OPENAI_MODEL: "provider.model",
     NEXUS_PROVIDER_THINKING: "provider.thinking",
+    NEXUS_CONTEXT_WINDOW_TOKENS: "provider.contextWindowTokens",
     NEXUS_MAX_STEPS: "runtime.maxSteps",
     NEXUS_MAX_TOKENS_PER_TURN: "runtime.maxTokensPerTurn",
     NEXUS_EXECUTION: "execution.type",
@@ -300,6 +316,7 @@ function applyCli(values, sources, args) {
     provider: "provider.type",
     model: "provider.model",
     "provider-thinking": "provider.thinking",
+    "context-window-tokens": "provider.contextWindowTokens",
     "base-url": "provider.baseUrl",
     "max-steps": "runtime.maxSteps",
     "max-tokens-per-turn": "runtime.maxTokensPerTurn",
@@ -352,6 +369,7 @@ function validateValues(values) {
   if (!PROVIDER_THINKING_MODES.has(values["provider.thinking"])) {
     throw new Error("provider.thinking 必须是 provider-default、enabled 或 disabled");
   }
+  values["provider.contextWindowTokens"] = parseContextWindowTokens(values["provider.contextWindowTokens"]);
   values["runtime.maxSteps"] = parseMaxSteps(values["runtime.maxSteps"]);
   values["runtime.maxTokensPerTurn"] = parseMaxTokensPerTurn(values["runtime.maxTokensPerTurn"]);
   if (!EXECUTION_TYPES.has(values["execution.type"])) throw new Error("execution.type 必须是 native、local 或 docker");
