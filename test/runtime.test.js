@@ -541,13 +541,13 @@ test("语义摘要失败时记录 degraded 并继续使用最近完整 turn", as
   assert.match(degraded.error, /summary provider unavailable/);
 });
 
-test("当前 turn 超预算时运行时 fail closed 且不调用模型", async () => {
+test("当前 turn 超过本地估算目标时仍调用 Provider", async () => {
   let calls = 0;
   const runtime = createRuntime({
     provider: {
       complete: async () => {
         calls += 1;
-        return { text: "不应调用", toolCalls: [] };
+        return { text: "由 Provider 正常完成", toolCalls: [] };
       },
     },
     maxInputTokens: 60,
@@ -555,10 +555,11 @@ test("当前 turn 超预算时运行时 fail closed 且不调用模型", async (
 
   await runtime.runTurn("X".repeat(1_000), async () => false);
 
-  assert.equal(calls, 0);
-  assert.equal(runtime.state.phase, "failed");
-  assert.match(runtime.state.lastError, /当前 turn.*超过 Model Context 预算 60/);
-  assert.equal(runtime.state.metrics.modelCalls, 0);
+  assert.equal(calls, 1);
+  assert.equal(runtime.state.phase, "completed");
+  assert.equal(runtime.state.metrics.modelCalls, 1);
+  const plan = runtime.state.events.find((event) => event.type === "model.context_prepared");
+  assert.equal(plan.estimatedOverTarget, true);
 });
 
 test("取消会中止模型请求并进入 cancelled", async () => {

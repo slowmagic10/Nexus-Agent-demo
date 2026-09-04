@@ -348,10 +348,49 @@ test("有副作用工具超时后记录 execution_unknown 且不悬挂", async (
   assert.equal(result.ok, false);
   assert.equal(result.status, "execution_unknown");
   assert.match(result.result, /超时.*未知/);
-  assert.ok(session.state.events.some((event) => (
+  const unknown = session.state.events.find((event) => (
     event.type === "tool.execution_unknown" && event.callId === "call-timeout"
-  )));
+  ));
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "call-timeout"
+  ));
+  assert.equal(unknown.effectiveTimeoutMs, 5);
+  assert.equal(unknown.terminationReason, "timeout");
+  assert.equal(completed.effectiveTimeoutMs, 5);
+  assert.equal(completed.terminationReason, "timeout");
   assert.equal(session.state.messages.at(-1).tool_call_id, "call-timeout");
+});
+
+test("null deadline 下 Adapter 的 timeout code 不会伪装成显式期限到达", async () => {
+  const { host, session } = fixture({
+    name: "adapter_transport_timeout",
+    description: "无自动期限的 Adapter 传输失败",
+    parameters: objectSchema({}),
+    approval: "never",
+    effects: ["execute"],
+    idempotency: "unknown",
+    deadline: {
+      defaultMs: null,
+      argument: null,
+      maximumMs: 2_147_483_647,
+      enforcement: "adapter",
+      hostGraceMs: 50,
+    },
+    execute: async () => {
+      const error = new Error("upstream transport timed out");
+      error.code = "timeout";
+      throw error;
+    },
+  }, { policy: new WorkspacePolicy({ rules: [{ id: "allow-adapter-timeout", tools: ["adapter_transport_timeout"], decision: "allow" }] }) });
+
+  const result = await host.execute({ id: "call-null-timeout", name: "adapter_transport_timeout", arguments: {} }, { session });
+
+  assert.equal(result.status, "external_failed");
+  assert.equal(result.terminationReason, "external_failed");
+  assert.doesNotMatch(result.result, /nullms/);
+  assert.equal(session.state.events.some((event) => (
+    event.type === "tool.execution_unknown" && event.callId === "call-null-timeout"
+  )), false);
 });
 
 test("执行中的有副作用工具被取消后仍记录实际工具耗时", async () => {
@@ -418,6 +457,11 @@ test("Tool Host 收到预取消信号时不会启动有副作用工具", async (
   assert.equal(session.state.events.some((event) => event.type === "tool.execution_unknown"), false);
   assert.equal(session.state.messages.at(-1).tool_call_id, "call-pre-cancelled");
   assert.match(session.state.messages.at(-1).content, /取消.*尚未启动/);
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "call-pre-cancelled"
+  ));
+  assert.equal(completed.effectiveTimeoutMs, 30_000);
+  assert.equal(completed.terminationReason, "cancelled");
 });
 
 test("Approval 后参数变化会失效且不会执行", async () => {

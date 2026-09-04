@@ -10,8 +10,9 @@ import {
   deriveAgentProfileSnapshot,
 } from "./agent-profile.js";
 import { CONTEXT_SUMMARY_VERSION, normalizeSemanticSummary } from "./context-summary.js";
+import { deriveSessionDisplayTitle, normalizeSessionDisplayTitle } from "./session-display-title.js";
 
-export const SESSION_SCHEMA_VERSION = 15;
+export const SESSION_SCHEMA_VERSION = 16;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
 export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", agentProfile, id, createdAt }) {
@@ -38,6 +39,7 @@ export function createSession({ provider, workspace, memoryScope, permissionProf
     agentProfile: resolvedProfile,
     permissionProfile,
     memoryScope: resolvedMemoryScope,
+    displayTitle: null,
     objective: null,
     plan: null,
     delegations: [],
@@ -93,6 +95,7 @@ export function reduceSession(state, action) {
       next.modelStreamChunks = [];
       next.toolStreams = {};
       next.messages.push({ role: "user", content: action.content });
+      next.displayTitle ||= deriveSessionDisplayTitle(next.messages);
       next.objective = {
         id: `objective-${next.events.length + 1}`,
         text: redactSensitiveValue(typeof action.objective === "string" && action.objective.trim() ? action.objective.trim() : action.content),
@@ -104,6 +107,15 @@ export function reduceSession(state, action) {
       emit("objective.created", { objectiveId: next.objective.id, preview: next.objective.text.slice(0, 160) });
       emit("message.user", { preview: action.content.slice(0, 120) });
       break;
+    case "SESSION_DISPLAY_TITLE_CHANGED": {
+      if (action.title !== null && typeof action.title !== "string") {
+        throw new Error("Session Display Title 必须是字符串或 null");
+      }
+      next.displayTitle = normalizeSessionDisplayTitle(action.title)
+        || deriveSessionDisplayTitle(next.messages);
+      emit("session.display_title_changed", { title: next.displayTitle });
+      break;
+    }
     case "MODEL_REQUESTED":
       next.phase = "thinking";
       next.step += 1;
@@ -309,6 +321,8 @@ export function reduceSession(state, action) {
         capturedChars: 0,
         truncated: false,
         channel: null,
+        ...(Object.hasOwn(action, "effectiveTimeoutMs") ? { effectiveTimeoutMs: action.effectiveTimeoutMs } : {}),
+        ...(Object.hasOwn(action, "deadlineAt") ? { deadlineAt: action.deadlineAt } : {}),
         startedAt: at,
         updatedAt: at,
       };
@@ -324,6 +338,8 @@ export function reduceSession(state, action) {
         capabilityHash: action.capabilityHash || null,
         grantId: action.grantId || null,
         grantScope: action.grantScope || null,
+        ...(Object.hasOwn(action, "effectiveTimeoutMs") ? { effectiveTimeoutMs: action.effectiveTimeoutMs } : {}),
+        ...(Object.hasOwn(action, "deadlineAt") ? { deadlineAt: action.deadlineAt } : {}),
       });
       break;
     case "TOOL_OUTPUT_UPDATED": {
@@ -377,6 +393,8 @@ export function reduceSession(state, action) {
         adapter: action.adapter,
         reason: action.reason,
         durationMs: action.durationMs || 0,
+        ...(Object.hasOwn(action, "effectiveTimeoutMs") ? { effectiveTimeoutMs: action.effectiveTimeoutMs } : {}),
+        ...(Object.hasOwn(action, "terminationReason") ? { terminationReason: action.terminationReason } : {}),
       });
       break;
     case "APPROVAL_REQUESTED":
@@ -498,6 +516,8 @@ export function reduceSession(state, action) {
         ok: action.ok,
         status: action.status || (action.ok ? "completed" : "failed"),
         durationMs: action.durationMs || 0,
+        ...(Object.hasOwn(action, "effectiveTimeoutMs") ? { effectiveTimeoutMs: action.effectiveTimeoutMs } : {}),
+        ...(Object.hasOwn(action, "terminationReason") ? { terminationReason: action.terminationReason } : {}),
         preview: action.result.slice(0, 160),
         ...(action.artifact ? { artifact: action.artifact } : {}),
         ...(action.fileChanges ? { fileChanges: action.fileChanges } : {}),
@@ -849,13 +869,30 @@ export function reduceSession(state, action) {
       const previousPhase = next.phase;
       const discardedApproval = next.pendingApproval?.name || null;
       const unresolvedCalls = findUnresolvedToolCalls(next.messages);
-      for (const call of unresolvedCalls) {
-        const wasPending = call.id === next.pendingApproval?.id;
-        if (!wasPending) {
+      const toolCallExecutionStates = findToolCallExecutionStates(next.messages, next.events);
+      const pendingCallIndex = next.pendingApproval?.id
+        ? unresolvedCalls.findIndex((call) => call.id === next.pendingApproval.id)
+        : -1;
+      for (const [callIndex, call] of unresolvedCalls.entries()) {
+        const wasPending = callIndex === pendingCallIndex;
+        const executionState = toolCallExecutionStates.get(toolCallOccurrenceKey(call));
+        const wasStarted = executionState?.started === true;
+        const alreadyUnknown = Boolean(executionState?.unknownEvent);
+        if (!wasPending && wasStarted && !alreadyUnknown) {
           emit("tool.execution_unknown", {
             callId: call.id,
             tool: call.name,
             reason: "process_interrupted",
+            messageIndex: call.messageIndex,
+            callOrdinal: call.callOrdinal,
+          });
+        } else if (!wasPending && !alreadyUnknown) {
+          emit("tool.recovery_cancelled", {
+            callId: call.id,
+            tool: call.name,
+            reason: "process_interrupted_before_start",
+            messageIndex: call.messageIndex,
+            callOrdinal: call.callOrdinal,
           });
         }
         next.messages.push({
@@ -863,7 +900,11 @@ export function reduceSession(state, action) {
           tool_call_id: call.id,
           content: wasPending
             ? "会话恢复：该工具调用尚未获得审批，已取消且未执行。"
-            : "会话恢复：该工具调用在进程中断时没有结果，执行状态未知，出于安全考虑不会自动重放。",
+            : alreadyUnknown
+              ? "会话恢复：该工具调用此前已记录结果未知，现已补全工具协议且不会自动重放。"
+            : wasStarted
+              ? "会话恢复：该工具调用在进程中断时没有结果，执行状态未知，出于安全考虑不会自动重放。"
+              : "会话恢复：该工具调用尚未开始执行，已取消且不会自动重放。",
         });
       }
       const reboundProfile = action.agentProfile
@@ -933,13 +974,26 @@ export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
   if (state.schemaVersion === SESSION_SCHEMA_VERSION) {
     assertAgentProfileSnapshot(state.agentProfile);
-    return state;
+    return {
+      ...state,
+      displayTitle: normalizeSessionDisplayTitle(state.displayTitle)
+        || deriveSessionDisplayTitle(state.messages),
+    };
+  }
+  if (state.schemaVersion === 15) {
+    assertAgentProfileSnapshot(state.agentProfile);
+    return {
+      ...state,
+      schemaVersion: SESSION_SCHEMA_VERSION,
+      displayTitle: deriveSessionDisplayTitle(state.messages),
+    };
   }
   if (state.schemaVersion === 14) {
     assertAgentProfileSnapshot(state.agentProfile);
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
+      displayTitle: deriveSessionDisplayTitle(state.messages),
       toolStreams: {},
     };
   }
@@ -948,6 +1002,7 @@ export function migrateSessionState(state) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
+      displayTitle: deriveSessionDisplayTitle(state.messages),
       modelStream: null,
       modelStreamChunks: [],
       toolStreams: {},
@@ -958,6 +1013,7 @@ export function migrateSessionState(state) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
+      displayTitle: deriveSessionDisplayTitle(state.messages),
       contextSummary: state.contextSummary || null,
       modelStream: null,
       modelStreamChunks: [],
@@ -969,6 +1025,7 @@ export function migrateSessionState(state) {
     return {
       ...state,
       schemaVersion: SESSION_SCHEMA_VERSION,
+      displayTitle: deriveSessionDisplayTitle(state.messages),
       lineage: state.lineage || null,
       permissionProfile: state.permissionProfile || "workspace-auto",
       memoryScope: migratedMemoryScope,
@@ -1108,10 +1165,47 @@ export function createSessionBranch(parentState, {
     profileReason: "session_branch",
     at: branchedAt,
   });
+  const existingUnknownRecovery = [...findToolCallExecutionStates(parent.messages, parent.events).values()]
+    .filter((executionState) => executionState.unknownEvent && !executionState.occurrence.resolved)
+    .map((executionState) => ({
+      ...executionState.unknownEvent,
+      messageIndex: executionState.occurrence.messageIndex,
+      callOrdinal: executionState.occurrence.callOrdinal,
+    }));
+  const recoveryKeys = new Set();
+  const inheritedToolRecovery = [
+    ...existingUnknownRecovery,
+    ...reconciled.events
+      .slice(parent.events.length)
+      .filter((event) => ["tool.execution_unknown", "tool.recovery_cancelled"].includes(event.type)),
+  ]
+    .filter((event) => {
+      const key = `${event.type}:${event.callId}:${event.messageIndex}:${event.callOrdinal}`;
+      if (recoveryKeys.has(key)) return false;
+      recoveryKeys.add(key);
+      return true;
+    })
+    .map((event, index) => ({
+      seq: index + 2,
+      at: branchedAt,
+      type: event.type,
+      callId: event.callId,
+      tool: event.tool || null,
+      reason: event.reason || (event.type === "tool.execution_unknown"
+        ? "process_interrupted"
+        : "process_interrupted_before_start"),
+      ...(Object.hasOwn(event, "effectiveTimeoutMs") ? { effectiveTimeoutMs: event.effectiveTimeoutMs } : {}),
+      ...(Object.hasOwn(event, "terminationReason") ? { terminationReason: event.terminationReason } : {}),
+      messageIndex: event.messageIndex,
+      callOrdinal: event.callOrdinal,
+      inherited: true,
+      parentSessionId: parent.id,
+      parentCursor,
+    }));
   const inheritedFileChanges = parent.events
     .filter((event) => event.callId && event.fileChanges)
     .map((event, index) => ({
-      seq: index + 2,
+      seq: inheritedToolRecovery.length + index + 2,
       at: branchedAt,
       type: "tool.file_changes_inherited",
       callId: event.callId,
@@ -1143,6 +1237,7 @@ export function createSessionBranch(parentState, {
         parentSessionId: parent.id,
         parentCursor,
       },
+      ...inheritedToolRecovery,
       ...inheritedFileChanges,
     ],
     contextMemory: [],
@@ -1191,15 +1286,98 @@ function assertProfileSessionBinding(profile, { provider, workspace, memoryScope
 }
 
 function findUnresolvedToolCalls(messages) {
-  const completed = new Set(
-    messages.filter((message) => message.role === "tool").map((message) => message.tool_call_id),
-  );
-  return messages.flatMap((message) => {
-    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) return [];
-    return message.tool_calls
-      .filter((call) => call.id && !completed.has(call.id))
-      .map((call) => ({ id: call.id, name: call.function?.name || "unknown" }));
-  });
+  return collectToolCallOccurrences(messages)
+    .filter((occurrence) => !occurrence.resolved)
+    .map(({ resolved: _resolved, ...occurrence }) => occurrence);
+}
+
+function collectToolCallOccurrences(messages) {
+  const occurrences = [];
+  for (const [messageIndex, message] of messages.entries()) {
+    if (message?.role === "assistant" && Array.isArray(message.tool_calls)) {
+      for (const [callOrdinal, call] of message.tool_calls.entries()) {
+        if (!call?.id) continue;
+        occurrences.push({
+          id: call.id,
+          name: call.name || call.function?.name || "unknown",
+          messageIndex,
+          callOrdinal,
+          resolved: false,
+        });
+      }
+      continue;
+    }
+    if (message?.role !== "tool" || !message.tool_call_id) continue;
+    const occurrence = occurrences.find((candidate) => (
+      !candidate.resolved && candidate.id === message.tool_call_id
+    ));
+    if (occurrence) occurrence.resolved = true;
+  }
+  return occurrences;
+}
+
+function findToolCallExecutionStates(messages, events) {
+  const occurrences = collectToolCallOccurrences(messages).map((occurrence) => ({
+    ...occurrence,
+    requested: false,
+  }));
+  const runs = [];
+  for (const event of events || []) {
+    if (event?.type === "tool.requested") {
+      const occurrence = findToolOccurrence(occurrences, event);
+      if (!occurrence) continue;
+      occurrence.requested = true;
+      runs.push({ occurrence, started: false, unknownEvent: null, closed: false });
+      continue;
+    }
+    if (!event?.callId || ![
+      "tool.execution_started",
+      "tool.execution_unknown",
+      "tool.completed",
+    ].includes(event.type)) continue;
+    const run = findToolRuntimeRun(runs, event);
+    if (!run) continue;
+    if (event.type === "tool.execution_started") run.started = true;
+    if (event.type === "tool.execution_unknown") run.unknownEvent = event;
+    if (["tool.execution_unknown", "tool.completed"].includes(event.type)) run.closed = true;
+  }
+  return new Map(runs.map((run) => [toolCallOccurrenceKey(run.occurrence), {
+    occurrence: run.occurrence,
+    started: run.started,
+    unknownEvent: run.unknownEvent,
+  }]));
+}
+
+function findToolOccurrence(occurrences, event) {
+  if (Number.isSafeInteger(event.messageIndex) && Number.isSafeInteger(event.callOrdinal)) {
+    return occurrences.find((occurrence) => (
+      !occurrence.requested
+      && occurrence.id === event.callId
+      && occurrence.messageIndex === event.messageIndex
+      && occurrence.callOrdinal === event.callOrdinal
+    )) || null;
+  }
+  return occurrences.find((occurrence) => (
+    !occurrence.requested
+    && occurrence.id === event.callId
+    && (!event.tool || occurrence.name === event.tool)
+  )) || occurrences.find((occurrence) => !occurrence.requested && occurrence.id === event.callId) || null;
+}
+
+function findToolRuntimeRun(runs, event) {
+  const open = [...runs].reverse().filter((run) => !run.closed);
+  if (Number.isSafeInteger(event.messageIndex) && Number.isSafeInteger(event.callOrdinal)) {
+    return open.find((run) => (
+      run.occurrence.id === event.callId
+      && run.occurrence.messageIndex === event.messageIndex
+      && run.occurrence.callOrdinal === event.callOrdinal
+    )) || null;
+  }
+  return open.find((run) => run.occurrence.id === event.callId) || null;
+}
+
+function toolCallOccurrenceKey(call) {
+  return `${call.messageIndex}:${call.callOrdinal}`;
 }
 
 function elapsedSince(value, at) {

@@ -18,6 +18,7 @@ test("预算充足时 Model Context 保持完整且不添加压缩标记", () =>
   assert.deepEqual(request.messages, context.messages);
   assert.equal(request.systemPrompt, "系统提示");
   assert.equal(request.contextPlan.compacted, false);
+  assert.equal(request.contextPlan.estimatedOverTarget, false);
   assert.equal(request.contextPlan.omittedMessages, 0);
   assert.ok(request.contextPlan.estimatedInputTokens <= request.contextPlan.maxInputTokens);
   assert.match(request.contextPlan.contextHash, /^sha256:[a-f0-9]{64}$/);
@@ -53,6 +54,7 @@ test("超预算时只保留连续的最近完整 turn，不拆散工具协议", 
     contextHashVersion: "model-request-sha256-v1",
     estimatorVersion: "utf8-bytes-div3-v1",
     maxInputTokens: 180,
+    estimatedOverTarget: false,
     estimatedInputTokens: request.contextPlan.estimatedInputTokens,
     fixedTokens: request.contextPlan.fixedTokens,
     messageTokens: request.contextPlan.messageTokens,
@@ -337,30 +339,32 @@ test("活动 turn 含不透明 Provider 状态时保持完整工具协议而不�
   assert.equal(request.contextPlan.activeToolProjection.compactedRounds, 0);
 });
 
-test("当前 turn 自身超过预算时明确失败而不是截断协议", () => {
+test("当前 turn 超过估算目标时保持完整并交由 Provider 决定", () => {
   const context = createContext([{ role: "user", content: "B".repeat(2_000) }]);
 
-  assert.throws(
-    () => prepareModelRequest(context, {
-      systemPrompt: () => "系统提示",
-      tools: [],
-      maxInputTokens: 100,
-    }),
-    /当前 turn.*超过 Model Context 预算 100/,
-  );
+  const request = prepareModelRequest(context, {
+    systemPrompt: () => "系统提示",
+    tools: [],
+    maxInputTokens: 100,
+  });
+
+  assert.deepEqual(request.messages, context.messages);
+  assert.equal(request.contextPlan.estimatedOverTarget, true);
+  assert.ok(request.contextPlan.estimatedInputTokens > request.contextPlan.maxInputTokens);
 });
 
-test("system prompt 与工具 schema 固定成本超过预算时明确失败", () => {
+test("固定上下文超过估算目标时仍构造完整请求", () => {
   const context = createContext([{ role: "user", content: "任务" }]);
 
-  assert.throws(
-    () => prepareModelRequest(context, {
-      systemPrompt: () => "S".repeat(2_000),
-      tools: [{ type: "function", function: { name: "tool", description: "T".repeat(2_000) } }],
-      maxInputTokens: 100,
-    }),
-    /固定上下文.*超过 Model Context 预算 100/,
-  );
+  const request = prepareModelRequest(context, {
+    systemPrompt: () => "S".repeat(2_000),
+    tools: [{ type: "function", function: { name: "tool", description: "T".repeat(2_000) } }],
+    maxInputTokens: 100,
+  });
+
+  assert.deepEqual(request.messages, context.messages);
+  assert.equal(request.contextPlan.estimatedOverTarget, true);
+  assert.ok(request.contextPlan.fixedTokens > request.contextPlan.maxInputTokens);
 });
 
 test("Context Window Plan 记录长期记忆命中来源但不复制正文", () => {

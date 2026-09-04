@@ -131,9 +131,13 @@ test("LocalWorkspaceAdapter 支持独立超时和 AbortSignal 取消", async (t)
 
   await assert.rejects(adapter.execute(createExecutionSpec({
     program: process.execPath,
-    args: ["-e", "setInterval(()=>{},1000)"],
-    timeoutMs: 30,
-  })), (error) => error.code === "timeout" && /执行超时/.test(error.message));
+    args: ["-e", "console.log('TIMEOUT-OUTPUT-TAIL');setInterval(()=>{},1000)"],
+    timeoutMs: 500,
+  })), (error) => (
+    error.code === "timeout"
+    && /执行超时/.test(error.message)
+    && /TIMEOUT-OUTPUT-TAIL/.test(error.result?.output || "")
+  ));
 
   const controller = new AbortController();
   controller.abort(new Error("cancel-before-spawn"));
@@ -141,6 +145,24 @@ test("LocalWorkspaceAdapter 支持独立超时和 AbortSignal 取消", async (t)
     program: process.execPath,
     args: ["-e", "console.log('must-not-run')"],
   }), { signal: controller.signal }), /cancel-before-spawn/);
+
+  let markOutput;
+  const receivedOutput = new Promise((resolve) => { markOutput = resolve; });
+  const runningController = new AbortController();
+  const running = adapter.execute(createExecutionSpec({
+    program: process.execPath,
+    args: ["-e", "console.log('CANCEL-OUTPUT-TAIL');setInterval(()=>{},1000)"],
+  }), {
+    signal: runningController.signal,
+    onOutput: () => markOutput(),
+  });
+  await receivedOutput;
+  runningController.abort(new Error("cancel-running"));
+  await assert.rejects(running, (error) => (
+    error.code === "cancelled"
+    && /cancel-running/.test(error.message)
+    && /CANCEL-OUTPUT-TAIL/.test(error.result?.output || "")
+  ));
 });
 
 test("LocalWorkspaceAdapter 超时会终止完整进程组", async (t) => {
@@ -547,17 +569,166 @@ test("可信网络扩展只在 Tool Host 审批后进入 Native ExecutionSpec", 
   assert.equal(grant.consumedAt, null);
 });
 
-test("run_shell 经 WorkspaceExecution 超时后保持 execution_unknown 语义", async (t) => {
-  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-timeout-chain-"));
+test("run_shell 默认不设 deadline，不受 Tool Host 默认超时影响", { concurrency: false }, async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-no-deadline-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const specs = [];
+  const registry = createToolRegistry({
+    workspace,
+    bundledSkills: path.join(workspace, "skills"),
+    workspaceExecution: {
+      id: "delayed-success",
+      execute: async (spec) => {
+        specs.push(spec);
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { exitCode: 0, stdout: "done", stderr: "", output: "done", durationMs: 30 };
+      },
+    },
+  });
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    defaultTimeoutMs: 5,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-shell-no-deadline", tools: ["run_shell"], decision: "allow" }] }),
+  });
+
+  // 把隐藏的 Tool Host deadline 压缩到 5ms，使回归无需真实等待旧版 15 秒。
+  const originalTimeout = AbortSignal.timeout;
+  AbortSignal.timeout = (milliseconds) => originalTimeout(Math.min(milliseconds, 5));
+  try {
+    const result = await host.execute({
+      id: "shell-no-deadline",
+      name: "run_shell",
+      arguments: { command: "npm test" },
+    }, { session });
+
+    assert.equal(result.status, "completed");
+    assert.equal(specs.length, 1);
+    assert.equal(specs[0].timeoutMs, null);
+    const started = session.state.events.find((event) => (
+      event.type === "tool.execution_started" && event.callId === "shell-no-deadline"
+    ));
+    assert.equal(started.effectiveTimeoutMs, null);
+    assert.equal(started.deadlineAt, null);
+  } finally {
+    AbortSignal.timeout = originalTimeout;
+  }
+});
+
+test("run_shell timeout_ms schema 只接受 1 到 2147483647 的整数", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-timeout-schema-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
   let executions = 0;
   const registry = createToolRegistry({
     workspace,
     bundledSkills: path.join(workspace, "skills"),
-    shellTimeoutMs: 5,
     workspaceExecution: {
-      id: "ignores-abort",
-      execute: async () => { executions += 1; return await new Promise(() => {}); },
+      id: "schema-probe",
+      execute: async () => {
+        executions += 1;
+        return { exitCode: 0, stdout: "", stderr: "", output: "", durationMs: 0 };
+      },
+    },
+  });
+  const schema = registry.schemas().find((candidate) => candidate.function.name === "run_shell").function.parameters;
+  assert.equal(schema.properties.timeout_ms.type, "integer");
+  assert.equal(schema.properties.timeout_ms.minimum, 1);
+  assert.equal(schema.properties.timeout_ms.maximum, 2_147_483_647);
+  assert.equal(typeof schema.properties.timeout_ms.description, "string");
+  assert.deepEqual(schema.required, ["command"]);
+
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-shell-timeout-schema", tools: ["run_shell"], decision: "allow" }] }),
+  });
+  for (const [id, timeoutMs, message] of [
+    ["zero", 0, /不能小于 1/],
+    ["fraction", 1.5, /必须是 整数/],
+    ["too-large", 2_147_483_648, /不能大于 2147483647/],
+  ]) {
+    const result = await host.execute({
+      id: `shell-timeout-${id}`,
+      name: "run_shell",
+      arguments: { command: "pwd", timeout_ms: timeoutMs },
+    }, { session });
+    assert.equal(result.status, "validation_failed");
+    assert.match(result.result, message);
+  }
+  assert.equal(executions, 0);
+});
+
+test("run_shell 把显式 timeout_ms 传入 WorkspaceExecution 并写入 durable 启动事件", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-explicit-deadline-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const specs = [];
+  const registry = createToolRegistry({
+    workspace,
+    bundledSkills: path.join(workspace, "skills"),
+    workspaceExecution: {
+      id: "deadline-probe",
+      execute: async (spec) => {
+        specs.push(spec);
+        return { exitCode: 0, stdout: "ok", stderr: "", output: "ok", durationMs: 1 };
+      },
+    },
+  });
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-shell-explicit-deadline", tools: ["run_shell"], decision: "allow" }] }),
+  });
+
+  const result = await host.execute({
+    id: "shell-explicit-deadline",
+    name: "run_shell",
+    arguments: { command: "npm test", timeout_ms: 120_000 },
+  }, { session });
+
+  assert.equal(result.status, "completed");
+  assert.equal(specs.length, 1);
+  assert.equal(specs[0].timeoutMs, 120_000);
+  const started = session.state.events.find((event) => (
+    event.type === "tool.execution_started" && event.callId === "shell-explicit-deadline"
+  ));
+  assert.equal(started.effectiveTimeoutMs, 120_000);
+  assert.equal(Date.parse(started.deadlineAt) - Date.parse(started.at), 120_000);
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "shell-explicit-deadline"
+  ));
+  assert.equal(completed.effectiveTimeoutMs, 120_000);
+  assert.equal(completed.terminationReason, "completed");
+});
+
+test("run_shell 显式到期后保持 execution_unknown 并 durable 记录终止原因", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-timeout-chain-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  let executions = 0;
+  let receivedSpec = null;
+  const registry = createToolRegistry({
+    workspace,
+    bundledSkills: path.join(workspace, "skills"),
+    workspaceExecution: {
+      id: "cooperative-timeout",
+      execute: async (spec, { signal }) => {
+        executions += 1;
+        receivedSpec = spec;
+        return await new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new WorkspaceExecutionError("deadline reached", {
+            code: "timeout",
+            result: { output: "partial" },
+          })), { once: true });
+        });
+      },
     },
   });
   const session = new AgentSession({
@@ -569,9 +740,347 @@ test("run_shell 经 WorkspaceExecution 超时后保持 execution_unknown 语义"
     policy: new WorkspacePolicy({ rules: [{ id: "allow-shell-test", tools: ["run_shell"], decision: "allow" }] }),
   });
 
-  const result = await host.execute({ id: "shell-timeout", name: "run_shell", arguments: { command: "sleep forever" } }, { session });
+  const result = await host.execute({
+    id: "shell-timeout",
+    name: "run_shell",
+    arguments: { command: "sleep forever", timeout_ms: 10 },
+  }, { session });
 
   assert.equal(result.status, "execution_unknown");
   assert.equal(executions, 1);
-  assert.ok(session.state.events.some((event) => event.type === "tool.execution_unknown"));
+  assert.equal(receivedSpec.timeoutMs, 10);
+  const started = session.state.events.find((event) => event.type === "tool.execution_started" && event.callId === "shell-timeout");
+  const unknown = session.state.events.find((event) => event.type === "tool.execution_unknown" && event.callId === "shell-timeout");
+  const completed = session.state.events.find((event) => event.type === "tool.completed" && event.callId === "shell-timeout");
+  assert.equal(started.effectiveTimeoutMs, 10);
+  assert.equal(unknown.effectiveTimeoutMs, 10);
+  assert.equal(unknown.terminationReason, "timeout");
+  assert.equal(completed.effectiveTimeoutMs, 10);
+  assert.equal(completed.terminationReason, "timeout");
 });
+
+test("run_shell 用户取消立即返回，不等待显式 deadline", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-cancel-deadline-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  let markStarted;
+  const startedAdapter = new Promise((resolve) => { markStarted = resolve; });
+  let receivedSpec = null;
+  const registry = createToolRegistry({
+    workspace,
+    bundledSkills: path.join(workspace, "skills"),
+    workspaceExecution: {
+      id: "cancel-probe",
+      execute: async (spec, { signal }) => {
+        receivedSpec = spec;
+        markStarted();
+        return await new Promise((resolve, reject) => {
+          const onAbort = () => reject(signal.reason || new Error("cancelled"));
+          if (signal.aborted) onAbort();
+          else signal.addEventListener("abort", onAbort, { once: true });
+        });
+      },
+    },
+  });
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-shell-cancel", tools: ["run_shell"], decision: "allow" }] }),
+  });
+  const controller = new AbortController();
+  const execution = host.execute({
+    id: "shell-cancel",
+    name: "run_shell",
+    arguments: { command: "sleep forever", timeout_ms: 2_147_483_647 },
+  }, { session, signal: controller.signal });
+  await Promise.race([
+    startedAdapter,
+    execution.then(() => { throw new Error("run_shell 未启动 WorkspaceExecution"); }),
+  ]);
+  const cancelledAt = performance.now();
+  controller.abort(new Error("user-stop"));
+
+  await assert.rejects(execution, /user-stop/);
+  assert.ok(performance.now() - cancelledAt < 250, "取消不应等待 deadline");
+  assert.equal(receivedSpec.timeoutMs, 2_147_483_647);
+  const unknown = session.state.events.find((event) => event.type === "tool.execution_unknown" && event.callId === "shell-cancel");
+  const completed = session.state.events.find((event) => event.type === "tool.completed" && event.callId === "shell-cancel");
+  assert.equal(unknown.effectiveTimeoutMs, 2_147_483_647);
+  assert.equal(unknown.terminationReason, "cancelled");
+  assert.equal(completed.effectiveTimeoutMs, 2_147_483_647);
+  assert.equal(completed.terminationReason, "cancelled");
+});
+
+test("Tool Host 取消后等待 LocalWorkspaceAdapter 回收进程，再提交完整 Manifest", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-cancel-cleanup-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const adapter = new LocalWorkspaceAdapter({
+    workspace,
+    environment: { PATH: process.env.PATH },
+    killGraceMs: 500,
+  });
+  const readyPath = path.join(workspace, "ready.pid");
+  const latePath = path.join(workspace, "late.txt");
+  const childSource = [
+    'const fs = require("node:fs");',
+    'fs.writeFileSync("ready.pid", String(process.pid));',
+    'process.on("SIGTERM", () => setTimeout(() => {',
+    '  fs.writeFileSync("late.txt", "written during cancellation");',
+    '  process.exit(0);',
+    '}, 50));',
+    'setInterval(() => {}, 1_000);',
+  ].join("\n");
+  const tool = {
+    name: "local_cleanup_probe",
+    description: "验证取消后的进程回收边界",
+    approval: "never",
+    effects: ["execute"],
+    idempotency: "unknown",
+    changeTracking: { mode: "workspace" },
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    deadline: {
+      defaultMs: null,
+      argument: null,
+      maximumMs: 2_147_483_647,
+      enforcement: "adapter",
+      hostGraceMs: 1_000,
+    },
+    execute: async (_arguments, context) => adapter.execute(createExecutionSpec({
+      program: process.execPath,
+      args: ["-e", childSource],
+      cwd: ".",
+      timeoutMs: context.effectiveTimeoutMs,
+      filesystemMode: "workspace-write",
+    }), { signal: context.signal }),
+  };
+  const registry = {
+    get: (name) => name === tool.name ? tool : null,
+    schemas: () => [],
+  };
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-local-cleanup-probe", tools: [tool.name], decision: "allow" }] }),
+  });
+  const controller = new AbortController();
+  const execution = host.execute({ id: "local-cleanup", name: tool.name, arguments: {} }, {
+    session,
+    signal: controller.signal,
+  });
+  await waitForFile(readyPath);
+  const pid = Number(await fs.readFile(readyPath, "utf8"));
+
+  controller.abort(new Error("user-stop"));
+  await assert.rejects(execution, /user-stop/);
+
+  assert.equal(processExists(pid), false, "durable terminal 前必须已回收子进程");
+  assert.equal(await fs.readFile(latePath, "utf8"), "written during cancellation");
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "local-cleanup"
+  ));
+  assert.equal(completed.status, "execution_unknown");
+  assert.equal(completed.fileChanges.complete, true);
+  assert.ok(completed.fileChanges.changes.some((change) => change.path === "late.txt" && change.operation === "created"));
+});
+
+test("Tool Host deadline watchdog 等待失责 Adapter 清理后再提交终态", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-watchdog-cleanup-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const adapter = new LocalWorkspaceAdapter({
+    workspace,
+    environment: { PATH: process.env.PATH },
+    killGraceMs: 500,
+  });
+  const readyPath = path.join(workspace, "ready.pid");
+  const latePath = path.join(workspace, "late.txt");
+  const childSource = [
+    'const fs = require("node:fs");',
+    'fs.writeFileSync("ready.pid", String(process.pid));',
+    'process.on("SIGTERM", () => setTimeout(() => {',
+    '  fs.writeFileSync("late.txt", "written during timeout cleanup");',
+    '  process.exit(0);',
+    '}, 50));',
+    'setInterval(() => {}, 1_000);',
+  ].join("\n");
+  const tool = {
+    name: "watchdog_cleanup_probe",
+    description: "验证 Host watchdog 后的进程回收边界",
+    approval: "never",
+    effects: ["execute"],
+    idempotency: "unknown",
+    changeTracking: { mode: "workspace" },
+    parameters: {
+      type: "object",
+      properties: { timeout_ms: { type: "integer", minimum: 1, maximum: 2_147_483_647 } },
+      required: ["timeout_ms"],
+      additionalProperties: false,
+    },
+    deadline: {
+      defaultMs: null,
+      argument: "timeout_ms",
+      maximumMs: 2_147_483_647,
+      enforcement: "adapter",
+      hostGraceMs: 1_000,
+    },
+    // 故意不把期限传给 Local Adapter，验证 Host watchdog 能终止失责实现且等待它完成清理。
+    execute: async (_arguments, context) => adapter.execute(createExecutionSpec({
+      program: process.execPath,
+      args: ["-e", childSource],
+      cwd: ".",
+      timeoutMs: null,
+      filesystemMode: "workspace-write",
+    }), { signal: context.signal }),
+  };
+  const registry = {
+    get: (name) => name === tool.name ? tool : null,
+    schemas: () => [],
+  };
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-watchdog-cleanup-probe", tools: [tool.name], decision: "allow" }] }),
+  });
+
+  const result = await host.execute({
+    id: "watchdog-cleanup",
+    name: tool.name,
+    arguments: { timeout_ms: 50 },
+  }, { session });
+
+  const pid = Number(await fs.readFile(readyPath, "utf8"));
+  assert.equal(processExists(pid), false, "durable timeout terminal 前必须已回收子进程");
+  assert.equal(result.status, "execution_unknown");
+  assert.equal(await fs.readFile(latePath, "utf8"), "written during timeout cleanup");
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "watchdog-cleanup"
+  ));
+  assert.equal(completed.terminationReason, "timeout");
+  assert.equal(completed.fileChanges.complete, true);
+  assert.ok(completed.fileChanges.changes.some((change) => change.path === "late.txt" && change.operation === "created"));
+});
+
+test("Tool Host adapter watchdog 在实现完全忽略 AbortSignal 时仍有界闭合", { timeout: 500 }, async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-watchdog-bound-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  const tool = {
+    name: "ignored_adapter_probe",
+    description: "验证失责 Adapter 的最终兜底",
+    approval: "never",
+    effects: ["execute"],
+    idempotency: "unknown",
+    parameters: { type: "object", properties: {}, required: [], additionalProperties: false },
+    deadline: {
+      defaultMs: 10,
+      argument: null,
+      maximumMs: 10,
+      enforcement: "adapter",
+      hostGraceMs: 30,
+    },
+    execute: async () => new Promise(() => {}),
+  };
+  const registry = {
+    get: (name) => name === tool.name ? tool : null,
+    schemas: () => [],
+  };
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-ignored-adapter-probe", tools: [tool.name], decision: "allow" }] }),
+  });
+  const started = performance.now();
+
+  const result = await host.execute({ id: "ignored-adapter", name: tool.name, arguments: {} }, { session });
+
+  assert.equal(result.status, "execution_unknown");
+  assert.equal(result.terminationReason, "timeout");
+  assert.ok(performance.now() - started < 250, "Host watchdog 不应被失责 Adapter 永久悬挂");
+  assert.equal(session.state.events.filter((event) => (
+    event.type === "tool.execution_unknown" && event.callId === "ignored-adapter"
+  )).length, 1);
+  assert.equal(session.state.events.filter((event) => (
+    event.type === "tool.completed" && event.callId === "ignored-adapter"
+  )).length, 1);
+});
+
+test("deadline 先触发时，清理期间的用户取消不会把终止原因重标为 cancelled", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-execution-first-cause-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const registry = createToolRegistry({
+    workspace,
+    bundledSkills: path.join(workspace, "skills"),
+    workspaceExecution: {
+      id: "first-cause-probe",
+      execute: async (_spec, { signal }) => {
+        markStarted();
+        return await new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => {
+            setTimeout(() => reject(new WorkspaceExecutionError("deadline cleanup complete", {
+              code: "timeout",
+              result: { output: "partial" },
+            })), 100);
+          }, { once: true });
+        });
+      },
+    },
+  });
+  const session = new AgentSession({
+    state: createSession({ provider: "test", workspace }),
+    reducer: reduceSession,
+  });
+  const host = new ToolHost({
+    registry,
+    policy: new WorkspacePolicy({ rules: [{ id: "allow-first-cause-probe", tools: ["run_shell"], decision: "allow" }] }),
+  });
+  const controller = new AbortController();
+  const execution = host.execute({
+    id: "first-cause",
+    name: "run_shell",
+    arguments: { command: "long build", timeout_ms: 100 },
+  }, { session, signal: controller.signal });
+  await started;
+  setTimeout(() => controller.abort(new Error("late-user-stop")), 150);
+
+  const result = await execution;
+
+  assert.equal(result.status, "execution_unknown");
+  assert.equal(result.terminationReason, "timeout");
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "first-cause"
+  ));
+  assert.equal(completed.terminationReason, "timeout");
+});
+
+async function waitForFile(file, timeoutMs = 2_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await fs.access(file);
+      return;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+  throw new Error(`等待文件超时：${file}`);
+}
+
+function processExists(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

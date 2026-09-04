@@ -16,6 +16,8 @@ import {
 const APPROVAL_MODES = new Set(["never", "always"]);
 const IDEMPOTENCY_MODES = new Set(["safe", "keyed", "unknown"]);
 const EFFECTS = new Set(["read", "write", "execute", "network", "memory", "credential", "state"]);
+const DEADLINE_ENFORCEMENTS = new Set(["host", "adapter"]);
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 export class ToolHost {
   constructor({ registry, policy = new WorkspacePolicy(), projectGrantStore = null, artifactStore = null, defaultTimeoutMs = 30_000, maxResultChars = 12_000 }) {
@@ -107,6 +109,8 @@ export class ToolHost {
       });
     }
 
+    const effectiveTimeoutMs = resolveEffectiveTimeoutMs(definition, call.arguments);
+
     const toolVersion = definitionVersion(definition);
     const authorization = this.policy.authorize({
       definition,
@@ -135,7 +139,7 @@ export class ToolHost {
       });
     }
 
-    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
+    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal, 0, effectiveTimeoutMs);
 
     let executionGrantId = authorization.grantId;
     let executionGrantScope = authorization.grantScope;
@@ -165,7 +169,7 @@ export class ToolHost {
       if (approval.approved && !approvalScopes.includes(approval.scope)) {
         throw new Error(`当前工具审批不支持授权范围：${approval.scope}`);
       }
-      if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
+      if (signal?.aborted) await cancelledBeforeStart(finish, call, signal, 0, effectiveTimeoutMs);
       const currentRegistration = resolveRegistryTool(this.registry, call.name);
       const currentTool = currentRegistration?.tool || null;
       const currentDefinition = currentTool ? normalizeDefinition(currentTool, this.defaultTimeoutMs) : null;
@@ -251,9 +255,9 @@ export class ToolHost {
       executionGrantScope = approval.scope;
     }
 
-    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
+    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal, 0, effectiveTimeoutMs);
     if (executionGrantId && executionGrantScope === "once") await consumeSessionGrant(session, executionGrantId, call.id);
-    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal);
+    if (signal?.aborted) await cancelledBeforeStart(finish, call, signal, 0, effectiveTimeoutMs);
     const executionLease = acquireRegistryTool(this.registry, call.name, registration);
     if (!executionLease || definitionVersion(normalizeDefinition(executionLease.tool, this.defaultTimeoutMs)) !== toolVersion) {
       return await capabilityUnavailable(session, finish, call, argsHash, registration, "能力已撤销或替换，Adapter 未启动");
@@ -261,13 +265,22 @@ export class ToolHost {
     const changeCapture = await beginTrackedChanges(definition, call.arguments, session.state.workspace);
     if (signal?.aborted) {
       executionLease.release();
-      await cancelledBeforeStart(finish, call, signal);
+      await cancelledBeforeStart(finish, call, signal, 0, effectiveTimeoutMs);
     }
-    const timeoutSignal = AbortSignal.timeout(definition.timeoutMs);
-    const executionSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+    const timeoutSignal = effectiveTimeoutMs === null ? null : AbortSignal.timeout(effectiveTimeoutMs);
+    const termination = trackFirstTermination(signal, timeoutSignal);
+    const executionSignal = combineAbortSignals(signal, timeoutSignal);
+    const settleAfterAbortMs = definition.deadline.enforcement === "adapter"
+      ? definition.deadline.hostGraceMs
+      : 0;
+    const executionStartedAt = new Date();
+    const deadlineAt = effectiveTimeoutMs === null
+      ? null
+      : new Date(executionStartedAt.getTime() + effectiveTimeoutMs).toISOString();
     try {
       await session.dispatch({
         type: "TOOL_EXECUTION_STARTED",
+        at: executionStartedAt.toISOString(),
         call,
         argsHash,
         toolVersion,
@@ -278,8 +291,11 @@ export class ToolHost {
         capabilityHash: authorization.capabilityHash,
         grantId: executionGrantId,
         grantScope: executionGrantScope,
+        effectiveTimeoutMs,
+        deadlineAt,
       });
     } catch (error) {
+      termination.dispose();
       executionLease.release();
       throw error;
     }
@@ -315,59 +331,76 @@ export class ToolHost {
           sourceCursor,
           callId: call.id,
           onOutput: (event) => outputStream?.append(event),
+          effectiveTimeoutMs,
+          deadlineAt,
         });
-      }, executionSignal);
+      }, executionSignal, { settleAfterAbortMs });
       await closeOutputStream();
       return await finishExecution({
         ok: true,
         status: "completed",
         result: normalizeResult(value),
         durationMs: Math.round(performance.now() - started),
+        effectiveTimeoutMs,
+        terminationReason: "completed",
       });
     } catch (error) {
       await closeOutputStream();
       const durationMs = Math.round(performance.now() - started);
-      if (signal?.aborted) {
-        if (!implementationStarted) await cancelledBeforeStart(finish, call, signal, durationMs);
+      if (termination.cause === "cancelled" || (!termination.cause && signal?.aborted)) {
+        if (!implementationStarted) await cancelledBeforeStart(finish, call, signal, durationMs, effectiveTimeoutMs);
         const unknown = outcomeMayBeUnknown(definition);
-        if (unknown) await executionUnknown(session, call, definition, argsHash, "cancelled", durationMs);
+        if (unknown) await executionUnknown(session, call, definition, argsHash, "cancelled", durationMs, effectiveTimeoutMs);
         await finishExecution({
           ok: false,
           status: unknown ? "execution_unknown" : "cancelled",
-          result: unknown
+          result: appendExecutionErrorOutput(unknown
             ? "任务已取消：工具已经启动，副作用结果未知，不会自动重试。"
-            : "任务已取消：工具执行已停止等待。",
+            : "任务已取消：工具执行已停止等待。", error),
           durationMs,
+          effectiveTimeoutMs,
+          terminationReason: "cancelled",
         });
         throw error;
       }
-      if (timeoutSignal.aborted) {
+      if (termination.cause === "timeout"
+          || (!termination.cause && effectiveTimeoutMs !== null && (timeoutSignal?.aborted || error?.code === "timeout"))) {
         if (!implementationStarted) {
           return await finishExecution({
             ok: false,
             status: "timeout",
-            result: `工具执行超时（${definition.timeoutMs}ms），实现尚未启动。`,
+            result: `工具执行超时（${effectiveTimeoutMs}ms），实现尚未启动。`,
             durationMs,
+            effectiveTimeoutMs,
+            terminationReason: "timeout",
           });
         }
         const unknown = outcomeMayBeUnknown(definition);
-        if (unknown) await executionUnknown(session, call, definition, argsHash, "timeout", durationMs);
+        if (unknown) await executionUnknown(session, call, definition, argsHash, "timeout", durationMs, effectiveTimeoutMs);
         return await finishExecution({
           ok: false,
           status: unknown ? "execution_unknown" : "timeout",
-          result: unknown
-            ? `工具执行超时（${definition.timeoutMs}ms），副作用结果未知，不会自动重试。`
-            : `工具执行超时（${definition.timeoutMs}ms），已停止等待。`,
+          result: appendExecutionErrorOutput(unknown
+            ? `工具执行超时（${effectiveTimeoutMs}ms），副作用结果未知，不会自动重试。`
+            : `工具执行超时（${effectiveTimeoutMs}ms），已停止等待。`, error),
           durationMs,
+          effectiveTimeoutMs,
+          terminationReason: "timeout",
         });
       }
       return await finishExecution({
         ok: false,
         status: "external_failed",
-        result: `工具执行失败：${redactSensitiveText(error?.message || "未知错误")}`,
+        result: appendExecutionErrorOutput(
+          `工具执行失败：${redactSensitiveText(error?.message || "未知错误")}`,
+          error,
+        ),
         durationMs,
+        effectiveTimeoutMs,
+        terminationReason: "external_failed",
       });
     } finally {
+      termination.dispose();
       executionLease.release();
     }
   }
@@ -401,17 +434,19 @@ async function capabilityUnavailable(session, finish, call, argsHash, registrati
   });
 }
 
-async function cancelledBeforeStart(finish, call, signal, durationMs = 0) {
+async function cancelledBeforeStart(finish, call, signal, durationMs = 0, effectiveTimeoutMs = undefined) {
   await finish(call, {
     ok: false,
     status: "cancelled",
     result: "任务已取消：工具尚未启动。",
     durationMs,
+    ...(effectiveTimeoutMs !== undefined ? { effectiveTimeoutMs } : {}),
+    terminationReason: "cancelled",
   });
   throw signal?.reason || new Error("任务已取消");
 }
 
-async function executionUnknown(session, call, definition, argsHash, reason, durationMs = 0) {
+async function executionUnknown(session, call, definition, argsHash, reason, durationMs = 0, effectiveTimeoutMs = undefined) {
   await session.dispatch({
     type: "TOOL_EXECUTION_UNKNOWN",
     call,
@@ -421,6 +456,8 @@ async function executionUnknown(session, call, definition, argsHash, reason, dur
     adapter: definition.adapter,
     reason,
     durationMs,
+    ...(effectiveTimeoutMs !== undefined ? { effectiveTimeoutMs } : {}),
+    terminationReason: reason,
   });
 }
 
@@ -457,6 +494,8 @@ async function complete(session, call, result) {
     status: result.status,
     result: safeResult,
     durationMs: result.durationMs,
+    ...(Object.hasOwn(result, "effectiveTimeoutMs") ? { effectiveTimeoutMs: result.effectiveTimeoutMs } : {}),
+    ...(result.terminationReason ? { terminationReason: result.terminationReason } : {}),
     ...(artifact ? { artifact } : {}),
     ...(result.fileChanges ? { fileChanges: result.fileChanges } : {}),
   });
@@ -472,16 +511,17 @@ function normalizeDefinition(tool, defaultTimeoutMs) {
   if (effects.some((effect) => !EFFECTS.has(effect))) throw new Error(`工具 ${tool.name} effects 无效`);
   const idempotency = tool.idempotency || "unknown";
   if (!IDEMPOTENCY_MODES.has(idempotency)) throw new Error(`工具 ${tool.name} idempotency 无效`);
-  const timeoutMs = tool.timeoutMs ?? defaultTimeoutMs;
-  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error(`工具 ${tool.name} timeoutMs 无效`);
+  const parameters = tool.parameters || { type: "object" };
+  const deadline = normalizeDeadline(tool, defaultTimeoutMs, parameters);
   const definition = {
     ...tool,
     adapter: tool.adapter || "native",
-    parameters: tool.parameters || { type: "object" },
+    parameters,
     approval,
     effects,
     idempotency,
-    timeoutMs,
+    timeoutMs: deadline.defaultMs,
+    deadline,
     changeTracking: normalizeChangeTracking(tool.changeTracking),
   };
   definition.capability = normalizeCapability(definition);
@@ -495,10 +535,100 @@ function definitionVersion(definition) {
     effects: definition.effects,
     idempotency: definition.idempotency,
     adapter: definition.adapter,
-    timeoutMs: definition.timeoutMs,
+    deadline: definition.deadline,
     capability: definition.capability,
     changeTracking: definition.changeTracking,
   });
+}
+
+function normalizeDeadline(tool, defaultTimeoutMs, parameters) {
+  if (tool.deadline === undefined) {
+    const defaultMs = Object.hasOwn(tool, "timeoutMs") ? tool.timeoutMs : defaultTimeoutMs;
+    assertTimeoutMs(defaultMs, `工具 ${tool.name} timeoutMs`);
+    return Object.freeze({
+      defaultMs,
+      argument: null,
+      maximumMs: defaultMs,
+      enforcement: "host",
+      hostGraceMs: 0,
+    });
+  }
+  if (Object.hasOwn(tool, "timeoutMs")) {
+    throw new Error(`工具 ${tool.name} 不能同时声明 timeoutMs 和 deadline`);
+  }
+  const value = tool.deadline;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error(`工具 ${tool.name} deadline 必须是对象`);
+  }
+  const unknown = Object.keys(value).find((key) => ![
+    "defaultMs", "argument", "maximumMs", "enforcement", "hostGraceMs",
+  ].includes(key));
+  if (unknown) throw new Error(`工具 ${tool.name} deadline 包含未知字段 ${unknown}`);
+  const defaultMs = Object.hasOwn(value, "defaultMs") ? value.defaultMs : defaultTimeoutMs;
+  assertTimeoutMs(defaultMs, `工具 ${tool.name} deadline.defaultMs`);
+  const argument = value.argument ?? null;
+  if (argument !== null && (typeof argument !== "string" || !argument)) {
+    throw new Error(`工具 ${tool.name} deadline.argument 必须是非空字符串或 null`);
+  }
+  if (argument && !Object.hasOwn(parameters?.properties || {}, argument)) {
+    throw new Error(`工具 ${tool.name} deadline.argument 未在 parameters 中声明：${argument}`);
+  }
+  const maximumMs = value.maximumMs ?? MAX_TIMER_DELAY_MS;
+  if (!Number.isSafeInteger(maximumMs) || maximumMs < 1 || maximumMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(`工具 ${tool.name} deadline.maximumMs 必须是 1 到 ${MAX_TIMER_DELAY_MS} 的整数`);
+  }
+  if (defaultMs !== null && defaultMs > maximumMs) {
+    throw new Error(`工具 ${tool.name} deadline.defaultMs 不能超过 maximumMs`);
+  }
+  const enforcement = value.enforcement || "host";
+  if (!DEADLINE_ENFORCEMENTS.has(enforcement)) {
+    throw new Error(`工具 ${tool.name} deadline.enforcement 无效`);
+  }
+  const hostGraceMs = value.hostGraceMs ?? 0;
+  if (!Number.isSafeInteger(hostGraceMs) || hostGraceMs < 0 || hostGraceMs > MAX_TIMER_DELAY_MS) {
+    throw new Error(`工具 ${tool.name} deadline.hostGraceMs 必须是非负整数`);
+  }
+  return Object.freeze({ defaultMs, argument, maximumMs, enforcement, hostGraceMs });
+}
+
+function assertTimeoutMs(value, label) {
+  if (value !== null && (!Number.isSafeInteger(value) || value < 1 || value > MAX_TIMER_DELAY_MS)) {
+    throw new Error(`${label} 必须是 1 到 ${MAX_TIMER_DELAY_MS} 的整数或 null`);
+  }
+}
+
+function resolveEffectiveTimeoutMs(definition, args) {
+  const { argument, defaultMs, maximumMs } = definition.deadline;
+  const value = argument && Object.hasOwn(args, argument) ? args[argument] : defaultMs;
+  assertTimeoutMs(value, `工具 ${definition.name} effectiveTimeoutMs`);
+  if (value !== null && value > maximumMs) {
+    throw new Error(`工具 ${definition.name} effectiveTimeoutMs 不能超过 ${maximumMs}`);
+  }
+  return value;
+}
+
+function combineAbortSignals(signal, timeoutSignal) {
+  if (signal && timeoutSignal) return AbortSignal.any([signal, timeoutSignal]);
+  return signal || timeoutSignal || null;
+}
+
+function trackFirstTermination(signal, timeoutSignal) {
+  let cause = null;
+  const recordCancelled = () => { cause ||= "cancelled"; };
+  const recordTimeout = () => { cause ||= "timeout"; };
+  signal?.addEventListener("abort", recordCancelled, { once: true });
+  timeoutSignal?.addEventListener("abort", recordTimeout, { once: true });
+  if (signal?.aborted) recordCancelled();
+  if (timeoutSignal?.aborted) recordTimeout();
+  return {
+    get cause() {
+      return cause;
+    },
+    dispose() {
+      signal?.removeEventListener("abort", recordCancelled);
+      timeoutSignal?.removeEventListener("abort", recordTimeout);
+    },
+  };
 }
 
 function normalizeChangeTracking(value) {
@@ -859,6 +989,12 @@ function normalizeResult(value) {
   return redactSensitiveText(text ?? "");
 }
 
+function appendExecutionErrorOutput(message, error) {
+  const output = error?.result?.output;
+  if (typeof output !== "string" || !output) return message;
+  return `${message}\n\n执行输出：\n${output}`;
+}
+
 function hashValue(value) {
   return createHash("sha256").update(JSON.stringify(canonical(value))).digest("hex");
 }
@@ -869,24 +1005,46 @@ function canonical(value) {
   return Object.fromEntries(Object.keys(value).sort().map((key) => [key, canonical(value[key])]));
 }
 
-function raceWithSignal(start, signal) {
+function raceWithSignal(start, signal, { settleAfterAbortMs = 0 } = {}) {
+  if (!signal) return Promise.resolve().then(start);
   if (signal.aborted) return Promise.reject(signal.reason || new Error("工具执行已取消"));
   return new Promise((resolve, reject) => {
-    const onAbort = () => reject(signal.reason || new Error("工具执行已取消"));
+    let settled = false;
+    let abortTimer = null;
+    const cleanup = () => {
+      if (abortTimer) clearTimeout(abortTimer);
+      signal.removeEventListener("abort", onAbort);
+    };
+    const settle = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      callback(value);
+    };
+    const abortReason = () => signal.reason || new Error("工具执行已取消");
+    const onAbort = () => {
+      if (settleAfterAbortMs <= 0) {
+        settle(reject, abortReason());
+        return;
+      }
+      abortTimer ||= setTimeout(() => settle(reject, abortReason()), settleAfterAbortMs);
+      abortTimer.unref?.();
+    };
     signal.addEventListener("abort", onAbort, { once: true });
     if (signal.aborted) {
-      onAbort();
-      signal.removeEventListener("abort", onAbort);
+      settle(reject, abortReason());
       return;
     }
     let operation;
     try {
       operation = start();
     } catch (error) {
-      signal.removeEventListener("abort", onAbort);
-      reject(error);
+      settle(reject, error);
       return;
     }
-    Promise.resolve(operation).then(resolve, reject).finally(() => signal.removeEventListener("abort", onAbort));
+    Promise.resolve(operation).then(
+      (value) => signal.aborted ? settle(reject, abortReason()) : settle(resolve, value),
+      (error) => settle(reject, error),
+    );
   });
 }

@@ -12,6 +12,9 @@ import { createPermissionProfile } from "./permission-profile.js";
 
 const NATIVE_TOOL_OWNER = "nexus:native-tools";
 const SAFE_READ_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
+const MAX_SHELL_TIMEOUT_MS = 2_147_483_647;
+// 覆盖 Local 进程树强杀与 Docker 最长 5 秒的显式容器清理窗口。
+const SHELL_TIMEOUT_HOST_GRACE_MS = 6_500;
 
 export function createToolRegistry({
   workspace,
@@ -25,10 +28,13 @@ export function createToolRegistry({
   accessPolicy = null,
   accessPolicies = null,
   delegateTask = null,
-  shellTimeoutMs = 15_000,
+  shellTimeoutMs = null,
 }) {
   const root = realpathSync(path.resolve(workspace));
-  if (!Number.isSafeInteger(shellTimeoutMs) || shellTimeoutMs < 1) throw new Error("shellTimeoutMs 必须是正整数");
+  if (shellTimeoutMs !== null
+      && (!Number.isSafeInteger(shellTimeoutMs) || shellTimeoutMs < 1 || shellTimeoutMs > MAX_SHELL_TIMEOUT_MS)) {
+    throw new Error(`shellTimeoutMs 必须是 1 到 ${MAX_SHELL_TIMEOUT_MS} 的整数或 null`);
+  }
   const execution = assertWorkspaceExecution(workspaceExecution || new LocalWorkspaceAdapter({ workspace: root }));
   const permissionProfile = accessPolicy || createPermissionProfile({
     name: "workspace-auto",
@@ -344,12 +350,18 @@ export function createToolRegistry({
 
   define({
     name: "run_shell",
-    description: "在工作区执行 Shell 命令。read-only 仅允许沙箱内的最小只读检查；workspace-auto 可自动执行常规命令；网络、安装和外部路径需要审批，危险命令拒绝。",
+    description: "在工作区以前台方式执行 Shell 命令。默认不自动超时，可用 timeout_ms 显式设置毫秒上限；用户仍可随时停止。read-only 仅允许沙箱内的最小只读检查；workspace-auto 可自动执行常规命令；网络、安装和外部路径需要审批，危险命令拒绝。",
     approval: "always",
     effects: ["execute"],
     idempotency: "unknown",
     changeTracking: { mode: "workspace" },
-    timeoutMs: shellTimeoutMs,
+    deadline: {
+      defaultMs: shellTimeoutMs,
+      argument: "timeout_ms",
+      maximumMs: MAX_SHELL_TIMEOUT_MS,
+      enforcement: "adapter",
+      hostGraceMs: SHELL_TIMEOUT_HOST_GRACE_MS,
+    },
     capability: {
       risk: "R2",
       readOnly: false,
@@ -358,8 +370,23 @@ export function createToolRegistry({
         { kind: "shell_command", argument: "command", access: "execute" },
       ],
     },
-    parameters: objectSchema({ command: { type: "string" } }, ["command"]),
-    execute: async ({ command }, context) => executeShell(execution, policyFor(context), command, context.signal, context.onOutput),
+    parameters: objectSchema({
+      command: { type: "string" },
+      timeout_ms: {
+        type: "integer",
+        minimum: 1,
+        maximum: MAX_SHELL_TIMEOUT_MS,
+        description: "可选的执行期限（毫秒）；省略表示不设置自动 deadline，命令会以前台方式等待直至退出或被用户停止。",
+      },
+    }, ["command"]),
+    execute: async ({ command }, context) => executeShell(
+      execution,
+      policyFor(context),
+      command,
+      context.signal,
+      context.onOutput,
+      context.effectiveTimeoutMs,
+    ),
   });
 
   define({
@@ -599,7 +626,7 @@ async function discoverSkills(roots) {
   return found;
 }
 
-async function executeShell(execution, accessPolicy, command, signal, onOutput) {
+async function executeShell(execution, accessPolicy, command, signal, onOutput, timeoutMs) {
   const classification = accessPolicy.classifyShell(command);
   if (classification.decision === "deny") throw new Error(classification.reason);
   const result = await execution.execute(createExecutionSpec({
@@ -612,6 +639,7 @@ async function executeShell(execution, accessPolicy, command, signal, onOutput) 
       ? { env: { PATH: SAFE_READ_PATH } }
       : {}),
     maxOutputChars: 1_000_000,
+    timeoutMs,
   }), { signal, onOutput });
   const summary = result.output.trim() || "（无输出）";
   if (result.exitCode === 0) return summary;

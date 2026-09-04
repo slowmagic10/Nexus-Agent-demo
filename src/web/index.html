@@ -9,7 +9,7 @@
   </head>
   <body>
     <div class="shell">
-      <aside class="sidebar">
+      <aside id="task-sidebar" class="sidebar">
         <header class="brand">
           <div class="mark">N</div>
           <div><strong>Nexus</strong><span>Local agent</span></div>
@@ -37,11 +37,18 @@
 
       <main class="workspace">
         <header class="topbar">
+          <button id="mobile-nav-toggle" class="mobile-nav-toggle" type="button" aria-label="打开任务列表" aria-controls="task-sidebar" aria-expanded="false">任务</button>
           <div class="task-heading">
             <div class="title-line">
               <span id="phase-dot" class="phase-dot idle"></span>
               <h1 id="session-title">准备开始</h1>
+              <button id="rename-session" class="rename-session" type="button" aria-label="重命名当前任务" disabled>重命名</button>
             </div>
+            <form id="title-form" class="title-editor hidden">
+              <input id="title-input" maxlength="500" autocomplete="off" aria-label="任务名称" placeholder="输入任务名称">
+              <button type="submit">保存</button>
+              <button id="title-cancel" type="button">取消</button>
+            </form>
             <div id="session-meta" class="status-line">
               <span class="status-chip">本地执行</span>
               <span class="status-chip">逐次审批</span>
@@ -49,7 +56,8 @@
           </div>
           <div class="actions">
             <button id="theme-toggle" class="icon-button theme-toggle" aria-label="切换到浅色主题" aria-pressed="false">浅色</button>
-            <button id="debug-toggle" class="icon-button" aria-label="打开调试抽屉" aria-expanded="false">调试</button>
+            <button id="review-toggle" class="icon-button" type="button" aria-label="打开文件审查" disabled>审查</button>
+            <button id="debug-toggle" class="icon-button" aria-label="打开任务详情" aria-controls="inspector" aria-expanded="false">详情</button>
             <button id="export-session" class="icon-button" disabled>导出</button>
           </div>
         </header>
@@ -118,8 +126,8 @@
           </form>
         </section>
       </main>
-    </div>
 
+    <div id="task-nav-backdrop" class="task-nav-backdrop hidden"></div>
     <div id="danger-confirm-backdrop" class="danger-confirm-backdrop hidden"></div>
     <section id="danger-confirm" class="danger-confirm hidden" role="dialog" aria-modal="true" aria-labelledby="danger-confirm-title">
       <div class="danger-confirm-icon">!</div>
@@ -140,57 +148,69 @@
     </section>
 
     <div id="drawer-backdrop" class="drawer-backdrop hidden"></div>
-    <aside id="inspector" class="inspector" aria-hidden="true">
+    <aside id="inspector" class="inspector" aria-labelledby="inspector-title" aria-hidden="true" inert>
       <header class="inspector-head">
         <div>
           <span>任务详情</span>
-          <strong>本地工作区</strong>
+          <strong id="inspector-title">本地工作区</strong>
         </div>
         <button id="debug-close" class="close-button" aria-label="关闭任务详情">×</button>
       </header>
       <div class="tabs" role="tablist">
-        <button class="tab active" data-tab="events" role="tab">调试</button>
-        <button class="tab" data-tab="context" role="tab">上下文</button>
-        <button class="tab" data-tab="evaluation" role="tab">诊断</button>
-        <button class="tab" data-tab="memory" role="tab">记忆</button>
-        <button class="tab" data-tab="grants" role="tab">授权 <span id="grant-count" class="tab-count">0</span></button>
+        <button id="overview-tab" class="tab active" data-tab="overview" role="tab" aria-controls="overview-view" aria-selected="true">概览</button>
+        <button id="files-tab" class="tab" data-tab="files" role="tab" aria-controls="files-view" aria-selected="false" tabindex="-1">文件 <span id="review-count" class="tab-count">0</span></button>
+        <button id="context-tab" class="tab" data-tab="context" role="tab" aria-controls="context-view" aria-selected="false" tabindex="-1">上下文</button>
+        <button id="more-tab" class="tab" data-tab="more" role="tab" aria-controls="more-view" aria-selected="false" tabindex="-1">更多 <span id="grant-count" class="tab-count">0</span></button>
       </div>
-      <div id="events-view" class="tab-view">
-        <div class="debug-note">原始运行事件仅用于诊断，不影响任务执行。</div>
-        <div id="events" class="events"></div>
-      </div>
-      <div id="context-view" class="tab-view hidden">
-        <div class="debug-note">仅显示预算、来源数量、压缩和重规划元数据；不会展示 System Prompt、消息、记忆或摘要正文。</div>
-        <div id="context-panel" class="context-stack"></div>
-      </div>
-      <div id="evaluation-view" class="tab-view hidden">
-        <div class="debug-note">从当前 Session Journal 确定性派生，不调用模型、不修改任务，也不展示消息、工具参数或原始错误正文。</div>
+      <div id="overview-view" class="tab-view" role="tabpanel" aria-labelledby="overview-tab">
+        <div class="debug-note">聚合显示当前 Turn 的执行、文件变化和任务健康状态；详细过程仍可在主线程展开。</div>
+        <div id="execution-overview-panel" class="execution-overview-stack"></div>
+        <div id="file-changes-overview-panel" class="file-changes-overview"></div>
         <div id="evaluation-panel" class="evaluation-stack"></div>
       </div>
-      <div id="memory-view" class="tab-view hidden">
-        <section class="candidate-section">
-          <div class="memory-section-heading">
-            <strong>待确认</strong>
-            <span>对话结束后提取，不会自动生效</span>
-          </div>
-          <div id="candidate-list" class="memory-list"></div>
-        </section>
-        <div class="memory-divider"></div>
-        <form id="memory-form" class="memory-form">
-          <input id="memory-input" placeholder="记录一条长期记忆">
-          <button type="submit">保存</button>
-        </form>
-        <div id="memory-list" class="memory-list"></div>
+      <div id="files-view" class="tab-view review-tab-view hidden" role="tabpanel" aria-labelledby="files-tab">
+        <div id="review-workspace"></div>
       </div>
-      <div id="grants-view" class="tab-view hidden">
-        <div class="debug-note">这里只显示尚未消费、撤销或过期的授权。授权仅在工具、资源、策略和权限档位完全匹配时生效。</div>
-        <div class="grant-section-heading">
-          <strong>有效授权</strong>
-          <span id="grant-summary">选择任务后查看</span>
-        </div>
-        <div id="grant-list" class="grant-list"></div>
+      <div id="context-view" class="tab-view hidden" role="tabpanel" aria-labelledby="context-tab">
+        <div class="debug-note">仅显示 Token 估算、软压缩目标、来源数量和重规划元数据；不会展示 System Prompt、消息、记忆或摘要正文。</div>
+        <div id="context-panel" class="context-stack"></div>
+      </div>
+      <div id="more-view" class="tab-view hidden" role="tabpanel" aria-labelledby="more-tab">
+        <details id="memory-section" class="inspector-section">
+          <summary><span><strong>长期记忆</strong><small>候选与当前作用域</small></span><i>⌄</i></summary>
+          <div id="memory-view" class="inspector-section-body">
+            <section class="candidate-section">
+              <div class="memory-section-heading">
+                <strong>待确认</strong>
+                <span>对话结束后提取，不会自动生效</span>
+              </div>
+              <div id="candidate-list" class="memory-list"></div>
+            </section>
+            <div class="memory-divider"></div>
+            <form id="memory-form" class="memory-form">
+              <input id="memory-input" placeholder="记录一条长期记忆">
+              <button type="submit">保存</button>
+            </form>
+            <div id="memory-list" class="memory-list"></div>
+          </div>
+        </details>
+        <details id="grants-section" class="inspector-section">
+          <summary><span><strong>有效授权</strong><small id="grant-summary">选择任务后查看</small></span><i>⌄</i></summary>
+          <div id="grants-view" class="inspector-section-body">
+            <div class="debug-note">只显示尚未消费、撤销或过期的授权；工具、资源、策略和权限档位必须完全匹配。</div>
+            <div id="grant-list" class="grant-list"></div>
+          </div>
+        </details>
+        <details id="journal-section" class="inspector-section">
+          <summary><span><strong>Journal 事件</strong><small id="journal-summary">按需显示最近 100 条</small></span><i>⌄</i></summary>
+          <div id="events-view" class="inspector-section-body">
+            <div class="debug-note">原始运行事件仅用于诊断，不影响任务执行。</div>
+            <div id="events" class="events"></div>
+          </div>
+        </details>
       </div>
     </aside>
+    </div>
 
     <div id="toast" class="toast hidden" role="status"></div>
     <script type="module" src="/app.js"></script>

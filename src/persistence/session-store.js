@@ -4,6 +4,7 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { createHash, randomUUID } from "node:crypto";
 import { createSessionBranch, migrateSessionState, reduceSession } from "../core/state.js";
+import { resolveSessionDisplayTitle } from "../core/session-display-title.js";
 import { deriveAgentProfileSnapshot } from "../core/agent-profile.js";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createStatePatch } from "../state-patch.js";
@@ -339,7 +340,7 @@ export class SessionStore {
       LIMIT ?
     `).all(workspace, limit).map(({ stateJson, ...row }) => ({
       ...row,
-      title: sessionTitle(parseState(stateJson, row.id)),
+      title: resolveSessionDisplayTitle(parseState(stateJson, row.id)),
     }));
   }
 
@@ -424,13 +425,6 @@ export class SessionStore {
     }
     return null;
   }
-}
-
-function sessionTitle(state) {
-  const firstRequest = state.messages?.find((message) => message.role === "user")?.content?.trim();
-  if (!firstRequest) return "新任务";
-  const title = firstRequest.replace(/\s+/g, " ");
-  return title.length > 36 ? `${title.slice(0, 36).trimEnd()}…` : title;
 }
 
 function parseState(value, label) {
@@ -553,7 +547,13 @@ function validateJournalArchive(archive) {
       throw new Error(`portable journal event ${cursor} 的类型或时间与 action 不一致`);
     }
     const next = reduceSession(state, event.action);
-    if (event.patch != null && stableStringify(event.patch) !== stableStringify(createStatePatch(state, next))) {
+    const replayedPatch = createStatePatch(state, next);
+    const comparablePatch = migrateArchivePatchForReplay(event.patch, {
+      sourceStateSchemaVersion,
+      action: event.action,
+      replayedPatch,
+    });
+    if (event.patch != null && stableStringify(comparablePatch) !== stableStringify(replayedPatch)) {
       throw new Error(`portable journal event ${cursor} 的 patch 与事实重放结果不一致`);
     }
     state = next;
@@ -566,6 +566,19 @@ function validateJournalArchive(archive) {
   validateArchiveMetadata(archive.session, state, sourceStateSchemaVersion);
   if (Object.hasOwn(archive, "artifacts")) validateArtifactReferences(state, artifacts, sourceId);
   return { events, state, artifacts };
+}
+
+function migrateArchivePatchForReplay(patch, { sourceStateSchemaVersion, action, replayedPatch }) {
+  if (patch == null || sourceStateSchemaVersion >= 16 || action.type !== "USER_MESSAGE") return patch;
+  if (Object.hasOwn(patch.set || {}, "displayTitle")
+      || !Object.hasOwn(replayedPatch.set || {}, "displayTitle")) return patch;
+  return {
+    ...structuredClone(patch),
+    set: {
+      ...(patch.set || {}),
+      displayTitle: structuredClone(replayedPatch.set.displayTitle),
+    },
+  };
 }
 
 function adaptJournal(events, { id, workspace }) {

@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/keyboard.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/tool-transcript.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);
@@ -204,6 +204,12 @@ async function route(request, response, manager, staticRoot) {
       const body = await readJson(request);
       const state = await manager.sendMessage(id, body.content);
       sendJson(response, 202, { accepted: true, session: state });
+      return;
+    }
+    if (request.method === "POST" && parts[2] === "display-title" && parts.length === 3) {
+      const body = await readJson(request);
+      const state = await manager.setDisplayTitle(id, body.title ?? null);
+      sendJson(response, 200, { session: state });
       return;
     }
     if (request.method === "POST" && parts[2] === "permission-profile" && parts.length === 3) {

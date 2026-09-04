@@ -1,6 +1,7 @@
 // FOUNDATION — coordinates isolated Agent sessions for local HTTP/SSE clients.
 import { randomUUID } from "node:crypto";
 import { createDelegatedSession, createSession, reduceSession } from "../core/state.js";
+import { normalizeSessionDisplayTitle } from "../core/session-display-title.js";
 import {
   assertAgentProfileSnapshot,
   createAgentProfileSnapshot,
@@ -246,6 +247,21 @@ export class GatewaySessionManager {
 
   async get(id) {
     const entry = await this.ensureLoaded(id);
+    return entry.state;
+  }
+
+  async setDisplayTitle(id, title) {
+    if (title !== null && typeof title !== "string") {
+      throw new GatewayError(400, "title 必须是字符串或 null");
+    }
+    if (typeof title === "string" && title.length > 500) {
+      throw new GatewayError(400, "title 最多输入 500 个字符");
+    }
+    const entry = await this.ensureLoaded(id);
+    await entry.session.dispatch({
+      type: "SESSION_DISPLAY_TITLE_CHANGED",
+      title: normalizeSessionDisplayTitle(title),
+    });
     return entry.state;
   }
 

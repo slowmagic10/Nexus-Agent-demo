@@ -26,6 +26,22 @@ test("会话状态可保存、列出并按 ID 恢复", () => {
   }
 });
 
+test("会话列表标题使用 durable 安全投影而不是直接暴露首条消息", () => {
+  const fixture = createFixture();
+  try {
+    let state = createSession({ provider: "demo", workspace: fixture.workspace });
+    state = reduceSession(state, { type: "USER_MESSAGE", content: "SSH 到 root@192.168.121.110 部署" });
+    fixture.store.save(state);
+    assert.equal(fixture.store.list(fixture.workspace)[0].title, "受保护任务");
+
+    state = reduceSession(state, { type: "SESSION_DISPLAY_TITLE_CHANGED", title: "服务器地址: prod.internal" });
+    fixture.store.save(state);
+    assert.equal(fixture.store.list(fixture.workspace)[0].title, "受保护任务");
+  } finally {
+    fixture.close();
+  }
+});
+
 test("恢复会话会丢弃未决审批并留下审计事件", () => {
   const call = { id: "call-1", name: "write_file", arguments: { path: "x", content: "y" } };
   let state = createSession({ provider: "old", workspace: "/old" });
@@ -54,6 +70,31 @@ test("恢复会话会丢弃未决审批并留下审计事件", () => {
   assert.equal(event.previousPhase, "awaiting_approval");
   assert.equal(event.discardedApproval, "write_file");
   assert.deepEqual(event.reconciledToolCalls, ["write_file"]);
+});
+
+test("重复 callId 的待审批 occurrence 按实际串行顺序恢复", () => {
+  const call = { id: "same", name: "write_file", arguments: { path: "a", content: "x" } };
+  let state = createSession({ provider: "demo", workspace: "/workspace" });
+  state = reduceSession(state, {
+    type: "ASSISTANT_MESSAGE",
+    message: {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "same", name: "write_file", arguments: { path: "a" } },
+        { id: "same", name: "write_file", arguments: { path: "b" } },
+      ],
+    },
+  });
+  state = reduceSession(state, { type: "APPROVAL_REQUESTED", call });
+
+  const resumed = reduceSession(state, { type: "RESUMED", provider: "demo", workspace: "/workspace" });
+  const recoveredResults = resumed.messages.slice(-2);
+  assert.match(recoveredResults[0].content, /尚未获得审批.*未执行/);
+  assert.match(recoveredResults[1].content, /尚未开始执行.*不会自动重放/);
+  assert.equal(resumed.events.some((event) => event.type === "tool.execution_unknown"), false);
+  const cancelled = resumed.events.find((event) => event.type === "tool.recovery_cancelled");
+  assert.equal(cancelled.callOrdinal, 1);
 });
 
 test("恢复会话不会重复补全已有工具结果", () => {
@@ -100,6 +141,99 @@ test("恢复执行中的工具会记录 execution_unknown 且不自动重放", (
   assert.ok(resumed.events.some((event) => (
     event.type === "tool.execution_unknown" && event.callId === call.id && event.reason === "process_interrupted"
   )));
+});
+
+test("恢复多工具调用时只有已启动 occurrence 标记 unknown，后续未启动调用明确取消", () => {
+  const first = { id: "same", name: "run_shell", arguments: { command: "one" } };
+  let state = createSession({ provider: "demo", workspace: "/workspace" });
+  state = reduceSession(state, {
+    type: "ASSISTANT_MESSAGE",
+    message: {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "same", name: "run_shell", arguments: { command: "one" } },
+        { id: "same", name: "run_shell", arguments: { command: "two" } },
+      ],
+    },
+  });
+  state = reduceSession(state, { type: "TOOL_REQUESTED", call: first });
+  state = reduceSession(state, {
+    type: "TOOL_EXECUTION_STARTED",
+    call: first,
+    argsHash: "one-hash",
+    toolVersion: "version",
+    effects: ["execute"],
+    idempotency: "unknown",
+    adapter: "native",
+  });
+
+  const resumed = reduceSession(state, { type: "RESUMED", provider: "demo", workspace: "/workspace" });
+  const recovered = resumed.messages.slice(-2);
+  const unknown = resumed.events.filter((event) => event.type === "tool.execution_unknown");
+  const cancelled = resumed.events.filter((event) => event.type === "tool.recovery_cancelled");
+
+  assert.equal(unknown.length, 1);
+  assert.equal(unknown[0].callOrdinal, 0);
+  assert.equal(cancelled.length, 1);
+  assert.equal(cancelled[0].callOrdinal, 1);
+  assert.match(recovered[0].content, /执行状态未知/);
+  assert.match(recovered[1].content, /尚未开始执行.*已取消/);
+});
+
+test("恢复不会为已有 execution_unknown 重复写事件，并保留 occurrence 的终止原因", () => {
+  for (const terminationReason of ["timeout", "cancelled"]) {
+    const first = { id: "same", name: "run_shell", arguments: { command: "one", timeout_ms: 10 } };
+    let state = createSession({ provider: "demo", workspace: "/workspace" });
+    state = reduceSession(state, {
+      type: "ASSISTANT_MESSAGE",
+      message: {
+        role: "assistant",
+        content: "",
+        tool_calls: [
+          { id: "same", name: "run_shell", arguments: { command: "one", timeout_ms: 10 } },
+          { id: "same", name: "run_shell", arguments: { command: "two" } },
+        ],
+      },
+    });
+    state = reduceSession(state, { type: "TOOL_REQUESTED", call: first });
+    state = reduceSession(state, {
+      type: "TOOL_EXECUTION_STARTED",
+      call: first,
+      argsHash: "one-hash",
+      toolVersion: "version",
+      effects: ["execute"],
+      idempotency: "unknown",
+      adapter: "native",
+      effectiveTimeoutMs: 10,
+      deadlineAt: "2026-09-03T00:00:00.010Z",
+    });
+    state = reduceSession(state, {
+      type: "TOOL_EXECUTION_UNKNOWN",
+      call: first,
+      argsHash: "one-hash",
+      effects: ["execute"],
+      idempotency: "unknown",
+      adapter: "native",
+      reason: terminationReason,
+      durationMs: 10,
+      effectiveTimeoutMs: 10,
+      terminationReason,
+    });
+
+    const resumed = reduceSession(state, { type: "RESUMED", provider: "demo", workspace: "/workspace" });
+    const unknown = resumed.events.filter((event) => event.type === "tool.execution_unknown");
+    const cancelled = resumed.events.filter((event) => event.type === "tool.recovery_cancelled");
+
+    assert.equal(unknown.length, 1);
+    assert.equal(unknown[0].reason, terminationReason);
+    assert.equal(unknown[0].terminationReason, terminationReason);
+    assert.equal(unknown[0].effectiveTimeoutMs, 10);
+    assert.equal(cancelled.length, 1);
+    assert.equal(cancelled[0].callOrdinal, 1);
+    assert.match(resumed.messages.at(-2).content, /此前已记录结果未知.*不会自动重放/);
+    assert.match(resumed.messages.at(-1).content, /尚未开始执行.*已取消/);
+  }
 });
 
 test("长期记忆支持保存、搜索和删除", async () => {
@@ -199,7 +333,7 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 15);
+    assert.equal(restored.schemaVersion, 16);
     assert.equal(restored.agentProfile.id, "legacy-default");
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
@@ -233,7 +367,7 @@ test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 15);
+  assert.equal(migrated.schemaVersion, 16);
   assert.equal(migrated.agentProfile.id, "legacy-default");
   assert.equal(migrated.toolGrants[0].usage, "single_use");
   assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
@@ -248,7 +382,7 @@ test("schema v12 升级时保留 Agent Profile 并初始化 durable summary", ()
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 15);
+  assert.equal(migrated.schemaVersion, 16);
   assert.equal(migrated.agentProfile.version, profileVersion);
   assert.equal(migrated.contextSummary, null);
   assert.equal(migrated.modelStream, null);
@@ -263,8 +397,29 @@ test("schema v14 升级时初始化 Tool Output Stream 投影", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 15);
+  assert.equal(migrated.schemaVersion, 16);
   assert.deepEqual(migrated.toolStreams, {});
+});
+
+test("schema v15 升级时从首条用户消息建立安全 Display Title", () => {
+  let state = createSession({ provider: "demo", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "访问 https://internal.example.com" });
+  state.schemaVersion = 15;
+  delete state.displayTitle;
+
+  const migrated = migrateSessionState(state);
+
+  assert.equal(migrated.schemaVersion, 16);
+  assert.equal(migrated.displayTitle, "受保护任务");
+});
+
+test("当前 schema 的外部 Display Title 仍会在恢复边界重新安全化", () => {
+  const state = createSession({ provider: "demo", workspace: "/tmp" });
+  state.displayTitle = "SSH root@10.0.0.8";
+
+  const migrated = migrateSessionState(state);
+
+  assert.equal(migrated.displayTitle, "受保护任务");
 });
 
 test("Gateway 恢复时保留模型部分输出并标记为 interrupted", () => {

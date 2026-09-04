@@ -12,6 +12,34 @@ import {
 } from "../src/tools/authorization.js";
 import { ProjectGrantStore } from "../src/tools/project-grant-store.js";
 
+test("Gateway 可持久化安全的自定义 Session Display Title", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-title-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({
+    workspace,
+    provider: { name: "title-provider", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null },
+    systemPrompt: () => "test",
+    store,
+  });
+  t.after(async () => {
+    await manager.close();
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+
+  const session = await manager.create();
+  const renamed = await manager.setDisplayTitle(session.id, "  本地架构复盘  ");
+  assert.equal(renamed.displayTitle, "本地架构复盘");
+  assert.equal(manager.list()[0].title, "本地架构复盘");
+
+  const protectedTitle = await manager.setDisplayTitle(session.id, "连接 root@192.168.1.8");
+  assert.equal(protectedTitle.displayTitle, "受保护任务");
+  assert.ok(protectedTitle.events.some((event) => event.type === "session.display_title_changed"));
+  const durableTitleEvent = store.listSessionEvents(session.id).findLast((event) => event.type === "SESSION_DISPLAY_TITLE_CHANGED");
+  assert.equal(JSON.stringify(durableTitleEvent).includes("192.168.1.8"), false);
+});
+
 test("关闭 Gateway 会取消仍在运行的任务", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-test-"));
   const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });

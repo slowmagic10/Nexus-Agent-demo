@@ -49,7 +49,7 @@ _Avoid_: Hidden patch paths, partial preflight writes, fuzzy replacement, claimi
 _Avoid_: Full state, UI state, prompt state
 
 **Context Window Plan**:
-一次模型请求对 Model Context 的确定性预算投影；固定计算 system prompt、Skills、工具 schema 和完整 turn 成本，只选择连续的最近完整 turn，并记录包含与省略数量。
+一次模型请求对 Model Context 的确定性成本投影；固定计算 system prompt、Skills、工具 schema 和完整 turn 成本，以配置值作为历史压缩的软目标，只选择连续的最近完整 turn，并记录包含与省略数量。估算超过目标不会阻止当前请求，真实上下文上限由 Provider 响应决定。
 _Avoid_: Message slice, token truncation
 
 **Historical Tool Transcript Projection**:
@@ -61,7 +61,7 @@ Context Lifecycle 对当前用户 turn 内已经闭合的较早工具轮生成�
 _Avoid_: Keeping only the last message, orphan tool results, compacting the latest two tool rounds, mutating Session state, model-generated active summary
 
 **Context Lifecycle**:
-管理一个用户 turn 内模型可见上下文完整生命周期的 deep Module。`startTurn` 在 Durable User Message 之后执行有界 Memory retrieval，并返回只公开 `completeModelStep` 的 turn Interface；该 Interface 在内部维护收紧后的 Context 预算，集中完成 Historical/Active Tool Transcript Projection、Context Window Plan、durable semantic summary、模型请求审计、usage 计量、Provider overflow 单次 replan 和 degraded audit。AgentRuntime 只协调 turn、工具循环和最终状态；`model-context` 纯投影与 Memory retrieval Adapter 是 Context Lifecycle 的内部 Implementation，不扩散给调用者。
+管理一个用户 turn 内模型可见上下文完整生命周期的 deep Module。`startTurn` 在 Durable User Message 之后执行有界 Memory retrieval，并返回只公开 `completeModelStep` 的 turn Interface；该 Interface 在内部维护可收紧的 Context 压缩目标，集中完成 Historical/Active Tool Transcript Projection、Context Window Plan、durable semantic summary、模型请求审计、usage 计量、Provider overflow 单次 replan 和 degraded audit。AgentRuntime 只协调 turn、工具循环和最终状态；`model-context` 纯投影与 Memory retrieval Adapter 是 Context Lifecycle 的内部 Implementation，不扩散给调用者。
 _Avoid_: Agent loop coordinating summary batches, caller-owned overflow retries, resetting tightened budget between tool rounds, pass-through context wrapper
 
 **Turn Budget**:
@@ -83,6 +83,38 @@ _Avoid_: Copying parent transcript, nested delegation, hidden child approval, au
 **Client Session Projection**:
 浏览器对一个已选 Agent Session 的只读 durable 投影。它公开 `select / refresh / close / query` 与当前 snapshot；内部原子读取 baseline 和 cursor、按 cursor 连接 SSE、只应用连续 patch、忽略重复或过期选择/事件源，并在游标缺口或无效 patch 时重新读取 baseline。Session-scoped feature query 绑定当前 Session 与 Projection revision，同一 query key 只保留最新请求，选择、刷新或关闭会取消全部旧请求。它复用共享 State Patch Module，不拥有 DOM、Memory/Grant 等 feature data，也不是恢复事实来源。
 _Avoid_: UI-owned EventSource, browser reducer, patch without cursor, stale selection overwriting the current view, all-Web global store, source of truth
+
+**Display Turn Projection**:
+Web 将 Durable Messages 投影为用户可见交互单元时，只有新的 user message 才开始新的 Turn。同一 user Turn 内多次 Provider assistant step、工具调用和工具结果统一收进一个 Agent 回应：中间步骤进入可折叠的“执行摘要”，最终 assistant message 单独展示；运行中的流式正文、审批和停止状态继续附着到当前 Turn。它不改变 Journal 或 Model Context，只解决展示层把模型步骤误画成多轮对话的问题；工具终态、耗时和恢复解释由 Execution Summary Projection 负责。
+_Avoid_: One avatar per Provider step, treating assistant tool messages as user turns, hiding tool failures, mutating durable messages for UI grouping
+
+**Execution Summary Projection**:
+把 Durable Messages、同一 user Turn 的 semantic durable event window，以及当前 `pendingApproval/toolStreams/modelStream` 收敛成一个 Web 执行视图的 deep Module。`projectExecutionTurns(session)` 在内部按 occurrence 绑定 Tool Run，允许 Provider 跨 Turn 或同 Turn 重用 callId；成功、失败、阻止、取消与 `execution_unknown` 只以 durable Tool 终态为准，不解析本地化输出文案。它统一聚合模型请求、Tool 数量与耗时、审批、恢复、Turn Outcome 和 File Change Manifest；活动 overlay 只能落在最后一个未闭合 occurrence，`execution_unknown + tool.completed` 只计一次。Branch baseline 继承 Messages 但不复制父 Tool lifecycle event，因此新事件窗口必须从末尾对齐，父 Tool 只显示为 `inherited`，不能伪造成功或未知。失败与取消原因来自各 Turn 的 durable terminal event，进入后续 Turn 或恢复后仍可解释；结果未知明确要求人工检查，不能暗示自动重试。缺失或孤立的非继承旧事件会标记投影完整性问题，不伪造成功。该投影只属于 Client UI，不写回 Journal，也不把 Token 估算放进主执行摘要。
+_Avoid_: Result-text status guessing, callId as global identity, aligning Branch events from the first inherited Turn, losing historical terminal reason, session-lifetime metrics presented as one turn, one row per stream delta, persisting UI summaries
+
+**Task Thread Module**:
+Task Workbench 主对话区的 deep UI Module，公开 `update / showWelcome / reset / destroy`，内部消费 Display Turn 与 Execution Summary Projection，并完整拥有 Turn DOM、无 Session 欢迎任务、实时模型正文、Tool Card、审批、Artifact 加载、文件审查入口、disclosure 状态和 follow-tail 策略。Turn 使用 `sessionId + turnKey` 身份稳定协调：流式 patch 只更新活动 Turn，已完成 Turn 节点、展开态、焦点和文本选择不被重建；用户接近底部或提交新 user Turn 时跟随尾部，主动上滚后模型/工具流不能抢回底部。审批和 Artifact 异步操作捕获 Session 身份，Session 切换会取消旧操作、RAF 和局部状态。它只保留短暂交互意图，Durable Session 仍是事实来源；app shell 只装配 Interface，并把返回的 Execution Summary 交给 Inspector 与 Review Workspace。
+_Avoid_: Whole-thread replaceChildren on every SSE patch, unconditional scroll-to-bottom, page-owned Tool Card behavior, callbacks that read the current Session after a click, shallow render callback bag, speculative virtual list or frontend framework migration
+
+**Composer Module**:
+Task Workbench 输入与任务中断的 deep UI Module，公开 `update / setDraft / focus / destroy`。它统一拥有 IME composition 与 229 兼容、Enter/Shift+Enter、发送/停止按钮状态、Provider 标签、`Esc` 中断、pending send 和 cancelling 等短暂交互状态；发送与取消在发起时捕获 Agent Session 身份，迟到成功或失败不得恢复、清空或禁用另一个 Session 的 Composer。成功发送保持防重复锁，直到对应 Session 的 durable phase 或单调 `userTurnCount` 推进；即使提交前后 phase 相同、期间切换过 Session，也能由新增 Durable User Message 解除。取消成功保持“正在停止”，直到该 Session 离开 busy phase。Overlay 与移动 Task Navigation 优先消费 Escape，`destroy` 后 listener 和迟到 Promise 均失效。它不拥有 Permission Profile、弹窗、toast 或 Durable Session 状态，app shell 只提供请求 Adapter 和当前投影。
+_Avoid_: Page-owned input listeners, shallow keyboard predicates, global cancelling flag, late request mutating another Session, Composer-owned permission or durable state
+
+**Inspector Shell Module**:
+Task Workbench 右侧任务详情的响应式 deep Module，公开 `open / close / select / isOpen / isModalOpen / isPersistent / destroy`；内部统一拥有 `概览 / 文件 / 上下文 / 更多`视图注册、active/hidden 和响应式容器语义。宽屏（≥1180px）时 Inspector 是 Grid 中常驻的第三栏，使用原生 complementary 语义，不创建 backdrop、不限制焦点且不消费 Escape；中小屏时才成为可关闭的 dialog 抽屉，统一处理 ARIA、Escape、backdrop、焦点约束与归还。视口缩小时若焦点位于即将关闭的 Inspector，会先归还详情入口，不能把焦点留在 inert 内容中。“文件”的投影、加载与渲染由 Review Workspace Module 拥有，Inspector Shell 只负责选择和容器行为；概览消费当前 Execution Summary 与 Session Evaluation，长期记忆、有效授权和 Journal Event 进入“更多”的按需 disclosure。Journal 只在对应 disclosure 打开时物化最近 100 条事件，关闭时仅暂存最新引用和数量，避免模型流式事件驱动隐藏 DOM 反复重建。它不拥有 Session 数据，也不抽象成尚无第二种 Implementation 的通用 Pane 框架。
+_Avoid_: Raw Journal as default view, five equal-priority debug tabs, page-owned drawer state, rendering hidden stream events, duplicating feature state
+
+**Review Workspace Module**:
+Task Workbench Inspector“文件”视图的 deep Module，公开 `update / select / reset / destroy`。它消费 Execution Summary Projection 中 occurrence-level 的 File Change Manifest 与 durable `file_diff` Artifact，按 Turn 和 Tool occurrence 分组；分支继承单独列出，同一路径的多次变化保持为不同 occurrence，不能按 callId 或 path 合并。Diff 以 `sessionId + artifactId + sha256` 为身份延迟加载和缓存，Session 切换会隔离迟到响应；同一 Session 的稳定投影不会因 SSE 更新重建视图。采集不完整、采集不可用、Diff 缺失或截断、仅元数据和非法记录都必须显式呈现。顶部入口与 Turn/概览中的文件入口汇聚到同一 Module；它不读取当前工作区来重建历史事实，首版也不拥有 staging、回滚、Terminal 或 Preview。
+_Avoid_: Current filesystem as historical truth, merging repeated paths, callId as batch identity, silent capture gaps, cross-session Artifact response, rebuilding a stable view on every SSE event, speculative generic Pane Adapter
+
+**Session Display Title**:
+Agent Session 在任务列表、页头和浏览器标题中使用的 durable 安全名称。首条 user message 只通过统一 Title Module 派生一次：先压缩空白，再对凭据、账号和网络端点执行脱敏与泛化；用户自定义命名也必须经过同一 Interface 后才能进入 Journal。Web 和 SessionStore 只消费 `displayTitle`，不能再次从消息正文自行截断。空自定义名称表示回到首条消息的安全派生标题；旧 schema 在恢复边界补齐该字段。
+_Avoid_: Raw first-message title, duplicate frontend truncation, credential-bearing custom title, UI-only rename
+
+**Task Navigation Module**:
+Web 工作台在窄屏下拥有任务抽屉的完整行为边界，公开 `open / close / isOpen / destroy`；内部统一处理 breakpoint、backdrop、Escape、ARIA 状态和桌面切换清理。Session 选择与创建只调用其 Interface，不各自操作 Sidebar class；Composer 只通过 `isOpen` 协调 Escape 优先级。桌面 Sidebar 仍是同一任务列表，不维护第二份 Session 状态。
+_Avoid_: Hiding sidebar without an entry point, duplicate mobile session list, page-level responsive event wiring
 
 **Session Checkpoint**:
 从某个 durable event cursor 派生并带校验和的恢复加速投影；它可以丢弃或重建，不能替代 session journal 的事实地位。
@@ -129,7 +161,7 @@ _Avoid_: Model extraction inside storage Adapter, auto-write active memory
 _Avoid_: Injecting unreviewed candidate into model context
 
 **Tool Host**:
-工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。参数 schema 只允许 Host 明确实现的 JSON Schema 关键字，约束递归执行；遇到 `$ref/$defs` 等未实现语义必须 fail closed，不能把部分校验伪装成完整校验。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
+工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、工具定义或规范化参数产生的可选 deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。`null` deadline 表示不自动超时，但不能绕过 Session cancel 或 Adapter 清理。参数 schema 只允许 Host 明确实现的 JSON Schema 关键字，约束递归执行；遇到 `$ref/$defs` 等未实现语义必须 fail closed，不能把部分校验伪装成完整校验。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
 _Avoid_: AgentRuntime reading tool approval or execute implementation
 
 **Tool Authorization Decision**:
@@ -169,12 +201,16 @@ _Avoid_: Global reusable approval, replayable call-bound grant, grant without po
 _Avoid_: Project grants stored in the repository, raw secret-bearing shell commands, path-agnostic global grants
 
 **Tool Execution Unknown**:
-有副作用且非 safe 的工具在 timeout、cancel 或进程中断时无法证明是否生效的终态。它写入 durable audit，补全工具协议，并禁止自动重放。
+有副作用且非 safe 的工具在显式 deadline 到达、用户取消或进程中断后，即使进程树已完成清理，也可能无法证明此前副作用是否生效。它写入 durable audit，补全工具协议，并禁止自动重放。
 只有 Adapter Implementation 已经启动且结果不可证明时才进入 unknown；启动前取消属于确定未执行，补全 cancelled result。
 _Avoid_: Timeout means no side effect, automatic replay after crash
 
+**Foreground Shell Run**:
+`run_shell` 的一次调用对应一个 request-scoped 前台执行。可选 `timeout_ms` 被规范化为 `ExecutionSpec.timeoutMs`；省略时为 `null`，表示没有自动 deadline，但 Agent 仍等待进程退出，用户取消与 Gateway 关闭仍可终止它。开始事件保存有效期限，终态保存实际耗时与第一个终止原因；deadline 与用户取消竞态时 first-cause 不得被迟到信号覆盖。Host 必须先等待 Adapter 有界回收，再闭合输出、Artifact 与 File Manifest；异常结果已经捕获的输出仍进入统一脱敏和 Artifact 流程。timeout、cancel 或 interruption 在副作用不可证明时继续进入 Tool Execution Unknown。
+_Avoid_: Hidden default timeout, no deadline means detached job, PTY/job control hidden inside run_shell, timeout means no side effect
+
 **Tool Output Stream**:
-WorkspaceExecution 在运行期间发布有序的 stdout/stderr observation，Tool Host 把它收敛为有界、整行发布且先脱敏再持久化的 durable preview。Session 的 `toolStreams` 只是尚未闭合 Tool Call 的实时投影，最终 Tool Result/Artifact 仍拥有完整结果并在闭合时取代该投影；取消、超时和 `execution_unknown` 继续使用同一条工具终态链路。浏览器只消费 Session State Patch，不直接读取子进程，也不把原始 chunk 保存到客户端私有状态。
+WorkspaceExecution 在运行期间发布有序的 stdout/stderr observation，Tool Host 把它收敛为有界、整行发布且先脱敏再持久化的 durable preview。Session 的 `toolStreams` 只是尚未闭合 Tool Call 的实时投影，最终 Tool Result/Artifact 仍拥有完整结果并在闭合时取代该投影；取消、超时和 `execution_unknown` 继续使用同一条工具终态链路。无 deadline 的长运行仍只保留有界 durable preview，不能因为运行时间不受限而产生无限 Journal。浏览器只消费 Session State Patch，不直接读取子进程，也不把原始 chunk 保存到客户端私有状态。
 _Avoid_: Browser-only terminal output, raw chunk per journal event, persisting incomplete credential-bearing lines, replacing final Tool Result with a live preview
 
 **Config Composition**:
@@ -194,5 +230,5 @@ _Avoid_: Token-per-event journal writes, raw Provider SSE in session state, brow
 _Avoid_: Static global registries, silent replacement, dispose before visibility revocation, executing through stale capability references
 
 **WorkspaceExecution**:
-Tool 与实际执行环境之间的稳定接口。Tool 产生显式 ExecutionSpec，Native/Local/Docker/Remote Adapter 负责 cwd、环境、进程和输出；stdout/stderr 各自维持流级 UTF-8 解码状态，实时 observation 和最终结果不得因 Buffer chunk 边界产生不同文本。Tool Host 仍负责 Capability、Policy、Approval、deadline、取消与 unknown 副作用。macOS 默认使用 NativeSandboxAdapter/Seatbelt；LocalWorkspaceAdapter 仅为显式 trusted-local；Docker 是显式可选后端。原生沙箱依赖缺失或平台未实现时 fail closed，不允许回退到 unrestricted。
+Tool 与实际执行环境之间的稳定接口。Tool 产生显式 ExecutionSpec，Native/Local/Docker/Remote Adapter 负责 cwd、环境、进程和输出；`ExecutionSpec.timeoutMs` 是正整数或 `null`，`null` 仅关闭自动 deadline。Adapter 仍必须响应 AbortSignal，并在取消或 deadline 到达时终止和回收完整进程树，再返回可分类的终止原因。stdout/stderr 各自维持流级 UTF-8 解码状态，实时 observation 和最终结果不得因 Buffer chunk 边界产生不同文本。Tool Host 仍负责 Capability、Policy、Approval、deadline、取消与 unknown 副作用。macOS 默认使用 NativeSandboxAdapter/Seatbelt；LocalWorkspaceAdapter 仅为显式 trusted-local；Docker 是显式可选后端。原生沙箱依赖缺失或平台未实现时 fail closed，不允许回退到 unrestricted。
 _Avoid_: child_process inside Tool Registry, full process.env inheritance, shell:true, project config selecting execution mode, silent sandbox fallback, treating OS sandbox or Docker as VM isolation

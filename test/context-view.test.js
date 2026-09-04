@@ -66,6 +66,7 @@ test("Context 可观测性投影只返回预算、来源数量和摘要元数据
   assert.deepEqual(view.usage, {
     estimatedTokens: 820,
     maxTokens: 1_000,
+    overTarget: false,
     percent: 82,
     meterPercent: 82,
     level: "warning",
@@ -97,6 +98,24 @@ test("Context 可观测性投影只返回预算、来源数量和摘要元数据
   assert.equal(view.summary.statusLabel, "已纳入本次请求");
   assert.equal(view.identity.contextHashShort, "aaaaaaaaaaaa");
   assert.equal(JSON.stringify(view).includes("不应"), false);
+});
+
+test("超过本地估算目标时提示继续交由 Provider，而不是任务停止", () => {
+  const view = contextObservabilityViewModel({
+    events: [{
+      seq: 1,
+      type: "model.context_prepared",
+      compacted: false,
+      maxInputTokens: 32_000,
+      estimatedInputTokens: 33_500,
+      estimatedOverTarget: true,
+    }],
+  });
+
+  assert.equal(view.plan.statusLabel, "超过估算目标，已继续");
+  assert.equal(view.usage.overTarget, true);
+  assert.equal(view.usage.percent, 105);
+  assert.equal(view.usage.meterPercent, 100);
 });
 
 test("Context 可观测性解释重规划耗尽和摘要降级", () => {

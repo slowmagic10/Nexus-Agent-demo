@@ -1,0 +1,595 @@
+(node:75569) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Agent Profile snapshot 稳定摘要运行身份且不保存敏感正文 (10.923542ms)
+✔ Gateway 恢复到不同运行 Profile 时写入 durable 选择事件 (29.536208ms)
+(node:75570) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ 会话可从事件日志重放，快照不是事实来源 (30.211625ms)
+✔ 订阅者只会看到已经持久化的状态 (14.664291ms)
+✔ 持久化失败时不推进内存状态，也不通知订阅者 (1.393875ms)
+✔ 订阅者异常不改变 durable dispatch 结果且不阻断其他订阅者 (1.186208ms)
+✔ 异步订阅者拒绝不会逃逸为 unhandledRejection (5.388ms)
+✔ Session 拒绝 Token 指标累计越过安全整数边界 (1.058667ms)
+✔ 事件游标支持增量读取、断点订阅和客户端投影 (13.054291ms)
+✔ 模型请求只暴露 durable context，并与展示状态隔离 (12.890125ms)
+✔ Context Hash 随 Model Context audit event 持久化并可从 Journal 恢复 (11.391208ms)
+✔ durable semantic summary 可从 Journal 恢复并继续进入压缩上下文 (18.062625ms)
+✔ 恢复从最新 checkpoint 开始，只重放之后的 durable event (11.061291ms)
+✔ checkpoint 损坏时自动退回完整 journal 重放 (9.792167ms)
+✔ portable journal export 包含连续事实但不包含派生 checkpoint (11.97325ms)
+✔ portable journal 可重定位 workspace、重映射 ID 并完整重放 (22.45775ms)
+✔ 导入的未完成 Memory outbox 不会自动执行副作用 (20.034916ms)
+✔ portable journal 校验失败时不会留下半导入会话 (15.29075ms)
+✔ portable journal ID 冲突时保持已有会话与事件不变 (17.56075ms)
+✔ Session Branch 从指定 cursor 建立独立 lineage 并闭合未决工具 (17.513125ms)
+(node:75571) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ apply_patch 在一个 Tool Call 中新增、更新、删除并生成完整 Manifest (77.378459ms)
+✔ apply_patch 任一预检失败时所有文件保持不变 (34.213833ms)
+✔ apply_patch 在提交中失败时回滚已经写入的文件 (15.92675ms)
+✔ apply_patch 对重复真实目标和受保护路径 fail closed (32.739917ms)
+✔ apply_patch 拒绝空批次且 read-only 不向模型暴露 (13.688458ms)
+(node:75572) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Portable Journal 携带 Artifact 并在重映射 Session 后保持可读 (49.732208ms)
+✔ Artifact 被篡改的 Archive 原子拒绝且不留下 Session (25.4575ms)
+✔ Session Branch 只复制指定 cursor 已可见的 Artifact (16.030667ms)
+✔ Session Branch 缺少被引用 Artifact 时不留下半创建基线 (14.224333ms)
+✔ 无 Artifact 的旧式 Archive 继续保持原有可导入结构 (25.834125ms)
+✔ migration v7 保留 v6 Artifact 并升级为 Session 复合主键 (15.697125ms)
+(node:75573) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ SQLite Artifact Adapter 按 Session 持久化并校验内容摘要 (29.898375ms)
+✔ Tool Host 将脱敏后的大输出保存为 Artifact 并写入 durable 引用 (27.350625ms)
+✔ read_artifact 只读取当前 Session 的分段内容 (16.470791ms)
+✔ run_shell 长输出经过 WorkspaceExecution 后保存为 Artifact (34.039875ms)
+✔ run_shell 失败大输出也由 Tool Host 保存为 Artifact (28.172208ms)
+✔ MCP 大输出在进入 Tool Host 前保持完整尾部 (97.146334ms)
+✔ Gateway Manager 只通过 Session 作用域列出和读取 Artifact (13.278625ms)
+✔ Web 只从 Tool Host 的完整输出标记提取 Artifact ID (0.389125ms)
+(node:75575) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Capability Runtime 按 owner 撤销，并在异步 dispose 前立即隐藏能力 (3.784292ms)
+✔ Tool Host 在执行前拒绝已经撤销的旧 capability registration (16.092917ms)
+(node:75576) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✖ CLI --sessions 可在空工作区启动 (108.100416ms)
+✖ 普通 CLI 可使用显式 Agent Profile 启动并退出 (93.150542ms)
+✖ CLI Journal Import 可在新工作区完成 (149.865375ms)
+✔ CLI 可在不启动 Runtime 的情况下离线评测 Journal Archive (237.026708ms)
+✔ CLI 可离线运行确定性 Scenario Evaluation (138.882084ms)
+✔ CLI 可按标签运行 Scenario Suite，并以退出码 2 表示断言失败 (204.214083ms)
+✔ CLI 可使用 Suite Baseline 检测 Token 回归并应用容差 (174.886458ms)
+✔ Config Composition 默认生成可运行的 Demo 配置 (7.351083ms)
+✔ --demo 清除 Thinking 并强制所有具名 Profile 保持离线 (27.702375ms)
+✔ 配置按 profile、local、environment、CLI 的确定顺序覆盖 (14.148667ms)
+✔ 本地私有配置可定义具名 Agent Profile 并由 CLI 显式选择 (8.482042ms)
+✔ 具名 Agent Profile 可显式绑定不同模型且 inspection 不暴露密钥 (7.717917ms)
+✔ 本机配置可显式选择原生 OpenAI Responses Adapter (6.574083ms)
+✔ 共享 profile 禁止 API Key，未知字段和无效值 fail closed (14.4405ms)
+✔ 共享 profile 不能启用会启动本地进程的 MCP (10.835375ms)
+✔ Docker 执行只能由可信环境或 CLI 显式启用 (15.958584ms)
+✔ Docker 执行配置缺失或组合冲突时 fail closed (2.317959ms)
+✔ 安全 Permission Profile 只能由可信环境或 CLI 选择 (9.60875ms)
+✔ 网络目标只能由可信环境或 CLI 为 Native Sandbox 声明 (13.794416ms)
+✔ 最终生效配置输出会脱敏 Key 并序列化无限步骤与 Token 预算 (0.917917ms)
+✔ Context Lifecycle 通过一个 turn Interface 收拢 retrieval、规划和模型审计 (12.013625ms)
+✔ Context Lifecycle 在同一 turn 内隐藏并延续 overflow 后的收紧预算 (8.705417ms)
+✔ Context Lifecycle 在 turn 开始前已取消时闭合 retrieval，不留下未处理拒绝 (1.78575ms)
+✔ Context Lifecycle 拒绝非法 Provider Token usage，预算指标不被污染 (3.773ms)
+✔ Context Lifecycle 在 Provider usage 缺少计数时回退本地估算 (2.916708ms)
+✔ Context Lifecycle 对 Provider 部分 usage 逐分量回退本地估算 (2.614375ms)
+✔ Context Lifecycle 拒绝分量求和后越过安全整数的 Token usage (1.673333ms)
+✔ 模型 Context Summarizer 只请求结构化摘要并解析 fenced JSON (2.37725ms)
+✔ Context Summary Batch 按完整 turn 前向推进并标记过长来源 (1.651291ms)
+✔ Context 可观测性投影只返回预算、来源数量和摘要元数据 (1.605625ms)
+✔ 超过本地估算目标时提示继续交由 Provider，而不是任务停止 (0.741042ms)
+✔ Context 可观测性解释重规划耗尽和摘要降级 (0.567792ms)
+✔ 没有 Context 规划或摘要时不显示空观察卡 (0.25275ms)
+✔ 未触发窗口裁剪时单独解释历史工具投影 (0.157708ms)
+✔ 未触发窗口裁剪时单独解释活动工具轮投影 (0.086584ms)
+✔ 旧计划缺少 Context Hash 时不会关联更早的重规划事件 (0.085083ms)
+✔ 旧轮次摘要降级不会污染最新正常 Context Plan (0.078375ms)
+(node:75582) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ 单层委派具有 durable Parent/Child 生命周期 (11.581875ms)
+✔ Gateway 单层委派只传显式上下文、继承受限预算并回填结果 (87.927291ms)
+✔ 取消 Parent 会级联取消正在运行的 Child (36.141917ms)
+✔ Child 的风险工具审批代理到 Parent 后继续执行 (89.581125ms)
+✔ Gateway 重启恢复 Child 时保留收紧后的 durable 预算 (32.749792ms)
+(node:75584) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ edit_file 在 workspace-auto 中精确替换并生成 durable Manifest 与 Diff (56.850333ms)
+✔ edit_file 在匹配缺失或歧义时不写入 (33.961125ms)
+✔ edit_file 支持显式多处替换并保留 UTF-8 BOM 与 CRLF (20.380583ms)
+✔ edit_file 通过工作区内符号链接编辑时审计真实目标 (20.466958ms)
+✔ read-only 不向模型暴露 edit_file (3.649625ms)
+(node:75585) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✖ File Change Capture 识别新增、修改、删除并忽略秘密与内部目录 (12.23925ms)
+✔ write_file 将 Manifest 与脱敏 Diff Artifact 写入 durable TOOL_RESULT (85.908125ms)
+✔ run_shell 通过统一 Tool Host 采集工作区变化 (34.347084ms)
+✔ write_file 通过工作区内符号链接写入时审计真实目标 (33.186833ms)
+✔ run_shell 创建、改指向和删除符号链接时记录链接变化 (34.24775ms)
+(node:75586) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ 关闭 Gateway 会取消仍在运行的任务 (39.461708ms)
+✔ Gateway 可在模型运行中由用户显式打断任务 (11.611583ms)
+✔ Gateway 可按 Session 返回不含正文的确定性诊断报告 (22.928917ms)
+✔ Gateway 审批只接受当前卡片公开的 Grant scope (11.712209ms)
+✔ Gateway 只列出可用 Grant，并按真实 scope 撤销 (19.694208ms)
+✔ Gateway 从指定游标补发事件后继续推送实时事件 (31.993917ms)
+✔ Gateway 可以导出 journal 并从指定 cursor 创建分支 (13.950583ms)
+✔ Gateway 可导入 journal，并把存储错误映射为客户端错误 (13.441417ms)
+✔ Gateway 可查看、验证来源并软删除长期记忆 (13.65475ms)
+✔ Gateway 暴露 Memory mutation retry、discard 与 resolve API (51.3495ms)
+✔ Gateway 可列出、批准和拒绝候选记忆 (19.561334ms)
+✔ Gateway 通过 Session durable outbox 固定和取消固定长期记忆 (18.54675ms)
+✔ Gateway 权限菜单按会话持久切换且运行中禁止变化 (25.812ms)
+✔ Gateway 完全访问要求可用 trusted-local Host 和显式二次确认 (10.253208ms)
+✔ Gateway 恢复和导入危险会话时不会复用历史确认 (24.426083ms)
+(node:75587) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Gateway 静态资源白名单包含 Web 子模块且拒绝任意路径 (2.826292ms)
+✖ 通用本地配置优先于旧厂商配置且不覆盖进程环境 (0.628833ms)
+✖ 没有通用配置时自动读取旧配置以保留现有密钥 (0.307417ms)
+(node:75591) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ MCP 样例公开 Tools、Resources 和 Prompts (95.718167ms)
+✔ MCP 子进程只继承白名单环境和显式配置 (54.550459ms)
+✔ MCP close 等待退出并强制终止忽略 SIGTERM 的子进程 (85.288417ms)
+(node:75592) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ SQLite Memory Adapter 按 scope 检索并返回完整 provenance (15.025625ms)
+✔ 重复事实合并到同一条 Memory Record (12.747667ms)
+✔ 更新、替代和删除都保留软删除状态与审计历史 (9.947042ms)
+✔ 已过期 Memory 不会进入检索结果 (6.93825ms)
+✔ Pinned Memory 只允许 active 记录并支持独立 scope 检索 (9.817958ms)
+✔ Adapter 拒绝非法终态创建和不可变字段更新 (10.97ms)
+✔ 所有 ID 操作都按 caller scope 隔离且普通更新不能移动 scope (5.596584ms)
+✔ SQLite Adapter 暴露统一 Promise 契约并要求 Inspection capability (6.949667ms)
+✔ lexical 排序在 LIMIT 前优先保留旧 exact match (6.375541ms)
+✔ 不存在的本地 provenance 不得伪装成可验证来源 (6.92525ms)
+✔ 本地 provenance 的来源 Session 必须属于当前 Memory scope (7.839292ms)
+✔ mutationId 重用时必须绑定相同规范化请求内容 (6.423875ms)
+✔ legacy NULL request_hash 不允许自动 replay (9.162042ms)
+✔ Pinned 与 Relevant Memory 使用独立预算且固定记忆优先 (1.8805ms)
+(node:75594) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ MemoryFlushPolicy 只创建 candidate，跳过已有事实并保留来源 (46.81825ms)
+✔ MemoryFlushPolicy 提取失败只记录 degraded，不改变已完成 turn (14.778375ms)
+✔ MemoryFlushPolicy 对忽略 AbortSignal 的 extractor 执行 deadline (15.981791ms)
+(node:75595) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ memory_save provenance 精确指向 TOOL_REQUESTED durable cursor (70.541875ms)
+✔ Memory mutation 在 TOOL_RESULT 失败前已有 durable outbox 事实 (42.59975ms)
+✔ 中断在 mutation applied event 前可幂等 retry (69.055541ms)
+✔ 失败 mutation 进入可恢复终态且不再阻断后续 turn (15.460417ms)
+✔ 忽略 AbortSignal 的非幂等 Adapter 超时后进入 outcome_unknown 且禁止 retry (47.27325ms)
+✔ Adapter 类型化错误控制 safe-to-retry 与 non-retryable 策略 (13.956917ms)
+✔ manual mutation 可 retry、discard 或人工 resolve (17.26025ms)
+✔ 预算充足时 Model Context 保持完整且不添加压缩标记 (11.620417ms)
+✔ 超预算时只保留连续的最近完整 turn，不拆散工具协议 (0.949458ms)
+✔ Context Hash 对等价请求保持稳定并随模型可见内容变化 (0.897917ms)
+✔ 已完成历史轮次的大型工具参数和结果使用有界投影，durable 消息保持完整 (1.117209ms)
+✔ 历史 turn 含不透明 Provider 状态时同样保持完整工具协议 (0.824417ms)
+✔ 当前轮次保持逐字完整，旧工具协议只有实际省 Token 时才投影 (0.346708ms)
+✔ 活动 turn 只精简较早工具轮并逐字保留最近两个完整工具轮 (0.46075ms)
+✔ 活动 turn 含不透明 Provider 状态时保持完整工具协议而不做转录投影 (0.317167ms)
+✔ 当前 turn 超过估算目标时保持完整并交由 Provider 决定 (0.114625ms)
+✔ 固定上下文超过估算目标时仍构造完整请求 (0.149834ms)
+✔ Context Window Plan 记录长期记忆命中来源但不复制正文 (0.7025ms)
+✔ Context Window Plan 分开记录 Pinned 与 Relevant Memory 预算来源 (0.487958ms)
+✔ 覆盖范围完整的 durable semantic summary 与最近 turn 一起进入请求 (2.140792ms)
+(node:75599) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Gateway 显式选择具名 Agent Profile 并持久绑定运行上下文 (70.438584ms)
+✔ 具名 Agent Profile 继承默认值并只公开安全摘要 (12.45875ms)
+✔ 具名 Agent Profile 拒绝危险权限、未知字段和不存在的默认项 (1.186625ms)
+(node:75601) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Objective 与 Plan 通过 durable action 进入明确生命周期 (4.941667ms)
+✔ Plan 拒绝空步骤、重复步骤和多个进行中步骤 (0.542083ms)
+✔ update_plan 在 read-only 中自动执行并写入 Session Journal (13.682791ms)
+✔ Objective 与 Plan 可从 SQLite Journal 重放恢复 (22.955ms)
+✔ OpenAI Responses Adapter 转换 durable 消息、工具和流式函数调用 (23.788041ms)
+✔ OpenAI Responses Adapter 的非流式 complete 与 JSON streaming fallback 使用同一结果语义 (1.697166ms)
+✔ OpenAI Responses 保留单分量 usage 的缺失状态 (0.361709ms)
+✔ OpenAI Responses incomplete 即使携带函数调用也保留非正常终态 (0.767875ms)
+✔ OpenAI Responses Adapter 拒绝非法 Tool Arguments JSON (0.671041ms)
+✔ OpenAI Responses 流式失败事件规范化为 Provider 错误 (0.356125ms)
+✔ PermissionProfile 独立判断路径风险、沙箱和审批 (3.955792ms)
+✔ workspace-auto 拒绝 Shell 通过 home shorthand 读取宿主凭据 (0.106625ms)
+✔ 可信网络目标绑定 Profile、命令分类和 Sandbox 扩展 (3.155916ms)
+✔ danger-full-access 只允许 trusted-local 并跳过工具审批与保护分类 (0.726792ms)
+✔ workspace-auto 对沙箱内破坏性操作请求可复用到 Session 的审批 (0.411ms)
+✔ workspace-auto 不会自动允许动态解释器绕过破坏性命令分类 (0.345125ms)
+✔ workspace-untrusted 只自动允许沙箱内明确的只读检查命令 (1.042625ms)
+✔ workspace-confirm 对普通写入和所有 Shell 请求确认，但保留真正硬拒绝 (0.653875ms)
+✔ workspace-untrusted 的自动 Shell 使用固定工具路径 (13.429917ms)
+✔ read-only 只允许工作区读取和最小只读 Shell，所有提权路径硬拒绝 (0.565792ms)
+✔ read-only 的自动 Shell 使用固定工具路径 (6.989166ms)
+✖ 文件工具统一隐藏所有 .env* 变体 (6.830583ms)
+✖ Tool Registry 执行层按 Session profile 选择 Shell 防线 (8.04325ms)
+✔ Tool Registry 只把审批命令命中的可信网络目标交给 WorkspaceExecution (5.438875ms)
+✖ 文件工具与 Shell 共享敏感路径策略 (6.930875ms)
+✔ PermissionToolHostRouter 按 durable Session profile 路由 schema 与执行 (1.94925ms)
+✔ Objective 计划投影为紧凑 Web ViewModel (0.618417ms)
+✔ Objective 计划投影包含 Child 委派状态 (0.079875ms)
+✔ Provider 思考模式投影为新任务可见标签 (1.195291ms)
+✔ Profile 漂移投影为可读且不暴露 hash 的 Web 摘要 (0.629958ms)
+(node:75610) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ ProjectGrantStore 私有持久化、撤销并绑定规范 workspace 身份 (14.145625ms)
+✔ 本地模型配置仍为占位 Key 时立即给出明确错误 (1.724167ms)
+✔ OpenAI-compatible Provider 解析分块 SSE 并组装增量工具调用 (27.82325ms)
+✔ OpenAI-compatible Streaming 在兼容端返回 JSON 时安全降级为单次增量 (10.44725ms)
+✔ OpenAI-compatible JSON fallback 缺少 usage 时保留为空以启用 Runtime 估算 (1.439666ms)
+✔ OpenAI-compatible 保留单分量 usage 的缺失状态 (4.563917ms)
+✔ OpenAI-compatible Streaming 在 SSE 截断且没有明确终态时失败 (5.235ms)
+✔ OpenAI-compatible Provider 拒绝非法 Tool Arguments JSON (1.646333ms)
+✔ OpenAI-compatible Provider 持久化并回传思考模式的 reasoning_content (1.001542ms)
+✔ OpenAI-compatible Provider 只在显式配置时发送 thinking 开关 (2.206459ms)
+✔ Provider 错误只把明确的 Context overflow 分类为可重规划 (2.150667ms)
+✔ 认证和限流 code 优先于冲突的 Context 文案 (0.407375ms)
+(node:75612) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Replay Harness 校验 Archive 并确定性重放健康报告 (41.676458ms)
+✔ Replay Harness 拒绝被篡改的 Archive，并解释不同重放结果 (36.5785ms)
+(node:75614) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Runtime Assembly 延迟激活执行环境和 MCP，基础 Store 可独立关闭 (17.330834ms)
+✔ Runtime Assembly 统一创建 Tool graph、AgentRuntime 和资源生命周期 (54.943542ms)
+✔ 步骤上限默认不限制并支持命令行覆盖环境变量 (1.022125ms)
+✔ unlimited 和 0 都表示无限步骤 (0.091583ms)
+✔ 无效步骤配置会在启动时明确失败 (0.193292ms)
+✔ 累计 Token 预算默认不限制并允许显式设置边界 (0.07175ms)
+(node:75616) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ 模型用量和耗时进入状态指标 (17.742ms)
+✔ 非正常模型终态保留部分回答但不会把任务判为成功 (13.572333ms)
+✔ 截断的模型工具调用不会启动 Tool Host Adapter (2.665ms)
+✔ Streaming Provider 增量正文 durable 合并后完成，工具调用保持现有协议 (6.907416ms)
+✔ 取消 Streaming 模型请求会保留已脱敏的部分输出并立即闭合状态 (1.534958ms)
+✔ Streaming Provider Context overflow 会丢弃旧增量投影并只重试一次 (9.328625ms)
+✔ Provider opaque items 随 Assistant Message durable 保存并进入下一工具轮 (5.490125ms)
+✔ 默认无限步骤与累计 Token 预算允许持续工具循环直到模型完成 (18.94725ms)
+✔ 显式累计 Token 预算在下一工具启动前停止并闭合工具协议 (5.904792ms)
+✔ 运行时按预算压缩历史 turn 并留下 durable audit event (3.004875ms)
+✔ Provider Context overflow 会缩减完整 turn 并自动重试一次 (9.23925ms)
+✔ 非 Context overflow 的 Provider 错误不会自动重试 (2.097875ms)
+✔ Context overflow 自动重试仍失败时停止且不进行第三次请求 (5.449125ms)
+✔ 运行时在压缩前生成 durable semantic summary 并注入主模型请求 (4.8955ms)
+✔ 滚动摘要只合并上次覆盖范围之后新省略的完整 turn (8.324083ms)
+✔ 语义摘要失败时记录 degraded 并继续使用最近完整 turn (3.554625ms)
+✔ 当前 turn 超过本地估算目标时仍调用 Provider (1.390917ms)
+✔ 取消会中止模型请求并进入 cancelled (8.967ms)
+✔ 取消会为未闭合工具调用补充安全结果 (0.594417ms)
+✔ 敏感凭据会从工具日志文本中脱敏 (0.271917ms)
+✔ Assistant 正文中的明确密码语境会在持久化前脱敏 (0.988208ms)
+✔ 普通代码和测试描述不会被高熵启发式误判为凭据 (0.035417ms)
+✔ 普通代码型 Tool 参数经过 Runtime 后保持逐字不变 (1.646916ms)
+✔ 无限步骤模式允许单次任务执行超过默认八步 (76.208708ms)
+✔ 长期记忆检索失败时降级为空并继续 Agent Loop (1.253625ms)
+✔ 长期记忆检索超时后降级并继续模型请求 (7.1625ms)
+✔ Memory reconcile 超时后留下审计并继续 turn (7.956625ms)
+✔ turn 完成后触发 Memory flush，flush 失败不推翻完成状态 (1.406875ms)
+✔ AgentRuntime 只通过 Tool Host Interface 执行工具 (3.002667ms)
+(node:75617) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Scenario Harness 通过真实 Runtime 与 Tool Host 确定性重跑成功场景 (33.59075ms)
+✔ Scenario Harness 稳定识别工具失败 (15.741583ms)
+✔ Scenario Harness 可在工具启动后取消并重复得到相同语义结果 (10.97175ms)
+✔ Scenario Harness 对错误期望返回失败报告，并拒绝未声明工具 (5.55375ms)
+(node:75618) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Suite Baseline 对相同报告通过，并允许新增且通过的场景 (38.723583ms)
+✔ Suite Baseline 检测场景缺失、Context 漂移和通过变失败 (11.750667ms)
+✔ Suite Baseline 按百分比容差判断 Token 增长，并记录指纹变化 (6.005375ms)
+✔ Suite Baseline 拒绝错误报告和非法 Token 容差 (7.42775ms)
+(node:75619) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Scenario Suite 汇总通过率、稳定指标、问题与标签覆盖 (60.494875ms)
+✔ Scenario Suite 标签使用任一命中语义筛选且不暴露正文 (15.884208ms)
+✔ Scenario Suite 目录 Loader 只加载排序后的普通 JSON fixture (43.262125ms)
+✔ Scenario Suite 拒绝重复 ID、空筛选结果和损坏 fixture (6.683833ms)
+✔ Session Evaluation 从 durable 状态生成确定性健康报告 (2.621083ms)
+✔ Session Evaluation 将未知执行和 Context 耗尽提升为高优先级问题 (5.660292ms)
+✔ Session Evaluation 对未闭合 Objective 和无工具会话给出可解释状态 (0.333208ms)
+✔ Gateway 恢复到 idle 后仍按 durable Objective 保留任务终态 (0.350875ms)
+✔ Client Session Projection 应用连续事件并在游标缺口时恢复 baseline (1.12075ms)
+✔ Client Session Projection 丢弃快速选择返回的旧 Session (1.357125ms)
+✔ Client Session Projection 在切换和 refresh 后拒绝旧事件源 (0.709875ms)
+✔ Client Session Projection 取消迟到的 feature query 且同类请求只保留最新结果 (0.782375ms)
+(node:75622) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ 会话状态可保存、列出并按 ID 恢复 (20.779875ms)
+✔ 恢复会话会丢弃未决审批并留下审计事件 (0.932333ms)
+✔ 恢复会话不会重复补全已有工具结果 (0.735459ms)
+✔ 恢复执行中的工具会记录 execution_unknown 且不自动重放 (1.380375ms)
+✔ 长期记忆支持保存、搜索和删除 (11.710084ms)
+✔ 旧数据库会按顺序执行显式 schema migration (7.873333ms)
+✔ schema v2 会话状态加载时迁移到当前版本 (5.34025ms)
+✔ schema v7 的 call-bound Grant 迁移后默认视为已消费 (0.517208ms)
+✔ schema v12 升级时保留 Agent Profile 并初始化 durable summary (0.576708ms)
+✔ schema v14 升级时初始化 Tool Output Stream 投影 (0.314042ms)
+✔ Gateway 恢复时保留模型部分输出并标记为 interrupted (0.394458ms)
+✔ 模型增量通过 SQLite Journal 重放后仍可恢复 (15.202375ms)
+✔ SessionStore 不再从数据库路径猜测 workspace (0.422916ms)
+(node:75624) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Workspace Policy 从 .nexus/tool-policy.json 加载简单 JSON 规则 (13.10375ms)
+✔ 从 workspace 加载的 allow 规则不能提升 Permission Profile (7.591792ms)
+(node:75625) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ Tool Host 在审批和执行前校验参数 (8.431833ms)
+✔ Tool Host 执行前强制 JSON Schema 数值、字符串和 oneOf 约束 (7.475125ms)
+✔ Tool Host 对未支持的 JSON Schema 关键字 fail closed (0.713667ms)
+✔ Tool Host 只在内层参数完整通过 schema 时恢复 Provider 双重 arguments 包装 (6.061667ms)
+✔ Tool Host 将 Approval 绑定 args hash，并统一脱敏执行结果 (6.486708ms)
+✔ Tool Host 将执行中输出写入 durable Tool Output Stream (3.042208ms)
+✔ Approval 自动签发的 call-bound Grant 不能重放 (6.766209ms)
+✔ Approval 可签发精确资源的 Session Grant，并拒绝跨资源复用 (6.7445ms)
+✔ Project Grant 仅在同一规范 workspace 复用，且策略变化后失效 (14.135709ms)
+✔ 有副作用工具超时后记录 execution_unknown 且不悬挂 (6.219125ms)
+✔ 执行中的有副作用工具被取消后仍记录实际工具耗时 (17.662583ms)
+✔ Tool Host 收到预取消信号时不会启动有副作用工具 (0.637416ms)
+✔ Approval 后参数变化会失效且不会执行 (1.425667ms)
+✔ workspace 外路径在 Adapter 启动前始终拒绝 (0.612417ms)
+✔ 指向 workspace 外部的符号链接在 Adapter 启动前拒绝 (2.795583ms)
+✔ Workspace Policy deny 会隐藏 schema 并阻止 Adapter (2.965333ms)
+✔ Session Grant 只在绑定会话和 workspace 内生效，并支持撤销 (10.206625ms)
+✔ Workspace Policy 变化后旧 Approval 自动失效 (1.730542ms)
+✔ workspace-auto 自动允许普通文件写入和 Native 沙箱常规命令 (3.592666ms)
+✔ workspace-auto 对网络 Shell 要求审批，Workspace allow 不能提权 (3.23225ms)
+✔ 沙箱内破坏性 Shell 可经 Session Grant 避免重复确认 (2.689625ms)
+✔ workspace-untrusted 自动编辑但只自动执行明确只读 Shell (3.526083ms)
+✔ read-only 隐藏写能力，且 Workspace allow 与旧 Grant 都不能提权 (1.678041ms)
+✔ Tool Output Stream 只发布完整行并在 durable snapshot 前统一脱敏 (2.286333ms)
+✔ Tool Output Stream 的第一条短完整行立即发布，后续更新再节流 (0.153875ms)
+✔ Tool Output Stream 截断时不发布不完整首行 (0.083708ms)
+✔ Tool Output Stream 进入 Session 投影并在最终 Tool Result 后清除 (3.595958ms)
+✔ Tool Transcript 按出现顺序配对重复 callId，不把旧结果套到运行中调用 (1.539083ms)
+✔ Tool Transcript 为同一 callId 的多个已完成调用逐个消费结果 (0.269916ms)
+✔ Grant UI 将 scope、资源和到期时间转换成安全可读视图 (0.898708ms)
+✔ Grant UI 覆盖 once/session 与常见资源类型 (0.0855ms)
+✔ 消息输入框只在非组合输入的普通 Enter 时提交 (0.466792ms)
+✔ 运行中 Composer 切换为可用的停止控制并支持 Esc (0.760333ms)
+(node:75631) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+✔ LocalWorkspaceAdapter 只向子进程暴露环境白名单 (61.992584ms)
+✔ LocalWorkspaceAdapter 按 stdout/stderr 通道发布执行中输出 (29.397375ms)
+✔ LocalWorkspaceAdapter 跨 Buffer chunk 保持 UTF-8 输出完整 (47.037292ms)
+✔ LocalWorkspaceAdapter 拒绝 workspace 外 cwd 和越界符号链接 (27.555375ms)
+✔ LocalWorkspaceAdapter 支持独立超时和 AbortSignal 取消 (34.358875ms)
+✔ LocalWorkspaceAdapter 超时会终止完整进程组 (396.437459ms)
+✔ NativeSandboxAdapter 在 macOS 构造可审计 Seatbelt 策略 (7.865083ms)
+✔ NativeSandboxAdapter 不支持平台和策略应用失败都 fail closed (2.486375ms)
+✔ DockerWorkspaceAdapter 构造固定隔离参数且只挂载 workspace (4.992584ms)
+✔ ExecutionSpec 显式区分 workspace-write 与 read-only (0.287ms)
+✔ DockerWorkspaceAdapter 默认拒绝容器环境变量和非法镜像 (0.956334ms)
+✔ DockerWorkspaceAdapter 执行失败会独立清理且 CLI 缺失时不降级 (0.710041ms)
+✔ WorkspaceExecution factory 支持 native 默认边界及显式 local/docker (1.284708ms)
+✔ ExecutionSpec 校验网络扩展，Local 与 Docker 不伪装成精确目标沙箱 (3.309875ms)
+✔ run_shell 通过 WorkspaceExecution 接口执行并保留危险命令拒绝 (5.024959ms)
+✔ 真实 run_shell 输出经 Tool Host 形成脱敏的 Session 实时投影 (10.118ms)
+✔ 可信网络扩展只在 Tool Host 审批后进入 Native ExecutionSpec (7.60675ms)
+✔ run_shell 经 WorkspaceExecution 超时后保持 execution_unknown 语义 (8.1165ms)
+ℹ tests 319
+ℹ suites 0
+ℹ pass 310
+ℹ fail 9
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 1627.86325
+
+✖ failing tests:
+
+test at test/cli-smoke.test.js:15:1
+✖ CLI --sessions 可在空工作区启动 (108.100416ms)
+  Error: Command failed: /Users/nick/.nvm/versions/node/v24.13.0/bin/node /Users/nick/Documents/ChatGPT/Nexus Agent/src/cli.js --demo --workspace=/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-cli-smoke-fzOqqC --sessions
+  (node:75579) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+  (Use `node --trace-warnings ...` to show where the warning was created)
+  node:fs:439
+      return binding.readFileUtf8(path, stringToFlags(options.flag));
+                     ^
+  
+  Error: EPERM: operation not permitted, open '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'
+      at readFileSync (node:fs:439:20)
+      at loadLocalEnvironment (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/local-environment.js:11:49)
+      at file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/cli.js:118:26
+      at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+      at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)
+      at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'
+  }
+  
+  Node.js v24.13.0
+  
+      at genericNodeError (node:internal/errors:985:15)
+      at wrappedFn (node:internal/errors:539:14)
+      at ChildProcess.exithandler (node:child_process:417:12)
+      at ChildProcess.emit (node:events:508:28)
+      at maybeClose (node:internal/child_process:1101:16)
+      at Socket.<anonymous> (node:internal/child_process:457:11)
+      at Socket.emit (node:events:508:28)
+      at Pipe.<anonymous> (node:net:346:12) {
+    code: 1,
+    killed: false,
+    signal: null,
+    cmd: '/Users/nick/.nvm/versions/node/v24.13.0/bin/node /Users/nick/Documents/ChatGPT/Nexus Agent/src/cli.js --demo --workspace=/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-cli-smoke-fzOqqC --sessions',
+    stdout: '',
+    stderr: "(node:75579) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n(Use `node --trace-warnings ...` to show where the warning was created)\nnode:fs:439\n    return binding.readFileUtf8(path, stringToFlags(options.flag));\n                   ^\n\nError: EPERM: operation not permitted, open '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'\n    at readFileSync (node:fs:439:20)\n    at loadLocalEnvironment (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/local-environment.js:11:49)\n    at file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/cli.js:118:26\n    at ModuleJob.run (node:internal/modules/esm/module_job:413:25)\n    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)\n    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {\n  errno: -1,\n  code: 'EPERM',\n  syscall: 'open',\n  path: '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'\n}\n\nNode.js v24.13.0\n"
+  }
+
+test at test/cli-smoke.test.js:34:1
+✖ 普通 CLI 可使用显式 Agent Profile 启动并退出 (93.150542ms)
+  AssertionError [ERR_ASSERTION]: (node:75583) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+  (Use `node --trace-warnings ...` to show where the warning was created)
+  node:fs:439
+      return binding.readFileUtf8(path, stringToFlags(options.flag));
+                     ^
+  
+  Error: EPERM: operation not permitted, open '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'
+      at readFileSync (node:fs:439:20)
+      at loadLocalEnvironment (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/local-environment.js:11:49)
+      at file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/cli.js:118:26
+      at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+      at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)
+      at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'
+  }
+  
+  Node.js v24.13.0
+  
+  
+  1 !== 0
+  
+      at TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/cli-smoke.test.js:48:10)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    generatedMessage: false,
+    code: 'ERR_ASSERTION',
+    actual: 1,
+    expected: 0,
+    operator: 'strictEqual',
+    diff: 'simple'
+  }
+
+test at test/cli-smoke.test.js:52:1
+✖ CLI Journal Import 可在新工作区完成 (149.865375ms)
+  Error: Command failed: /Users/nick/.nvm/versions/node/v24.13.0/bin/node /Users/nick/Documents/ChatGPT/Nexus Agent/src/cli.js --demo --workspace=/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-cli-import-target-CDPUoP --import=/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-cli-import-source-YfF0aE/session.journal.json
+  (node:75590) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+  (Use `node --trace-warnings ...` to show where the warning was created)
+  node:fs:439
+      return binding.readFileUtf8(path, stringToFlags(options.flag));
+                     ^
+  
+  Error: EPERM: operation not permitted, open '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'
+      at readFileSync (node:fs:439:20)
+      at loadLocalEnvironment (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/local-environment.js:11:49)
+      at file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/cli.js:118:26
+      at ModuleJob.run (node:internal/modules/esm/module_job:413:25)
+      at process.processTicksAndRejections (node:internal/process/task_queues:103:5)
+      at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)
+      at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'
+  }
+  
+  Node.js v24.13.0
+  
+      at genericNodeError (node:internal/errors:985:15)
+      at wrappedFn (node:internal/errors:539:14)
+      at ChildProcess.exithandler (node:child_process:417:12)
+      at ChildProcess.emit (node:events:508:28)
+      at maybeClose (node:internal/child_process:1101:16)
+      at Socket.<anonymous> (node:internal/child_process:457:11)
+      at Socket.emit (node:events:508:28)
+      at Pipe.<anonymous> (node:net:346:12) {
+    code: 1,
+    killed: false,
+    signal: null,
+    cmd: '/Users/nick/.nvm/versions/node/v24.13.0/bin/node /Users/nick/Documents/ChatGPT/Nexus Agent/src/cli.js --demo --workspace=/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-cli-import-target-CDPUoP --import=/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-cli-import-source-YfF0aE/session.journal.json',
+    stdout: '',
+    stderr: "(node:75590) ExperimentalWarning: SQLite is an experimental feature and might change at any time\n(Use `node --trace-warnings ...` to show where the warning was created)\nnode:fs:439\n    return binding.readFileUtf8(path, stringToFlags(options.flag));\n                   ^\n\nError: EPERM: operation not permitted, open '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'\n    at readFileSync (node:fs:439:20)\n    at loadLocalEnvironment (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/local-environment.js:11:49)\n    at file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/src/cli.js:118:26\n    at ModuleJob.run (node:internal/modules/esm/module_job:413:25)\n    at process.processTicksAndRejections (node:internal/process/task_queues:103:5)\n    at async onImport.tracePromise.__proto__ (node:internal/modules/esm/loader:660:26)\n    at async asyncRunEntryPointWithESMLoader (node:internal/modules/run_main:101:5) {\n  errno: -1,\n  code: 'EPERM',\n  syscall: 'open',\n  path: '/Users/nick/Documents/ChatGPT/Nexus Agent/.env.deepseek.local'\n}\n\nNode.js v24.13.0\n"
+  }
+
+test at test/file-change-manifest.test.js:16:1
+✖ File Change Capture 识别新增、修改、删除并忽略秘密与内部目录 (12.23925ms)
+  Error: EPERM: operation not permitted, open '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-file-change-8C7Euv/.env-secret'
+      at async open (node:internal/fs/promises:637:25)
+      at async Object.writeFile (node:internal/fs/promises:1239:14)
+      at async TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/file-change-manifest.test.js:21:3)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-file-change-8C7Euv/.env-secret'
+  }
+
+test at test/local-environment.test.js:8:1
+✖ 通用本地配置优先于旧厂商配置且不覆盖进程环境 (0.628833ms)
+  Error: EPERM: operation not permitted, open '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-local-env-bmFbaz/.env.local'
+      at writeFileSync (node:fs:2427:20)
+      at TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/local-environment.test.js:11:5)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.start (node:internal/test_runner/test:1003:17)
+      at startSubtestAfterBootstrap (node:internal/test_runner/harness:358:17) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-local-env-bmFbaz/.env.local'
+  }
+
+test at test/local-environment.test.js:27:1
+✖ 没有通用配置时自动读取旧配置以保留现有密钥 (0.307417ms)
+  Error: EPERM: operation not permitted, open '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-legacy-env-o7yQkJ/.env.deepseek.local'
+      at writeFileSync (node:fs:2427:20)
+      at TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/local-environment.test.js:30:5)
+      at Test.runInAsyncScope (node:async_hooks:214:14)
+      at Test.run (node:internal/test_runner/test:1106:25)
+      at Test.processPendingSubtests (node:internal/test_runner/test:788:18)
+      at Test.postRun (node:internal/test_runner/test:1235:19)
+      at Test.run (node:internal/test_runner/test:1163:12)
+      at async startSubtestAfterBootstrap (node:internal/test_runner/harness:358:3) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-legacy-env-o7yQkJ/.env.deepseek.local'
+  }
+
+test at test/permission-profile.test.js:273:1
+✖ 文件工具统一隐藏所有 .env* 变体 (6.830583ms)
+  Error: EPERM: operation not permitted, open '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-env-variants-CmxuUM/.envrc'
+      at async open (node:internal/fs/promises:637:25)
+      at async Object.writeFile (node:internal/fs/promises:1239:14)
+      at async TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/permission-profile.test.js:278:5)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-env-variants-CmxuUM/.envrc'
+  }
+
+test at test/permission-profile.test.js:298:1
+✖ Tool Registry 执行层按 Session profile 选择 Shell 防线 (8.04325ms)
+  Error: EPERM: operation not permitted, open '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-profile-registry-lU6XYd/.env.local'
+      at async open (node:internal/fs/promises:637:25)
+      at async Object.writeFile (node:internal/fs/promises:1239:14)
+      at async TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/permission-profile.test.js:301:3)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-profile-registry-lU6XYd/.env.local'
+  }
+
+test at test/permission-profile.test.js:375:1
+✖ 文件工具与 Shell 共享敏感路径策略 (6.930875ms)
+  Error: EPERM: operation not permitted, open '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-access-policy-M9jn4v/.env.production'
+      at async open (node:internal/fs/promises:637:25)
+      at async Object.writeFile (node:internal/fs/promises:1239:14)
+      at async TestContext.<anonymous> (file:///Users/nick/Documents/ChatGPT/Nexus%20Agent/test/permission-profile.test.js:382:3)
+      at async Test.run (node:internal/test_runner/test:1113:7)
+      at async Test.processPendingSubtests (node:internal/test_runner/test:788:7) {
+    errno: -1,
+    code: 'EPERM',
+    syscall: 'open',
+    path: '/var/folders/wc/cr36tm_125sfg9hdmqy8cdgw0000gn/T/nexus-access-policy-M9jn4v/.env.production'
+  }

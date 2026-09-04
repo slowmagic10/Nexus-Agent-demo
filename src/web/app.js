@@ -1,23 +1,23 @@
-import {
-  composerActionState,
-  shouldCancelRun,
-  shouldSubmitMessage,
-} from "/keyboard.js";
+import { createComposer } from "/composer.js";
 import { grantViewModel } from "/grants.js";
 import { objectivePlanViewModel } from "/plan-view.js";
 import { profileDriftViewModel, providerThinkingLabel } from "/profile-view.js";
-import { artifactIdFromToolResult } from "/artifact-view.js";
 import { contextObservabilityViewModel } from "/context-view.js";
 import { createSessionProjection } from "/session-projection.js";
-import { createToolTranscriptCursor } from "/tool-transcript.js";
+import { createTaskNavigation } from "/task-navigation.js";
+import { createInspectorShell } from "/inspector-shell.js";
+import { createReviewWorkspace } from "/review-workspace.js";
+import { createTaskThread } from "/task-thread.js";
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
   runtime: null,
   selectedAgentProfileId: "default",
   selectedPermissionProfile: "workspace-auto",
-  inspectorTab: "events",
-  cancelling: false,
+  inspectorTab: "overview",
+  editingTitle: false,
+  journalEvents: [],
+  journalDirty: true,
 };
 
 const elements = {
@@ -26,9 +26,15 @@ const elements = {
   messages: $("#messages"),
   planPanel: $("#plan-panel"),
   events: $("#events"),
+  journalSummary: $("#journal-summary"),
   contextPanel: $("#context-panel"),
+  executionOverviewPanel: $("#execution-overview-panel"),
+  fileChangesOverviewPanel: $("#file-changes-overview-panel"),
   evaluationPanel: $("#evaluation-panel"),
   title: $("#session-title"),
+  titleForm: $("#title-form"),
+  titleInput: $("#title-input"),
+  renameSession: $("#rename-session"),
   meta: $("#session-meta"),
   phaseDot: $("#phase-dot"),
   input: $("#message-input"),
@@ -45,6 +51,8 @@ const elements = {
   inspector: $("#inspector"),
   backdrop: $("#drawer-backdrop"),
   debugToggle: $("#debug-toggle"),
+  reviewToggle: $("#review-toggle"),
+  reviewCount: $("#review-count"),
   themeToggle: $("#theme-toggle"),
   permissionTrigger: $("#permission-trigger"),
   permissionLabel: $("#permission-label"),
@@ -55,6 +63,39 @@ const elements = {
   agentProfileSelect: $("#agent-profile-select"),
 };
 
+const taskNavigation = createTaskNavigation({
+  sidebar: $("#task-sidebar"),
+  toggle: $("#mobile-nav-toggle"),
+  backdrop: $("#task-nav-backdrop"),
+  media: window.matchMedia("(max-width: 760px)"),
+});
+const inspectorShell = createInspectorShell({
+  root: elements.inspector,
+  toggle: elements.debugToggle,
+  backdrop: elements.backdrop,
+  closeButton: $("#debug-close"),
+  tabs: {
+    overview: $("#overview-tab"),
+    files: $("#files-tab"),
+    context: $("#context-tab"),
+    more: $("#more-tab"),
+  },
+  views: {
+    overview: $("#overview-view"),
+    files: $("#files-view"),
+    context: $("#context-view"),
+    more: $("#more-view"),
+  },
+  defaultView: "overview",
+  media: window.matchMedia("(min-width: 1180px)"),
+  onBeforeOpen: (view) => {
+    taskNavigation.close();
+    prepareInspectorView(view);
+  },
+  onViewSelected: handleInspectorViewSelected,
+});
+$("#mobile-nav-toggle").addEventListener("click", () => inspectorShell.close());
+
 const sessionProjection = createSessionProjection({
   readSession: (id) => api(`/sessions/${encodeURIComponent(id)}`),
   eventSourceFactory: (url) => new EventSource(url),
@@ -62,51 +103,110 @@ const sessionProjection = createSessionProjection({
   onEvent: handleSessionEvent,
   onDisconnect: (error) => toast(error.message),
 });
-window.addEventListener("beforeunload", () => sessionProjection.close(), { once: true });
+const composer = createComposer({
+  form: elements.form,
+  input: elements.input,
+  action: elements.composerAction,
+  shortcut: elements.composerShortcut,
+  provider: elements.provider,
+  eventRoot: document,
+  sendMessage: ({ sessionId, content }) => api(`/sessions/${encodeURIComponent(sessionId)}/messages`, {
+    method: "POST",
+    body: { content },
+  }),
+  cancelRun: ({ sessionId }) => api(`/sessions/${encodeURIComponent(sessionId)}/cancel`, {
+    method: "POST",
+    body: {},
+  }),
+  isOverlayOpen,
+});
+const reviewWorkspace = createReviewWorkspace({
+  root: $("#review-workspace"),
+  loadArtifact: async ({ sessionId, artifactId }) => {
+    const response = await sessionProjection.query(`review-diff:${artifactId}`, (selectedSessionId, { signal }) => {
+      if (selectedSessionId !== sessionId) throw new Error("Diff 不属于当前 Agent Session");
+      return api(
+        `/sessions/${encodeURIComponent(selectedSessionId)}/artifacts/${encodeURIComponent(artifactId)}`,
+        { signal },
+        { silent: true },
+      );
+    });
+    if (!response || response.sessionId !== sessionId) throw new Error("Diff 请求已过期");
+    return response.value;
+  },
+});
+const taskThread = createTaskThread({
+  root: elements.messages,
+  requestApproval: ({ sessionId, callId, approved, scope, signal }) => {
+    if (sessionProjection.sessionId !== sessionId) throw new Error("审批所属任务已切换");
+    return api(`/sessions/${encodeURIComponent(sessionId)}/approvals/${encodeURIComponent(callId)}`, {
+      method: "POST",
+      body: { approved, scope },
+      signal,
+    });
+  },
+  loadArtifact: async ({ sessionId, artifactId, signal }) => {
+    const response = await sessionProjection.query(`thread-artifact:${artifactId}`, (selectedSessionId, { signal: querySignal }) => {
+      if (selectedSessionId !== sessionId) throw new Error("Artifact 不属于当前 Agent Session");
+      const requestSignal = typeof AbortSignal.any === "function"
+        ? AbortSignal.any([signal, querySignal])
+        : querySignal;
+      return api(
+        `/sessions/${encodeURIComponent(selectedSessionId)}/artifacts/${encodeURIComponent(artifactId)}`,
+        { signal: requestSignal },
+        { silent: true },
+      );
+    });
+    if (!response || response.sessionId !== sessionId) throw new Error("Artifact 请求已过期");
+    return response.value;
+  },
+  openReview: ({ sessionId, ...target }) => {
+    if (sessionProjection.sessionId !== sessionId) return;
+    openReview(target);
+  },
+  useStarter: async ({ sessionId, prompt }) => {
+    if (sessionId === null) {
+      if (sessionProjection.sessionId) return;
+      await createSession();
+    } else if (sessionProjection.sessionId !== sessionId) {
+      return;
+    }
+    composer.setDraft(prompt, { focus: true });
+  },
+});
+window.addEventListener("beforeunload", () => {
+  composer.destroy();
+  taskThread.destroy();
+  sessionProjection.close();
+  reviewWorkspace.destroy();
+  taskNavigation.destroy();
+  inspectorShell.destroy();
+}, { once: true });
 
 applyTheme(savedTheme());
 $("#new-session").addEventListener("click", createSession);
-elements.form.addEventListener("submit", sendMessage);
-let inputIsComposing = false;
 let evaluationTimer = null;
-elements.input.addEventListener("compositionstart", () => {
-  inputIsComposing = true;
-});
-elements.input.addEventListener("compositionend", () => {
-  inputIsComposing = false;
-});
-elements.input.addEventListener("keydown", (event) => {
-  if (shouldSubmitMessage(event, { composing: inputIsComposing })) {
-    event.preventDefault();
-    elements.form.requestSubmit();
-  }
-});
-elements.messages.addEventListener("click", useStarter);
-elements.composerAction.addEventListener("click", handleComposerAction);
 elements.export.addEventListener("click", exportSession);
 elements.themeToggle.addEventListener("click", toggleTheme);
+elements.reviewToggle.addEventListener("click", () => openReview());
 elements.permissionTrigger.addEventListener("click", togglePermissionMenu);
 elements.permissionMenu.addEventListener("click", choosePermissionMode);
 elements.agentProfileSelect.addEventListener("change", chooseAgentProfile);
+elements.renameSession.addEventListener("click", openTitleEditor);
+elements.titleForm.addEventListener("submit", saveDisplayTitle);
+$("#title-cancel").addEventListener("click", closeTitleEditor);
 elements.dangerConfirmAccept.addEventListener("click", confirmDangerFullAccess);
 $("#danger-confirm-cancel").addEventListener("click", closeDangerConfirm);
 elements.dangerConfirmBackdrop.addEventListener("click", closeDangerConfirm);
-elements.debugToggle.addEventListener("click", openInspector);
-$("#debug-close").addEventListener("click", closeInspector);
-elements.backdrop.addEventListener("click", closeInspector);
 $("#memory-form").addEventListener("submit", addMemory);
+$("#memory-section").addEventListener("toggle", handleInspectorSectionToggle);
+$("#grants-section").addEventListener("toggle", handleInspectorSectionToggle);
+$("#journal-section").addEventListener("toggle", handleInspectorSectionToggle);
 document.addEventListener("keydown", (event) => {
-  if (shouldCancelRun(event, {
-    phase: sessionProjection.phase,
-    cancelling: state.cancelling,
-    overlayOpen: isOverlayOpen(),
-  })) {
-    event.preventDefault();
-    void cancelRun();
-    return;
-  }
+  if (event.defaultPrevented) return;
   if (event.key === "Escape") {
-    closeInspector();
+    closeTitleEditor();
+    inspectorShell.close();
     closePermissionMenu();
     closeDangerConfirm();
   }
@@ -114,10 +214,6 @@ document.addEventListener("keydown", (event) => {
 document.addEventListener("click", (event) => {
   if (!event.target.closest(".permission-selector")) closePermissionMenu();
 });
-document.querySelectorAll(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => selectTab(tab.dataset.tab));
-});
-
 await Promise.allSettled([checkHealth(), loadRuntime(), loadSessions(), loadMemories(), loadCandidates()]);
 
 function savedTheme() {
@@ -188,6 +284,7 @@ function sessionButton(session) {
 }
 
 async function createSession() {
+  taskNavigation.close();
   const { session } = await api("/sessions", {
     method: "POST",
     body: {
@@ -198,11 +295,13 @@ async function createSession() {
   });
   await loadSessions();
   await selectSession(session.id);
-  elements.input.focus();
+  composer.focus();
   return session;
 }
 
 async function selectSession(id) {
+  taskNavigation.close();
+  closeTitleEditor();
   const selected = await sessionProjection.select(id);
   if (!selected) return;
   await Promise.allSettled([
@@ -210,64 +309,70 @@ async function selectSession(id) {
     loadGrants(),
     loadMemories(),
     loadCandidates(),
-    ...(state.inspectorTab === "evaluation" ? [loadEvaluation()] : []),
+    ...(state.inspectorTab === "overview" && inspectorShell.isOpen() ? [loadEvaluation()] : []),
   ]);
 }
 
 async function handleSessionEvent(event) {
+  if (event.type === "SESSION_DISPLAY_TITLE_CHANGED") await loadSessions();
   if (["MEMORY_CANDIDATE_CREATED", "MEMORY_CANDIDATE_APPROVED", "MEMORY_CANDIDATE_REJECTED"].includes(event.type)) {
     await Promise.allSettled([loadCandidates(), loadMemories()]);
   }
   if (["TOOL_GRANT_ISSUED", "TOOL_GRANT_CONSUMED", "TOOL_GRANT_REVOKED", "TOOL_PROJECT_GRANT_ISSUED", "TOOL_PROJECT_GRANT_REVOKED"].includes(event.type)) {
     await Promise.allSettled([loadGrants()]);
   }
-  if (state.inspectorTab === "evaluation") scheduleEvaluation();
+  if (state.inspectorTab === "overview" && inspectorShell.isOpen()) scheduleEvaluation();
 }
 
 function renderSession(session) {
   state.selectedPermissionProfile = session.permissionProfile || state.runtime?.permission.defaultProfile || "workspace-auto";
-  const title = sessionTitle(session);
+  const title = session.displayTitle || "新任务";
   elements.title.textContent = title;
   document.title = `${title} · Nexus`;
   elements.phaseDot.className = `phase-dot ${phaseClass(session.phase)}`;
   renderStatus(session);
 
   const busy = ["thinking", "executing", "awaiting_approval"].includes(session.phase);
-  if (!busy) state.cancelling = false;
-  elements.input.disabled = busy;
-  renderComposerAction();
+  composer.update({
+    sessionId: session.id,
+    phase: session.phase,
+    provider: session.provider || "本地模型",
+    userTurnCount: (session.messages || []).reduce(
+      (count, message) => count + Number(message.role === "user"),
+      0,
+    ),
+  });
   elements.export.disabled = false;
-  elements.provider.textContent = session.provider || "本地模型";
+  elements.renameSession.disabled = false;
   renderPermissionControl();
   setGrantActionAvailability(busy);
 
-  renderMessages(
-    session.messages,
-    session.pendingApproval,
-    session.phase === "failed" ? session.lastError : null,
-    session.events,
-    session.modelStream,
-    session.modelStreamChunks,
-    session.toolStreams,
-  );
+  const { executionProjection } = taskThread.update({
+    session,
+    cursor: sessionProjection.cursor,
+  });
+  const reviewState = reviewWorkspace.update({
+    sessionId: session.id,
+    cursor: sessionProjection.cursor,
+    executionProjection,
+  });
+  renderReviewControl(reviewState);
   renderObjectivePlan(session.objective, session.plan, session.delegations);
   renderContextObservability(session);
-  renderEvents(session.events);
+  stageJournal(session.events);
+  const latestExecution = executionProjection.turns.at(-1)?.execution || null;
+  renderExecutionOverview(latestExecution, session);
+  renderFileChangeOverview(latestExecution?.fileChanges || null, latestExecution?.turnKey || null);
   updateSelectedSession(session, title);
 }
 
 function renderStatus(session) {
-  const metrics = session.metrics || {};
-  const drift = profileDriftViewModel((session.events || []).findLast((event) => event.type === "agent.profile_selected"));
   const parts = [
     [phaseLabel(session.phase), `status-chip phase ${phaseClass(session.phase)}`],
     [agentProfileLabel(session.agentProfile?.id), "status-chip"],
     [session.provider || "本地模型", "status-chip"],
     [permissionLabel(session.permissionProfile), "status-chip"],
-    [formatTokens(metrics.totalTokens || 0), "status-chip"],
   ];
-  if (drift) parts.push([`配置变化 ${drift.count}`, `status-chip profile-drift${drift.highImpact ? " high" : ""}`, drift.summary]);
-  if (metrics.lastTurnDurationMs) parts.push([formatDuration(metrics.lastTurnDurationMs), "status-chip"]);
   elements.meta.replaceChildren(...parts.map(([text, className, titleText]) => {
     const chip = document.createElement("span");
     chip.className = className;
@@ -432,101 +537,40 @@ function updateSelectedSession(session, title) {
   item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
 }
 
-function renderMessages(messages, pendingApproval, terminalError, events = [], modelStream = null, modelStreamChunks = [], toolStreams = {}) {
-  if (!messages.length) {
-    elements.messages.replaceChildren(createWelcome());
-    return;
+function openTitleEditor() {
+  if (!sessionProjection.sessionId) return;
+  state.editingTitle = true;
+  elements.titleInput.value = elements.title.textContent === "新任务" ? "" : elements.title.textContent;
+  elements.titleForm.classList.remove("hidden");
+  elements.renameSession.classList.add("hidden");
+  requestAnimationFrame(() => elements.titleInput.select());
+}
+
+function closeTitleEditor() {
+  if (!state.editingTitle) return;
+  state.editingTitle = false;
+  elements.titleForm.classList.add("hidden");
+  elements.renameSession.classList.remove("hidden");
+}
+
+async function saveDisplayTitle(event) {
+  event.preventDefault();
+  if (!sessionProjection.sessionId) return;
+  const sessionId = sessionProjection.sessionId;
+  const buttons = elements.titleForm.querySelectorAll("button");
+  buttons.forEach((button) => { button.disabled = true; });
+  try {
+    const { session } = await api(`/sessions/${encodeURIComponent(sessionId)}/display-title`, {
+      method: "POST",
+      body: { title: elements.titleInput.value.trim() || null },
+    });
+    if (sessionProjection.sessionId === sessionId) renderSession(session);
+    await loadSessions();
+    closeTitleEditor();
+    toast("任务名称已更新");
+  } finally {
+    buttons.forEach((button) => { button.disabled = false; });
   }
-
-  const toolTranscript = createToolTranscriptCursor(messages, events);
-  const rendered = [];
-  let approvalRendered = false;
-
-  for (const message of messages) {
-    if (message.role === "tool") continue;
-    const row = document.createElement("article");
-    row.className = `message-row ${message.role}`;
-
-    if (message.role === "assistant") {
-      const avatar = document.createElement("div");
-      avatar.className = "avatar";
-      avatar.textContent = "N";
-      const body = document.createElement("div");
-      body.className = "message-body";
-      if (message.content) body.append(renderMarkdown(message.content));
-      for (const call of message.tool_calls || []) {
-        const normalized = normalizeToolCall(call);
-        const transcript = toolTranscript.next(normalized.id);
-        const pending = pendingApproval?.id === normalized.id ? pendingApproval : null;
-        body.append(toolCard(
-          normalized,
-          transcript.result,
-          pending,
-          transcript.fileChanges,
-          toolStreams?.[normalized.id],
-        ));
-        approvalRendered ||= Boolean(pending);
-      }
-      row.append(avatar, body);
-    } else {
-      const bubble = document.createElement("div");
-      bubble.className = "user-bubble";
-      bubble.textContent = message.content || "";
-      row.append(bubble);
-    }
-    rendered.push(row);
-  }
-
-  if (pendingApproval && !approvalRendered) {
-    const row = document.createElement("article");
-    row.className = "message-row assistant";
-    const avatar = document.createElement("div");
-    avatar.className = "avatar";
-    avatar.textContent = "N";
-    const body = document.createElement("div");
-    body.className = "message-body";
-    body.append(toolCard(pendingApproval, null, pendingApproval));
-    row.append(avatar, body);
-    rendered.push(row);
-  }
-
-  const streamedText = Array.isArray(modelStreamChunks) ? modelStreamChunks.join("") : "";
-  if (modelStream && streamedText) {
-    const row = document.createElement("article");
-    row.className = `message-row assistant model-stream ${modelStream.status}`;
-    const avatar = document.createElement("div");
-    avatar.className = "avatar";
-    avatar.textContent = "N";
-    const body = document.createElement("div");
-    body.className = "message-body";
-    body.append(renderMarkdown(streamedText));
-    const stateLabel = document.createElement("span");
-    stateLabel.className = "model-stream-state";
-    stateLabel.textContent = ({
-      streaming: "正在生成",
-      cancelled: "已中途停止",
-      failed: "生成失败，保留部分输出",
-      interrupted: "进程中断，保留部分输出",
-    })[modelStream.status] || "部分输出";
-    body.append(stateLabel);
-    row.append(avatar, body);
-    rendered.push(row);
-  }
-
-  if (terminalError) {
-    const alert = document.createElement("div");
-    alert.className = "runtime-error";
-    const title = document.createElement("strong");
-    title.textContent = "任务已停止";
-    const detail = document.createElement("span");
-    detail.textContent = terminalError;
-    alert.append(title, detail);
-    rendered.push(alert);
-  }
-
-  if (["thinking", "executing"].includes(sessionProjection.phase) && !streamedText) rendered.push(thinkingIndicator());
-  elements.messages.replaceChildren(...rendered);
-  requestAnimationFrame(() => { elements.messages.scrollTop = elements.messages.scrollHeight; });
 }
 
 function renderObjectivePlan(objective, plan, delegations) {
@@ -611,20 +655,24 @@ function renderContextObservability(session) {
   if (!view) {
     const empty = document.createElement("div");
     empty.className = "drawer-empty";
-    empty.textContent = "模型完成第一次请求后，这里会显示 Context 预算和压缩状态。";
+    empty.textContent = "模型完成第一次请求后，这里会显示 Context 估算目标和压缩状态。";
     elements.contextPanel.replaceChildren(empty);
     return;
   }
 
   const overview = document.createElement("section");
   overview.className = "context-card context-overview";
-  const head = contextCardHeading("本次模型上下文", view.plan?.statusLabel || "等待规划", view.plan?.compacted ? "warning" : "normal");
+  const head = contextCardHeading(
+    "本次模型上下文",
+    view.plan?.statusLabel || "等待规划",
+    view.plan?.compacted || view.usage.overTarget ? "warning" : "normal",
+  );
   const tokenLine = document.createElement("div");
   tokenLine.className = "context-token-line";
   const tokenValue = document.createElement("strong");
   tokenValue.textContent = `${formatTokens(view.usage.estimatedTokens)} / ${view.usage.maxTokens ? formatTokens(view.usage.maxTokens) : "未设置"}`;
   const tokenPercent = document.createElement("span");
-  tokenPercent.textContent = view.usage.maxTokens ? `${view.usage.percent}%` : "无预算";
+  tokenPercent.textContent = view.usage.maxTokens ? `${view.usage.percent}%` : "无估算目标";
   tokenLine.append(tokenValue, tokenPercent);
   const meter = document.createElement("div");
   meter.className = `context-meter ${view.usage.level}`;
@@ -692,10 +740,10 @@ function renderContextObservability(session) {
     const detail = document.createElement("p");
     detail.className = "context-card-detail";
     detail.textContent = view.replan.status === "replanned"
-      ? `输入预算 ${formatTokens(view.replan.fromMaxInputTokens)} → ${formatTokens(view.replan.toMaxInputTokens)}；新增省略 ${view.replan.omittedMessages} 条消息。`
+      ? `压缩目标 ${formatTokens(view.replan.fromMaxInputTokens)} → ${formatTokens(view.replan.toMaxInputTokens)}；新增省略 ${view.replan.omittedMessages} 条消息。`
       : view.replan.status === "exhausted"
-        ? `当前预算 ${formatTokens(view.replan.maxInputTokens)}${view.replan.contextLimit ? `；Provider 上限 ${formatTokens(view.replan.contextLimit)}` : ""}。`
-        : `输入预算 ${formatTokens(view.replan.fromMaxInputTokens)} → ${formatTokens(view.replan.toMaxInputTokens)}。`;
+        ? `当前压缩目标 ${formatTokens(view.replan.maxInputTokens)}${view.replan.contextLimit ? `；Provider 上限 ${formatTokens(view.replan.contextLimit)}` : ""}。`
+        : `压缩目标 ${formatTokens(view.replan.fromMaxInputTokens)} → ${formatTokens(view.replan.toMaxInputTokens)}。`;
     replan.append(detail);
     cards.push(replan);
   }
@@ -709,6 +757,129 @@ function renderContextObservability(session) {
   ].filter(Boolean).join(" · ");
   cards.push(identity);
   elements.contextPanel.replaceChildren(...cards);
+}
+
+function renderExecutionOverview(execution, session) {
+  if (!execution) {
+    const empty = document.createElement("div");
+    empty.className = "drawer-empty";
+    empty.textContent = "任务开始后，这里会显示当前 Turn 的执行摘要。";
+    elements.executionOverviewPanel.replaceChildren(empty);
+    return;
+  }
+  const card = document.createElement("section");
+  card.className = `context-card execution-overview-card ${execution.status}`;
+  card.append(
+    contextCardHeading("当前 Turn", executionStatusLabel(execution.status), executionStatusLevel(execution.status)),
+    evaluationMetrics([
+      ["工具", String(execution.counts.total), executionRunDetail(execution)],
+      ["模型请求", String(execution.model.requests), execution.model.streaming ? "正在生成" : `${execution.model.completed} 次完成`],
+      ["总耗时", execution.durationMs === null ? "—" : formatDuration(execution.durationMs), execution.durationMs === null ? "运行结束后记录" : "由 Journal 记录"],
+      ["文件", String(execution.fileChanges.uniquePaths), execution.fileChanges.complete ? `${execution.fileChanges.operations} 次变化` : "变化采集不完整"],
+    ]),
+  );
+  if (execution.recovery) {
+    const recovery = document.createElement("p");
+    recovery.className = "execution-recovery";
+    recovery.textContent = execution.recovery.toolExecutionUnknown
+      ? "Gateway 已恢复；中断前存在未闭合工具执行，结果已标记为未知。"
+      : execution.recovery.interrupted
+        ? `Gateway 已恢复；上次 Turn 在 ${execution.recovery.interruptedFromPhase || "运行中"} 阶段中断，未标记为完成。`
+      : `Gateway 已从 ${execution.recovery.previousPhase || "上次状态"} 恢复。`;
+    card.append(recovery);
+  }
+  const drift = profileDriftViewModel((session?.events || []).findLast((event) => event.type === "agent.profile_selected"));
+  if (drift) {
+    const notice = document.createElement("p");
+    notice.className = `execution-drift${drift.highImpact ? " high" : ""}`;
+    notice.textContent = `配置变化 ${drift.count} 项 · ${drift.summary}`;
+    card.append(notice);
+  }
+  elements.executionOverviewPanel.replaceChildren(card);
+}
+
+function renderReviewControl(reviewState) {
+  const summary = reviewState?.projection?.summary || { batches: 0, occurrences: 0 };
+  const available = summary.batches > 0;
+  elements.reviewToggle.disabled = !available;
+  elements.reviewToggle.textContent = available ? `审查 ${summary.occurrences}` : "审查";
+  elements.reviewToggle.title = available
+    ? `打开文件审查，共 ${summary.occurrences} 项变化`
+    : "当前任务还没有可审查的文件变化";
+  elements.reviewToggle.setAttribute("aria-label", elements.reviewToggle.title);
+  elements.reviewCount.textContent = String(summary.occurrences);
+}
+
+function openReview(target = null) {
+  const snapshot = reviewWorkspace.snapshot();
+  if (!snapshot.projection.batches.length) {
+    toast("当前任务还没有可审查的文件变化");
+    return;
+  }
+  try {
+    if (target) reviewWorkspace.select(target);
+    inspectorShell.open("files");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+function renderFileChangeOverview(fileChanges, turnKey) {
+  const entries = fileChanges?.entries || [];
+  if (!entries.length) {
+    elements.fileChangesOverviewPanel.replaceChildren();
+    return;
+  }
+  const section = document.createElement("section");
+  section.className = "inspector-file-changes";
+  const heading = document.createElement("header");
+  const title = document.createElement("strong");
+  title.textContent = "本轮文件变化";
+  const count = document.createElement("span");
+  count.textContent = `${fileChanges.uniquePaths} 个文件`;
+  heading.append(title, count);
+  section.append(
+    heading,
+    ...entries.map((entry) => fileChangePanel(entry.manifest, {
+      turnKey,
+      runKey: entry.runKey,
+    })),
+  );
+  elements.fileChangesOverviewPanel.replaceChildren(section);
+}
+
+function executionRunDetail(execution) {
+  return [
+    execution.counts.succeeded ? `${execution.counts.succeeded} 成功` : null,
+    execution.counts.failed ? `${execution.counts.failed} 失败` : null,
+    execution.counts.blocked ? `${execution.counts.blocked} 阻止` : null,
+    execution.counts.unknown ? `${execution.counts.unknown} 未知` : null,
+    execution.counts.inherited ? `${execution.counts.inherited} 继承记录` : null,
+    execution.counts.awaitingApproval ? `${execution.counts.awaitingApproval} 待批准` : null,
+    execution.counts.running ? `${execution.counts.running} 运行中` : null,
+  ].filter(Boolean).join(" · ") || "没有工具调用";
+}
+
+function executionStatusLabel(status) {
+  return ({
+    idle: "等待执行",
+    running: "运行中",
+    awaiting_approval: "等待批准",
+    completed: "已完成",
+    attention: "需要留意",
+    failed: "失败",
+    cancelled: "已取消",
+    interrupted: "已中断",
+    unknown: "结果未知",
+    inherited: "继承记录",
+  })[status] || status;
+}
+
+function executionStatusLevel(status) {
+  if (["failed", "unknown"].includes(status)) return "danger";
+  if (["attention", "awaiting_approval", "cancelled", "interrupted"].includes(status)) return "warning";
+  if (["idle", "inherited"].includes(status)) return "muted";
+  return "normal";
 }
 
 async function loadEvaluation() {
@@ -795,16 +966,21 @@ function renderEvaluation(report) {
     }
     issues.append(list);
   } else {
-    const clean = document.createElement("p");
-    clean.className = "evaluation-clean";
-    clean.textContent = "本次回放投影中没有发现失败、未知副作用或未闭合状态。";
-    issues.append(clean);
+    summary.textContent += " · 未发现失败、未知副作用或未闭合状态";
   }
 
   const foot = document.createElement("p");
   foot.className = "evaluation-foot";
   foot.textContent = "报告由 Session Journal 派生，不调用模型，也不会修改原任务。";
-  elements.evaluationPanel.replaceChildren(overview, metrics, reliability, issues, foot);
+  const details = document.createElement("details");
+  details.className = "evaluation-details";
+  const detailsSummary = document.createElement("summary");
+  detailsSummary.textContent = "运行指标与可靠性";
+  const detailsBody = document.createElement("div");
+  detailsBody.className = "evaluation-details-body";
+  detailsBody.append(metrics, reliability, foot);
+  details.append(detailsSummary, detailsBody);
+  elements.evaluationPanel.replaceChildren(overview, ...(report.issues.length ? [issues] : []), details);
 }
 
 function evaluationMetrics(items) {
@@ -895,81 +1071,7 @@ function contextMemoryRow(label, section) {
   return row;
 }
 
-function toolCard(call, result, pending, fileChanges = null, outputStream = null) {
-  const details = document.createElement("details");
-  details.className = `tool-card ${pending ? "approval-needed" : result ? toolResultClass(result.content) : "running"}`;
-  details.open = Boolean(pending || outputStream?.preview);
-
-  const summary = document.createElement("summary");
-  const icon = document.createElement("span");
-  icon.className = "tool-icon";
-  icon.textContent = pending ? "!" : result ? (toolResultClass(result.content) === "failed" ? "×" : "✓") : "·";
-  const name = document.createElement("span");
-  name.className = "tool-name";
-  name.textContent = toolLabel(call.name);
-  const status = document.createElement("span");
-  status.className = "tool-status";
-  status.textContent = pending
-    ? "等待批准"
-    : result
-      ? (toolResultClass(result.content) === "failed" ? "未完成" : "已完成")
-      : outputStream?.capturedChars
-        ? `运行中 · ${outputStream.capturedChars} 字符`
-        : "运行中";
-  const chevron = document.createElement("span");
-  chevron.className = "chevron";
-  chevron.textContent = "⌄";
-  summary.append(icon, name, status, chevron);
-
-  const content = document.createElement("div");
-  content.className = "tool-content";
-  const args = document.createElement("pre");
-  args.textContent = formatToolArguments(call.arguments);
-  content.append(args);
-  if (!result && outputStream?.preview) {
-    const outputLabel = document.createElement("span");
-    outputLabel.className = "tool-output-label";
-    outputLabel.textContent = outputStream.truncated ? "实时输出 · 预览已满" : "实时输出";
-    const output = document.createElement("pre");
-    output.className = "tool-live-output";
-    output.textContent = outputStream.preview;
-    content.append(outputLabel, output);
-  }
-  if (result) {
-    const outputLabel = document.createElement("span");
-    outputLabel.className = "tool-output-label";
-    outputLabel.textContent = "输出";
-    const output = document.createElement("pre");
-    output.textContent = result.content || "工具没有返回内容";
-    content.append(outputLabel, output);
-    const artifactId = artifactIdFromToolResult(result.content);
-    if (artifactId && sessionProjection.sessionId) {
-      const load = document.createElement("button");
-      load.type = "button";
-      load.className = "artifact-button";
-      load.textContent = "加载完整输出";
-      load.addEventListener("click", async () => {
-        load.disabled = true;
-        load.textContent = "加载中…";
-        try {
-          const payload = await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/artifacts/${encodeURIComponent(artifactId)}`);
-          output.textContent = payload.artifact.content;
-          load.textContent = `已加载完整输出 · ${payload.artifact.byteSize} 字节`;
-        } catch (error) {
-          load.disabled = false;
-          load.textContent = `加载失败：${error.message}`;
-        }
-      });
-      content.append(load);
-    }
-    if (fileChanges) content.append(fileChangePanel(fileChanges));
-  }
-  if (pending) content.append(approvalActions(pending));
-  details.append(summary, content);
-  return details;
-}
-
-function fileChangePanel(manifest) {
+function fileChangePanel(manifest, reviewTarget = null) {
   const panel = document.createElement("section");
   panel.className = "file-change-panel";
   const heading = document.createElement("strong");
@@ -981,7 +1083,8 @@ function fileChangePanel(manifest) {
 
   if (manifest.changes?.length) {
     const list = document.createElement("ul");
-    for (const change of manifest.changes.slice(0, 24)) {
+    const previewLimit = 8;
+    for (const change of manifest.changes.slice(0, previewLimit)) {
       const item = document.createElement("li");
       item.className = change.operation;
       const marker = document.createElement("i");
@@ -992,79 +1095,45 @@ function fileChangePanel(manifest) {
       list.append(item);
     }
     panel.append(list);
+    if (manifest.changes.length > previewLimit) {
+      const remaining = document.createElement("span");
+      remaining.className = "file-change-remaining";
+      remaining.textContent = `还有 ${manifest.changes.length - previewLimit} 项，请在文件审查中查看`;
+      panel.append(remaining);
+    }
   }
 
-  if (manifest.diffArtifact?.id && sessionProjection.sessionId) {
-    const load = document.createElement("button");
-    load.type = "button";
-    load.className = "artifact-button";
-    load.textContent = manifest.diffTruncated ? "加载 Diff（已截断）" : "加载 Diff";
-    load.addEventListener("click", async () => {
-      load.disabled = true;
-      load.textContent = "加载中…";
-      try {
-        const payload = await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/artifacts/${encodeURIComponent(manifest.diffArtifact.id)}`);
-        const diff = document.createElement("pre");
-        diff.className = "file-diff";
-        diff.textContent = payload.artifact.content;
-        panel.append(diff);
-        load.textContent = `已加载 Diff · ${payload.artifact.byteSize} 字节`;
-      } catch (error) {
-        load.disabled = false;
-        load.textContent = `加载失败：${error.message}`;
-      }
-    });
-    panel.append(load);
+  if (reviewTarget) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "artifact-button";
+    open.textContent = manifest.diffArtifact?.id
+      ? (manifest.diffTruncated ? "打开文件审查（Diff 已截断）" : "打开文件审查")
+      : "查看文件变化";
+    open.addEventListener("click", () => openReview({
+      ...reviewTarget,
+      path: manifest.changes?.[0]?.path || null,
+    }));
+    panel.append(open);
   }
   return panel;
 }
 
-function approvalActions(call) {
-  const notice = document.createElement("p");
-  notice.className = "approval-copy";
-  notice.textContent = call.reason || "此操作需要你的确认后才会在本地执行。";
-  const context = document.createElement("p");
-  context.className = "approval-copy";
-  context.textContent = `权限档位：${call.profile || "未指定"} · 风险：${call.risk || "未分类"} · 规则：${call.ruleId || "未命中"}`;
-  const row = document.createElement("div");
-  row.className = "approval-actions";
-  const scopes = call.approvalScopes || ["once"];
-  const approvals = [
-    ["once", "仅本次", "只允许当前工具调用，使用后立即失效"],
-    ["session", "本会话允许", "相同工具和资源在当前会话中可复用，最长 8 小时"],
-    ["project", "本项目允许", "相同工具和资源可跨本项目会话复用，最长 30 天"],
-  ].filter(([scope]) => scopes.includes(scope)).map(([scope, label, title]) => {
-    const button = document.createElement("button");
-    button.className = `approve-button approve-${scope}`;
-    button.textContent = label;
-    button.title = title;
-    return { button, scope };
-  });
-  const deny = document.createElement("button");
-  deny.className = "deny-button";
-  deny.textContent = "拒绝";
-  const buttons = [...approvals.map(({ button }) => button), deny];
-  approvals.forEach(({ button, scope }) => {
-    button.addEventListener("click", () => decide(call.id, true, scope, buttons));
-  });
-  deny.addEventListener("click", () => decide(call.id, false, "once", buttons));
-  row.append(...buttons);
-  const fragment = document.createDocumentFragment();
-  fragment.append(notice, context, row);
-  return fragment;
+function stageJournal(events) {
+  state.journalEvents = Array.isArray(events) ? events : [];
+  state.journalDirty = true;
+  elements.journalSummary.textContent = state.journalEvents.length
+    ? `最近 ${Math.min(100, state.journalEvents.length)} / 共 ${state.journalEvents.length} 条`
+    : "任务开始后显示";
+  if (state.inspectorTab === "more" && inspectorShell.isOpen() && $("#journal-section").open) {
+    requestAnimationFrame(renderStagedJournal);
+  }
 }
 
-function thinkingIndicator() {
-  const row = document.createElement("div");
-  row.className = "message-row assistant thinking-row";
-  const avatar = document.createElement("div");
-  avatar.className = "avatar";
-  avatar.textContent = "N";
-  const dots = document.createElement("div");
-  dots.className = "thinking-dots";
-  dots.innerHTML = "<i></i><i></i><i></i>";
-  row.append(avatar, dots);
-  return row;
+function renderStagedJournal() {
+  if (!state.journalDirty) return;
+  state.journalDirty = false;
+  renderEvents(state.journalEvents);
 }
 
 function renderEvents(events) {
@@ -1093,81 +1162,12 @@ function renderEvents(events) {
   }));
 }
 
-async function useStarter(event) {
-  const button = event.target.closest("[data-prompt]");
-  if (!button) return;
-  if (!sessionProjection.sessionId) await createSession();
-  elements.input.value = button.dataset.prompt;
-  elements.input.focus();
-}
-
-async function sendMessage(event) {
-  event.preventDefault();
-  const content = elements.input.value.trim();
-  if (!content || !sessionProjection.sessionId) return;
-  elements.input.value = "";
-  elements.input.disabled = true;
-  elements.composerAction.disabled = true;
-  try {
-    await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/messages`, {
-      method: "POST",
-      body: { content },
-    });
-  } catch {
-    elements.input.value = content;
-    elements.input.disabled = false;
-    renderComposerAction();
-  }
-}
-
-function handleComposerAction() {
-  const action = composerActionState(sessionProjection.phase, { cancelling: state.cancelling });
-  if (action.mode === "stop") {
-    void cancelRun();
-    return;
-  }
-  elements.form.requestSubmit();
-}
-
-async function decide(callId, approved, scope, buttons) {
-  buttons.forEach((button) => { button.disabled = true; });
-  try {
-    await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/approvals/${encodeURIComponent(callId)}`, {
-      method: "POST",
-      body: { approved, scope },
-    });
-  } catch {
-    buttons.forEach((button) => { button.disabled = false; });
-  }
-}
-
-async function cancelRun() {
-  const action = composerActionState(sessionProjection.phase, { cancelling: state.cancelling });
-  if (!sessionProjection.sessionId || action.mode !== "stop" || state.cancelling) return;
-  state.cancelling = true;
-  renderComposerAction();
-  try {
-    await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/cancel`, { method: "POST", body: {} });
-  } catch {
-    state.cancelling = false;
-    renderComposerAction();
-  }
-}
-
-function renderComposerAction() {
-  const action = composerActionState(sessionProjection.phase, { cancelling: state.cancelling });
-  elements.composerAction.textContent = action.symbol;
-  elements.composerAction.disabled = !sessionProjection.sessionId || action.disabled;
-  elements.composerAction.setAttribute("aria-label", action.label);
-  elements.composerAction.title = action.mode === "stop" ? "停止当前任务（Esc）" : "发送消息（Enter）";
-  elements.composerAction.classList.toggle("stop-button", action.mode === "stop");
-  elements.composerShortcut.textContent = action.shortcut;
-}
-
 function isOverlayOpen() {
   return !elements.dangerConfirm.classList.contains("hidden")
-    || elements.inspector.getAttribute("aria-hidden") === "false"
-    || !elements.permissionMenu.classList.contains("hidden");
+    || state.editingTitle
+    || inspectorShell.isModalOpen()
+    || !elements.permissionMenu.classList.contains("hidden")
+    || taskNavigation.isOpen();
 }
 
 async function exportSession() {
@@ -1429,201 +1429,26 @@ function setGrantActionAvailability(busy) {
   });
 }
 
-function openInspector() {
-  elements.inspector.classList.add("open");
-  elements.inspector.setAttribute("aria-hidden", "false");
-  elements.debugToggle.setAttribute("aria-expanded", "true");
-  elements.backdrop.classList.remove("hidden");
-}
-
-function closeInspector() {
-  elements.inspector.classList.remove("open");
-  elements.inspector.setAttribute("aria-hidden", "true");
-  elements.debugToggle.setAttribute("aria-expanded", "false");
-  elements.backdrop.classList.add("hidden");
-}
-
-function selectTab(name) {
+function handleInspectorViewSelected(name) {
   state.inspectorTab = name;
-  document.querySelectorAll(".tab").forEach((tab) => {
-    const active = tab.dataset.tab === name;
-    tab.classList.toggle("active", active);
-    tab.setAttribute("aria-selected", String(active));
-  });
-  $("#events-view").classList.toggle("hidden", name !== "events");
-  $("#context-view").classList.toggle("hidden", name !== "context");
-  $("#evaluation-view").classList.toggle("hidden", name !== "evaluation");
-  $("#memory-view").classList.toggle("hidden", name !== "memory");
-  $("#grants-view").classList.toggle("hidden", name !== "grants");
-  if (name === "grants") void Promise.allSettled([loadGrants()]);
-  if (name === "evaluation") void loadEvaluation();
-  if (name === "memory") void Promise.allSettled([loadMemories(), loadCandidates()]);
+  elements.inspector.classList.toggle("review-mode", name === "files");
+  prepareInspectorView(name);
 }
 
-function renderMarkdown(source) {
-  const root = document.createElement("div");
-  root.className = "markdown";
-  const lines = String(source || "").replace(/\r\n/g, "\n").split("\n");
-  let index = 0;
-  while (index < lines.length) {
-    const line = lines[index];
-    if (!line.trim()) { index += 1; continue; }
-
-    if (/^```/.test(line.trim())) {
-      const language = line.trim().slice(3).trim();
-      const codeLines = [];
-      index += 1;
-      while (index < lines.length && !/^```/.test(lines[index].trim())) codeLines.push(lines[index++]);
-      if (index < lines.length) index += 1;
-      const pre = document.createElement("pre");
-      const code = document.createElement("code");
-      if (language) code.dataset.language = language;
-      code.textContent = codeLines.join("\n");
-      pre.append(code);
-      root.append(pre);
-      continue;
-    }
-
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) {
-      const node = document.createElement(`h${heading[1].length + 1}`);
-      appendInline(node, heading[2]);
-      root.append(node);
-      index += 1;
-      continue;
-    }
-
-    if (/^\s*[-*+]\s+/.test(line) || /^\s*\d+[.)]\s+/.test(line)) {
-      const ordered = /^\s*\d+[.)]\s+/.test(line);
-      const list = document.createElement(ordered ? "ol" : "ul");
-      const matcher = ordered ? /^\s*\d+[.)]\s+(.+)$/ : /^\s*[-*+]\s+(.+)$/;
-      while (index < lines.length) {
-        const match = lines[index].match(matcher);
-        if (!match) break;
-        const item = document.createElement("li");
-        appendInline(item, match[1]);
-        list.append(item);
-        index += 1;
-      }
-      root.append(list);
-      continue;
-    }
-
-    if (/^>\s?/.test(line)) {
-      const quote = document.createElement("blockquote");
-      const quoteLines = [];
-      while (index < lines.length && /^>\s?/.test(lines[index])) quoteLines.push(lines[index++].replace(/^>\s?/, ""));
-      appendInline(quote, quoteLines.join(" "));
-      root.append(quote);
-      continue;
-    }
-
-    const paragraph = [];
-    while (index < lines.length && lines[index].trim() && !isBlockStart(lines[index])) paragraph.push(lines[index++].trim());
-    if (!paragraph.length) paragraph.push(lines[index++]);
-    const node = document.createElement("p");
-    appendInline(node, paragraph.join(" "));
-    root.append(node);
-  }
-  return root;
-}
-
-function appendInline(parent, source) {
-  const pattern = /(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\*[^*\n]+\*|_([^_]+)_|\[[^\]]+\]\([^)]+\))/g;
-  let cursor = 0;
-  for (const match of source.matchAll(pattern)) {
-    if (match.index > cursor) parent.append(document.createTextNode(source.slice(cursor, match.index)));
-    const token = match[0];
-    if (token.startsWith("`")) {
-      const code = document.createElement("code");
-      code.textContent = token.slice(1, -1);
-      parent.append(code);
-    } else if (token.startsWith("**") || token.startsWith("__")) {
-      const strong = document.createElement("strong");
-      strong.textContent = token.slice(2, -2);
-      parent.append(strong);
-    } else if (token.startsWith("*") || token.startsWith("_")) {
-      const em = document.createElement("em");
-      em.textContent = token.slice(1, -1);
-      parent.append(em);
-    } else {
-      const parts = token.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-      const link = document.createElement("a");
-      link.textContent = parts[1];
-      if (safeLink(parts[2])) {
-        link.href = parts[2];
-        link.target = "_blank";
-        link.rel = "noreferrer";
-      }
-      parent.append(link);
-    }
-    cursor = match.index + token.length;
-  }
-  if (cursor < source.length) parent.append(document.createTextNode(source.slice(cursor)));
-}
-
-function isBlockStart(line) {
-  const value = line.trim();
-  return /^```/.test(value) || /^#{1,4}\s+/.test(value) || /^>\s?/.test(value)
-    || /^[-*+]\s+/.test(value) || /^\d+[.)]\s+/.test(value);
-}
-
-function safeLink(value) {
-  try {
-    return ["http:", "https:"].includes(new URL(value, location.href).protocol);
-  } catch {
-    return false;
+function prepareInspectorView(name) {
+  if (name === "overview") void loadEvaluation();
+  if (name === "more") {
+    if ($("#memory-section").open) void Promise.allSettled([loadMemories(), loadCandidates()]);
+    if ($("#grants-section").open) void loadGrants();
+    if ($("#journal-section").open) renderStagedJournal();
   }
 }
 
-function createWelcome() {
-  const box = document.createElement("div");
-  box.className = "welcome";
-  const mark = document.createElement("div");
-  mark.className = "welcome-mark";
-  mark.textContent = "N";
-  const title = document.createElement("h2");
-  title.textContent = "开始一个新任务";
-  const copy = document.createElement("p");
-  copy.textContent = "Nexus 会在本地工作区中读取文件、运行命令并请求必要审批。";
-  const starters = document.createElement("div");
-  starters.className = "starters";
-  [
-    ["理解项目", "梳理架构与关键模块", "分析这个项目的结构，并告诉我应该从哪里开始。"],
-    ["检查问题", "定位错误与风险", "检查当前项目，找出最值得修复的问题。"],
-    ["继续开发", "推进优先级最高的功能", "根据当前项目目标，实现下一个优先级最高的功能。"],
-  ].forEach(([label, description, prompt]) => {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.dataset.prompt = prompt;
-    const strong = document.createElement("strong");
-    strong.textContent = label;
-    const span = document.createElement("span");
-    span.textContent = description;
-    button.append(strong, span);
-    starters.append(button);
-  });
-  box.append(mark, title, copy, starters);
-  return box;
-}
-
-function normalizeToolCall(call) {
-  return {
-    id: call.id,
-    name: call.name || call.function?.name || "unknown",
-    arguments: call.arguments ?? call.function?.arguments ?? {},
-  };
-}
-
-function formatToolArguments(value) {
-  if (typeof value === "string") {
-    try { return JSON.stringify(JSON.parse(value), null, 2); } catch { return value; }
-  }
-  return JSON.stringify(value ?? {}, null, 2);
-}
-
-function toolResultClass(content) {
-  return /失败|拒绝|未知工具|取消|error/i.test(content || "") ? "failed" : "completed";
+function handleInspectorSectionToggle(event) {
+  if (!event.currentTarget.open) return;
+  if (event.currentTarget.id === "memory-section") void Promise.allSettled([loadMemories(), loadCandidates()]);
+  if (event.currentTarget.id === "grants-section") void loadGrants();
+  if (event.currentTarget.id === "journal-section") renderStagedJournal();
 }
 
 function toolLabel(name) {
@@ -1642,13 +1467,6 @@ function toolLabel(name) {
     delegate_task: "委派 Child Agent",
   };
   return labels[name] || name || "工具调用";
-}
-
-function sessionTitle(session) {
-  const content = session.messages?.find((message) => message.role === "user")?.content?.trim();
-  if (!content) return "新任务";
-  const compact = content.replace(/\s+/g, " ");
-  return compact.length > 42 ? `${compact.slice(0, 42).trimEnd()}…` : compact;
 }
 
 function phaseLabel(phase) {
@@ -1708,6 +1526,7 @@ function eventLabel(type) {
     "tool.execution_started": "开始执行工具",
     "tool.output_updated": "更新工具实时输出",
     "tool.execution_unknown": "工具结果未知",
+    "tool.recovery_cancelled": "恢复时取消未启动工具",
     "tool.completed": "工具完成",
     "tool.file_changes_inherited": "继承文件变更",
     "approval.requested": "等待审批",
@@ -1721,6 +1540,7 @@ function eventLabel(type) {
     "tool.project_grant_revoked": "撤销项目授权",
     "permission.profile_changed": "切换权限档位",
     "permission.profile_downgraded": "安全降级权限档位",
+    "session.display_title_changed": "更新任务名称",
     "session.turn_completed": "任务完成",
     "session.failed": "任务失败",
     "session.cancelled": "任务取消",

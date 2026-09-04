@@ -12,6 +12,8 @@ export function contextObservabilityViewModel(session = {}) {
   const maxTokens = safeNumber(plan?.maxInputTokens);
   const estimatedTokens = safeNumber(plan?.estimatedInputTokens);
   const percent = maxTokens ? Math.round((estimatedTokens / maxTokens) * 100) : 0;
+  const estimatedOverTarget = plan?.estimatedOverTarget === true
+    || Boolean(maxTokens && estimatedTokens > maxTokens);
   const summary = summaryView(plan?.summary, session.contextSummary, summaryEvent);
   const historyProjection = historicalToolProjectionView(plan?.historyProjection);
   const activeToolProjection = activeToolProjectionView(plan?.activeToolProjection);
@@ -19,7 +21,9 @@ export function contextObservabilityViewModel(session = {}) {
   return {
     plan: plan ? {
       compacted: plan.compacted === true,
-      statusLabel: plan.compacted
+      statusLabel: estimatedOverTarget
+        ? "超过估算目标，已继续"
+        : plan.compacted
         ? "已压缩"
         : activeToolProjection.applied
           ? "活动工具轮已精简"
@@ -33,6 +37,7 @@ export function contextObservabilityViewModel(session = {}) {
     usage: {
       estimatedTokens,
       maxTokens,
+      overTarget: estimatedOverTarget,
       percent,
       meterPercent: Math.min(100, Math.max(0, percent)),
       level: percent >= 90 ? "danger" : percent >= 75 ? "warning" : "normal",

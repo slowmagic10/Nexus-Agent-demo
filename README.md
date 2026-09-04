@@ -74,7 +74,9 @@ npm run gateway:local
 
 单次任务的模型/工具循环次数与累计 Token 默认都不限制，Agent 会持续运行到模型确认完成、遇到阻塞、需要审批/用户输入或用户主动取消。会话中的用户消息轮次本身也没有总数限制。
 
-如果需要主动设置成本边界，可通过 `NEXUS_MAX_STEPS=20` / `--max-steps=20` 限制循环次数，通过 `NEXUS_MAX_TOKENS_PER_TURN=500000` / `--max-tokens-per-turn=500000` 限制累计 Token；`unlimited` 或 `0` 恢复为不限制。模型自身单次 Context Window、工具超时、审批、取消和沙箱边界仍然生效。
+如果需要主动设置成本边界，可通过 `NEXUS_MAX_STEPS=20` / `--max-steps=20` 限制循环次数，通过 `NEXUS_MAX_TOKENS_PER_TURN=500000` / `--max-tokens-per-turn=500000` 限制累计 Token；`unlimited` 或 `0` 恢复为不限制。模型自身单次 Context Window、审批、取消和沙箱边界仍然生效。`run_shell` 默认不设置自动 deadline；需要上限时由模型或调用方显式传入 `timeout_ms`，其他工具自己的 deadline 不受影响。
+
+`run_shell` 是前台工具调用：省略 `timeout_ms` 时会持续等待命令退出，并通过现有 durable output stream 展示进度；例如 `{ "command": "npm test", "timeout_ms": 1800000 }` 可设置 30 分钟上限。无自动 deadline 不等于后台任务，用户仍可随时点击停止或按 `Esc`，取消会终止整个执行进程树并留下可恢复的终态记录。
 
 配置按以下顺序覆盖：内置默认值、工作区 `nexus.config.json`、本机 `.nexus/config.local.json`、环境变量/`.env.local`、命令行参数。共享的 `nexus.config.json` 不允许保存 API Key；私有 JSON 和 `.env.local` 均由 Git 忽略。为防止不可信 workspace 在启动时拉起任意子进程或降低权限边界，两个 workspace JSON 配置层都不能启用 MCP、选择执行环境或全局 Permission Profile；这些能力只能由受信任环境变量或显式 CLI 参数启用。本机具名 Agent Profile 可以选择预先支持的安全权限档位，但不能配置 `danger-full-access`。
 
@@ -174,23 +176,25 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 - Agent Loop：模型、工具、Observation 循环默认不限制步骤数和累计 Token；可按需显式设置边界。模型被要求持续执行到完成并验证、明确阻塞或需要用户输入。
 - 模型流式输出：OpenAI-compatible/DeepSeek 与原生 OpenAI Responses 两个真实 Adapter 都把各自的 SSE 方言规范化为 `text_delta/completed`；Runtime 合并并脱敏正文片段后写入 durable Session Event，Web 可实时显示，刷新或 Gateway 重启后仍能恢复已生成部分。取消会直接中止模型请求并保留部分输出；Context overflow 重试前不会复用旧增量。普通 JSON 兼容端会安全降级，Context Summary 与 Memory Flush 继续使用非流式调用。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
+- 安全任务标题：任务列表和页头使用 durable `Session Display Title`；首条输入及用户自定义名称都会先统一脱敏和泛化，服务器地址、账号、凭据或网络端点不会直接出现在侧栏。页头“重命名”可设置自定义名称，清空后回到安全派生标题。
 - Objective 与计划：每个用户任务建立 durable Objective；复杂任务可通过内置 `update_plan` 维护有版本的步骤状态，Journal 恢复和 Web Client Projection 会保留同一计划。
 - 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。Child 重启恢复时预算只能保持或继续收紧，不能被具名 Profile 默认值扩大。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
 - Agent Profile：每个 Session baseline 保存不含密钥的 Provider/model、提示词与工具 schema hash、Policy、Execution、Memory scope 和预算版本；恢复配置变化会留下带字段分类和影响等级的 durable diff。可在本地私有配置中定义具名 Profile，并在 Web/CLI 创建新任务时显式选择；Child 继承身份并单独收紧预算。
 - Artifact：长 Shell、MCP、文件读取等成功或失败工具输出在 Tool Host 统一脱敏后保存到 Session 专属 SQLite Artifact Store，消息只保留预览和引用；模型可用 `read_artifact` 分段读取，Web 工具卡可加载完整输出。Portable Journal 可携带 Artifact，Import 与 Branch 会复制到目标 Session scope，运行时仍禁止直接跨 Session 访问。
 - 精确编辑：`edit_file` 通过唯一旧文本完成单文件局部替换；`apply_patch` 用一个结构化批次新增、精确更新或删除多个文件，同一路径可按顺序执行多个 update。批次先校验全部目标、权限、匹配次数和大小，再开始写入；符号链接别名造成的重复真实目标会拒绝，预检失败不修改文件，提交失败会回滚已经尝试的文件。它是进程内文件级补偿回滚，不承诺主机崩溃时的事务原子性。
 - 文件变更：`write_file`、`edit_file`、`apply_patch` 与 `run_shell` 执行后生成有界 File Change Manifest；Journal 保存新增/修改/删除摘要和哈希，脱敏文本 Diff 保存为 Artifact，Web 工具卡可按需查看。工作区内符号链接写入会追踪真实目标，Shell 创建、改指向或删除链接会记录链接变化。`.git/.nexus/node_modules/.env*` 不参与内容采集，超限会明确显示为不完整。
-- 模型上下文：Context Lifecycle deep Module 从 durable event 投影消息、记忆与 Skills，并在每个用户 turn 内统一管理历史/活动工具投影、Memory retrieval、窗口规划、语义摘要、模型审计与 overflow replan；Agent Loop 不再编排这些细节。已完成旧 turn 的工具协议会成对改写为有界历史记录；长任务的当前 turn 始终逐字保留最近两个完整工具轮，只在确实节省 Token 时精简更早、已经闭合的工具轮。完整内容继续保存在 Journal，用户目标、普通正文和最近 Observation 不变。默认按 32,000 estimated input tokens 规划窗口，超限时生成带覆盖位置的滚动结构化语义摘要，并与连续的最近完整 turn 一起进入模型；摘要失败会降级为 recent-turn 策略，原始 Journal 永不删除。每个最终 Provider 请求都计算确定性的 SHA-256 `contextHash`，durable audit 分开记录历史与活动工具投影节省和规划元数据，不复制 System Prompt、消息或工具正文。若 Provider 明确返回 Context overflow，Lifecycle 会进一步缩减完整旧 turn 并自动重试一次，且在本 turn 后续工具轮继续沿用收紧后的预算；认证、限流、网络和普通模型错误不会进入该重试路径。
+- 模型上下文：Context Lifecycle deep Module 从 durable event 投影消息、记忆与 Skills，并在每个用户 turn 内统一管理历史/活动工具投影、Memory retrieval、窗口规划、语义摘要、模型审计与 overflow replan；Agent Loop 不再编排这些细节。已完成旧 turn 的工具协议会成对改写为有界历史记录；长任务的当前 turn 始终逐字保留最近两个完整工具轮，只在确实节省 Token 时精简更早、已经闭合的工具轮。完整内容继续保存在 Journal，用户目标、普通正文和最近 Observation 不变。默认把 32,000 estimated input tokens 作为历史压缩的软目标，超出时优先生成带覆盖位置的滚动结构化语义摘要，并与连续的最近完整 turn 一起进入模型；当前 turn 或固定上下文即使估算超出目标也会继续发送，不会被本地估算阻断。摘要失败会降级为 recent-turn 策略，原始 Journal 永不删除。每个最终 Provider 请求都计算确定性的 SHA-256 `contextHash`，durable audit 分开记录历史与活动工具投影节省和规划元数据，不复制 System Prompt、消息或工具正文。若 Provider 明确返回 Context overflow，Lifecycle 会进一步缩减完整旧 turn 并自动重试一次，且在本 turn 后续工具轮继续沿用收紧后的压缩目标；认证、限流、网络和普通模型错误不会进入该重试路径。
 - 长期记忆：Pinned 与 Relevant Memory 按 Session scope 独立检索和预算，固定记忆优先进入 Context；两类都按不可信事实数据处理，不会提升为策略指令。Web 记忆面板的列表、新增、删除、固定、候选列表与候选处理全部绑定当前 Session/Profile 的 Memory Scope，不会落入默认 Agent 的全局 scope；固定状态经 durable outbox 修改并保留 Session 审计。
-- 工具安全：`read-only` 提供不可被 Policy/Grant/Approval 提升的只读闭环；`workspace-auto` 自动执行普通工作区写入与沙箱内常规 Shell；工作区删除、动态解释器、网络/安装/Git 写入审批并支持 Session Grant；秘密、宿主逃逸和系统破坏硬拒绝；工具有超时与取消信号。
+- 工具安全：`read-only` 提供不可被 Policy/Grant/Approval 提升的只读闭环；`workspace-auto` 自动执行普通工作区写入与沙箱内常规 Shell；工作区删除、动态解释器、网络/安装/Git 写入审批并支持 Session Grant；秘密、宿主逃逸和系统破坏硬拒绝；工具支持可选 deadline 与取消信号，`run_shell` 默认无自动 deadline，可用 `timeout_ms` 显式限制。
 - Workspace 与 Skills：读取 `AGENTS.md`、`SOUL.md`，按需加载 `.nexus/skills/*/SKILL.md`。
 - 持久化：SQLite 保存会话、消息、事件、文本 Artifact、短期记忆、已加载 Skills 和跨会话长期记忆；自动执行事务化 schema migration，并用带校验和的 checkpoint 加速长会话恢复。
 - 恢复与迁移：按 ID 恢复会话，安全闭合中断的工具调用，并导入、导出可重放 Journal Archive。
-- 可观测性：记录模型/工具调用数、审批数、Token 用量以及模型、工具和单轮耗时；Web “上下文”面板解释 Token 预算、历史省略、Memory 命中、摘要 revision 与 Context overflow 自动缩减，“诊断”面板从 Session Journal 确定性派生任务健康、工具可靠性、审批和委派信号，不展示消息、工具参数或原始错误正文。离线 Replay Harness 可验证 Journal Archive、重复 reducer 重放并比较 state/event 指纹、Context Hash、指标与问题分类，全程不调用 Provider 或工具 Adapter。
+- 可观测性：记录模型/工具调用数、审批数、Token 用量以及模型、工具和单轮耗时；Web “上下文”面板解释 Token 估算与软压缩目标、历史省略、Memory 命中、摘要 revision 与 Context overflow 自动缩减，详情“概览”从 Session Journal 确定性派生任务健康、工具可靠性、审批和委派信号，不展示消息、工具参数或原始错误正文。离线 Replay Harness 可验证 Journal Archive、重复 reducer 重放并比较 state/event 指纹、Context Hash、指标与问题分类，全程不调用 Provider 或工具 Adapter。
 - 本地 Gateway：HTTP API、带游标的增量 SSE、远程审批、取消、记忆管理和同源 Web 控制台。
+- Task Workbench：同一 user Turn 的多次模型/工具步骤聚合为一个 Agent 回应；每轮只显示一张可折叠 Execution Summary，以 durable Tool 终态汇总工具数、耗时、文件变化、审批、恢复和本轮结果，不再从输出文案猜测成败。主线程以稳定 Turn 身份增量协调：模型或工具流只更新活动 Turn，已完成历史、手动展开状态、焦点和阅读位置不会被整页重建；接近底部时自动跟随，主动上滚后不抢回底部。失败、取消和结果未知保留各自 durable 原因：只有 Adapter 已启动且没有终态时才标记未知并要求人工检查，尚未启动的后续调用明确取消，两者都不会自动重试；Branch 继承历史显示为中性记录，新事件只配对新的 Turn。宽屏使用“任务列表 / 任务线程 / 任务详情”真实三栏工作台，右侧详情常驻且不遮挡正文；中小屏才退化为可关闭抽屉。详情收拢为“概览 / 文件 / 上下文 / 更多”；“文件”按 Turn 和 Tool occurrence 展示 File Change Manifest，并按需加载 durable Diff，同一路径的多次变化与分支继承都保留独立来源。Memory、Grant 与最近 100 条 Journal Event 默认折叠且按需加载。Composer 统一管理输入法、发送、停止和 Session-scoped 异步状态，快速切换任务时旧请求不会污染当前草稿或按钮；真正的浮层和移动任务抽屉会优先消费 `Esc`，常驻详情栏不会阻断任务中止。正文使用 15px 基线，状态和次要信息不低于 12px；小于 760px 时通过“任务”按钮打开可键盘关闭的 Sidebar 抽屉，不再丢失任务导航。
 - MCP stdio：支持 Tools、Resources、Resource Templates 和 Prompts；能力名称隔离并统一审批。
 - Capability Runtime：Native/MCP 工具有明确 owner；MCP 关闭或能力撤销后 schema 立即消失，旧调用不会启动 Adapter。
-- WorkspaceExecution：macOS 默认通过 Seatbelt 原生沙箱执行 Shell，限制沿进程树继承；环境变量白名单、zsh no-rc、workspace/symlink 边界和完整进程组终止统一生效。Local 为显式 trusted-local，Docker 为显式可选后端。
+- WorkspaceExecution：macOS 默认通过 Seatbelt 原生沙箱执行 Shell，限制沿进程树继承；环境变量白名单、zsh no-rc、workspace/symlink 边界和完整进程组终止统一生效。`run_shell` 无 deadline 时仍是前台调用；取消或显式超时继续回收完整进程树，并记录实际耗时与终止原因。Local 为显式 trusted-local，Docker 为显式可选后端。
 - 凭据脱敏：Assistant 正文、工具参数、输出和错误在持久化前过滤常见 API Key、Token、Authorization、敏感字段、高熵引号凭据，以及 `sshpass`/位置型 `expect` 登录参数。
 
 ## 会话、记忆与导出
@@ -243,13 +247,13 @@ CLI 中可用：
 - `/export`：导出当前会话到 `.nexus/exports/`。
 - `/quit`：保存并退出。
 
-如果进程在审批或工具执行期间中断，恢复时会为未闭合调用补充“执行状态未知”的安全结果，不会自动重放可能有副作用的操作。
+如果进程在审批或工具执行期间中断，恢复时会为未闭合调用补充“执行状态未知”的安全结果，不会自动重放可能有副作用的操作。长时间 `run_shell` 也不作为可重连后台 Job；Gateway 中断后的已启动执行继续按 `execution_unknown` 闭合。
 
-Model Context 不会按单条消息硬截断。assistant tool call 与对应 tool result 属于同一个完整 turn；如果当前 turn 或 system prompt、Skills、工具 schema 的固定成本自身超过预算，本轮会在调用模型前进入 `failed`。每次窗口规划都会产生 `model.context_prepared` 或 `model.context_compacted` durable audit event，其中 `contextHash` 对实际发送的 System Prompt、消息和 Tool Schema 做规范化摘要，可用于识别两次请求的模型可见内容是否完全一致。Provider overflow 的自动缩减会写入 `context.replan_requested/replanned`；重试仍超限时写入 `context.replan_exhausted` 并结束任务，不会形成无界重试。
+Model Context 不会按单条消息硬截断。assistant tool call 与对应 tool result 属于同一个完整 turn；配置的 Context 数值只用于压缩旧历史，不是本地执行上限。当前 turn 或 system prompt、Skills、工具 schema 的固定成本即使估算超过目标，也会保留完整协议并继续调用 Provider，同时在计划中记录 `estimatedOverTarget`。每次窗口规划都会产生 `model.context_prepared` 或 `model.context_compacted` durable audit event，其中 `contextHash` 对实际发送的 System Prompt、消息和 Tool Schema 做规范化摘要，可用于识别两次请求的模型可见内容是否完全一致。只有 Provider 明确返回真实 Context overflow 才会自动缩减并写入 `context.replan_requested/replanned`；重试仍被 Provider 拒绝时写入 `context.replan_exhausted` 并结束任务，不会形成无界重试。
 
 ## Web 控制台与 Gateway API
 
-Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web 控制台提供会话列表、消息发送、实时状态、运行指标、Context 可观测性、Journal 派生的任务诊断、会话级权限菜单、审批、取消、长期记忆和会话导出。运行期间 Composer 的发送按钮会切换成红色停止按钮，点击或按 `Esc` 都会中断模型请求、审批等待和工具进程组；停止完成后恢复发送。Runtime 失败时会在消息流底部直接显示停止原因，不再表现为无声结束。消息输入框支持中日韩输入法组合态：确认候选时的 Enter 不会发送，普通 Enter 发送，Shift+Enter 换行。
+Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web 控制台提供会话列表、消息发送、实时状态、运行指标、Context 可观测性、Journal 派生的任务诊断、会话级权限菜单、审批、取消、长期记忆和会话导出。只有 user message 才创建新的可见 Turn；同一任务里的多次模型步骤和 Tool Run 共用一个 Nexus 头像，并收进带工具数、耗时、文件变化与异常状态的“执行摘要”，完成后默认折叠，最终回答保留在 Turn 主体。顶部“审查”入口及 Turn/概览中的文件入口会选择 Inspector“文件”视图；宽屏 Inspector 常驻第三栏，中小屏以 dialog 抽屉打开。该视图只使用 durable File Change Manifest 和 Diff Artifact 展示对应执行现场，不以当前工作区内容改写历史。运行期间 Composer 的发送按钮会切换成红色停止按钮，点击或按 `Esc` 都会中断模型请求、审批等待和工具进程组；权限菜单、危险确认、移动任务抽屉或中小屏 Inspector 打开时，`Esc` 只关闭当前浮层，宽屏常驻 Inspector 不属于浮层。发送和取消状态按 Session 隔离，切换任务后迟到请求不会改写当前草稿或控制按钮。Runtime 失败时会在消息流底部直接显示停止原因，不再表现为无声结束。消息输入框支持中日韩输入法组合态：确认候选时的 Enter 不会发送，普通 Enter 发送，Shift+Enter 换行。
 
 常用 API：
 

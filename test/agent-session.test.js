@@ -502,6 +502,116 @@ test("portable journal 可重定位 workspace、重映射 ID 并完整重放", a
   }
 });
 
+test("M17 仍可校验和导入不含 deadline 元数据的旧 Tool Journal", async () => {
+  const source = createFixture();
+  const destination = createFixture();
+  try {
+    const session = new AgentSession({
+      state: createSession({
+        provider: "demo",
+        workspace: source.workspace,
+        id: "session-pre-m17-tools",
+        createdAt: "2026-08-17T01:00:00.000Z",
+      }),
+      reducer: reduceSession,
+      journal: source.store,
+    });
+    const call = { id: "legacy-shell", name: "run_shell", arguments: { command: "sleep 1" } };
+    await session.dispatch({ type: "TOOL_REQUESTED", call, at: "2026-08-17T01:00:01.000Z" });
+    await session.dispatch({
+      type: "TOOL_EXECUTION_STARTED",
+      call,
+      argsHash: "legacy-hash",
+      toolVersion: "legacy-version",
+      effects: ["execute"],
+      idempotency: "unknown",
+      adapter: "native",
+      at: "2026-08-17T01:00:02.000Z",
+    });
+    await session.dispatch({
+      type: "TOOL_EXECUTION_UNKNOWN",
+      call,
+      argsHash: "legacy-hash",
+      effects: ["execute"],
+      idempotency: "unknown",
+      adapter: "native",
+      reason: "timeout",
+      durationMs: 15_000,
+      at: "2026-08-17T01:00:03.000Z",
+    });
+    await session.dispatch({
+      type: "TOOL_RESULT",
+      call,
+      ok: false,
+      status: "execution_unknown",
+      result: "旧版超时结果未知",
+      durationMs: 15_000,
+      at: "2026-08-17T01:00:04.000Z",
+    });
+
+    const archive = source.store.exportJournal(session.id, { exportedAt: "2026-08-17T02:00:00.000Z" });
+    const legacyToolEvents = archive.events.slice(1);
+    assert.equal(JSON.stringify(legacyToolEvents).includes("effectiveTimeoutMs"), false);
+    assert.equal(JSON.stringify(legacyToolEvents).includes("deadlineAt"), false);
+    assert.equal(JSON.stringify(legacyToolEvents).includes("terminationReason"), false);
+
+    const imported = destination.store.importJournal(archive, {
+      id: "session-pre-m17-imported",
+      workspace: destination.workspace,
+    });
+    assert.equal(imported.id, "session-pre-m17-imported");
+    assert.equal(imported.messages.at(-1).content, "旧版超时结果未知");
+  } finally {
+    source.close();
+    destination.close();
+  }
+});
+
+test("schema v15 portable journal 可迁移派生安全标题后继续严格重放", async () => {
+  const source = createFixture();
+  const destination = createFixture();
+  try {
+    const session = new AgentSession({
+      state: createSession({
+        provider: "demo",
+        workspace: source.workspace,
+        id: "session-schema-v15-portable",
+        createdAt: "2026-08-17T01:00:00.000Z",
+      }),
+      reducer: reduceSession,
+      journal: source.store,
+    });
+    await session.dispatch({
+      type: "USER_MESSAGE",
+      content: "访问 https://internal.example.com",
+      at: "2026-08-17T01:00:01.000Z",
+    });
+    const archive = source.store.exportJournal(session.id, { exportedAt: "2026-08-17T02:00:00.000Z" });
+
+    archive.events[0].baseline.schemaVersion = 15;
+    delete archive.events[0].baseline.displayTitle;
+    archive.session.stateSchemaVersion = 15;
+    delete archive.events[1].patch.set.displayTitle;
+    const legacyCore = {
+      format: archive.format,
+      formatVersion: archive.formatVersion,
+      session: archive.session,
+      events: archive.events,
+    };
+    archive.checksum = `sha256:${createHash("sha256").update(JSON.stringify(legacyCore)).digest("hex")}`;
+
+    const imported = destination.store.importJournal(archive, {
+      id: "session-schema-v15-imported",
+      workspace: destination.workspace,
+    });
+    assert.equal(imported.displayTitle, "受保护任务");
+    assert.equal(imported.messages[0].content, "访问 https://internal.example.com");
+  } finally {
+    source.close();
+    destination.close();
+  }
+});
+
 test("导入的未完成 Memory outbox 不会自动执行副作用", async () => {
   const source = createFixture();
   const destination = createFixture();

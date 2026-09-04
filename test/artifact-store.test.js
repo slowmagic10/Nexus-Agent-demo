@@ -9,6 +9,7 @@ import { createSession, reduceSession } from "../src/core/state.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 import { GatewaySessionManager } from "../src/gateway/session-manager.js";
 import { connectMcpTools } from "../src/mcp/tool-adapter.js";
+import { WorkspaceExecutionError } from "../src/execution/local-workspace-adapter.js";
 import { createToolRegistry } from "../src/tools/registry.js";
 import { ToolHost } from "../src/tools/host.js";
 
@@ -170,6 +171,135 @@ test("run_shell 失败大输出也由 Tool Host 保存为 Artifact", async (t) =
   const artifact = await store.artifacts.get(result.artifact.id, { sessionId: session.id });
   assert.match(artifact.content, /TAIL-5000/);
   assert.match(artifact.content, /退出码 7/);
+});
+
+test("run_shell 超时保留 WorkspaceExecutionError 输出并生成 Artifact", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-shell-timeout-artifact-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  t.after(async () => {
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const initial = createSession({ id: "session-shell-timeout-artifact", provider: "test", workspace });
+  store.ensureJournal(initial);
+  const session = new AgentSession({ state: initial, reducer: reduceSession, journal: store });
+  const fullOutput = `${"timeout-output\n".repeat(200)}TIMEOUT-TAIL`;
+  const registry = createToolRegistry({
+    workspace,
+    artifactStore: store.artifacts,
+    workspaceExecution: {
+      id: "artifact-timeout-execution",
+      execute: async () => {
+        throw new WorkspaceExecutionError("execution timed out", {
+          code: "timeout",
+          result: { output: fullOutput },
+        });
+      },
+    },
+  });
+  const host = new ToolHost({ registry, artifactStore: store.artifacts, maxResultChars: 120 });
+
+  const result = await host.execute({
+    id: "call-shell-timeout-artifact",
+    name: "run_shell",
+    arguments: { command: "long build", timeout_ms: 60_000 },
+  }, { session, requestApproval: async () => true });
+
+  assert.equal(result.status, "execution_unknown");
+  assert.match(result.artifact.id, /^artifact-/);
+  const artifact = await store.artifacts.get(result.artifact.id, { sessionId: session.id });
+  assert.match(artifact.content, /timeout-output/);
+  assert.match(artifact.content, /TIMEOUT-TAIL/);
+});
+
+test("run_shell 取消保留 WorkspaceExecutionError 输出并生成 Artifact", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-shell-cancel-artifact-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  t.after(async () => {
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const initial = createSession({ id: "session-shell-cancel-artifact", provider: "test", workspace });
+  store.ensureJournal(initial);
+  const session = new AgentSession({ state: initial, reducer: reduceSession, journal: store });
+  const fullOutput = `${"cancel-output\n".repeat(200)}CANCEL-TAIL`;
+  let markStarted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const registry = createToolRegistry({
+    workspace,
+    artifactStore: store.artifacts,
+    workspaceExecution: {
+      id: "artifact-cancel-execution",
+      execute: async (_spec, { signal }) => {
+        markStarted();
+        return await new Promise((resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new WorkspaceExecutionError("execution cancelled", {
+            code: "cancelled",
+            result: { output: fullOutput },
+          })), { once: true });
+        });
+      },
+    },
+  });
+  const host = new ToolHost({ registry, artifactStore: store.artifacts, maxResultChars: 120 });
+  const controller = new AbortController();
+  const execution = host.execute({
+    id: "call-shell-cancel-artifact",
+    name: "run_shell",
+    arguments: { command: "long build" },
+  }, { session, signal: controller.signal, requestApproval: async () => true });
+  await started;
+
+  controller.abort(new Error("user-stop"));
+  await assert.rejects(execution, /execution cancelled/);
+
+  const completed = session.state.events.find((event) => (
+    event.type === "tool.completed" && event.callId === "call-shell-cancel-artifact"
+  ));
+  assert.equal(completed.status, "execution_unknown");
+  assert.match(completed.artifact.id, /^artifact-/);
+  const artifact = await store.artifacts.get(completed.artifact.id, { sessionId: session.id });
+  assert.match(artifact.content, /cancel-output/);
+  assert.match(artifact.content, /CANCEL-TAIL/);
+});
+
+test("run_shell 外部执行失败也保留 WorkspaceExecutionError 输出", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-shell-external-error-artifact-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  t.after(async () => {
+    store.close();
+    await fs.rm(workspace, { recursive: true, force: true });
+  });
+  const initial = createSession({ id: "session-shell-external-error-artifact", provider: "test", workspace });
+  store.ensureJournal(initial);
+  const session = new AgentSession({ state: initial, reducer: reduceSession, journal: store });
+  const fullOutput = `${"container-output\n".repeat(200)}CONTAINER-TAIL`;
+  const registry = createToolRegistry({
+    workspace,
+    artifactStore: store.artifacts,
+    workspaceExecution: {
+      id: "artifact-container-failed-execution",
+      execute: async () => {
+        throw new WorkspaceExecutionError("container failed", {
+          code: "container_failed",
+          result: { output: fullOutput },
+        });
+      },
+    },
+  });
+  const host = new ToolHost({ registry, artifactStore: store.artifacts, maxResultChars: 120 });
+
+  const result = await host.execute({
+    id: "call-shell-external-error-artifact",
+    name: "run_shell",
+    arguments: { command: "container task" },
+  }, { session, requestApproval: async () => true });
+
+  assert.equal(result.status, "external_failed");
+  assert.match(result.artifact.id, /^artifact-/);
+  const artifact = await store.artifacts.get(result.artifact.id, { sessionId: session.id });
+  assert.match(artifact.content, /container-output/);
+  assert.match(artifact.content, /CONTAINER-TAIL/);
 });
 
 test("MCP 大输出在进入 Tool Host 前保持完整尾部", async (t) => {

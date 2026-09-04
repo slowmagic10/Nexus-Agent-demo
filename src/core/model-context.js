@@ -62,9 +62,6 @@ export function prepareModelRequest(context, {
   const durableTools = structuredClone(tools || []);
   const full = measureRequest(baseSystemPrompt, projectedMessages, durableTools);
 
-  if (full.fixedTokens > maxInputTokens) {
-    throw new Error(`固定上下文预计 ${full.fixedTokens} tokens，超过 Model Context 预算 ${maxInputTokens}`);
-  }
   if (full.estimatedInputTokens <= maxInputTokens) {
     return buildRequest(baseSystemPrompt, projectedMessages, durableTools, {
       ...full,
@@ -85,9 +82,6 @@ export function prepareModelRequest(context, {
   const compactedSystemPrompt = `${baseSystemPrompt}\n\n${COMPACTION_MARKER}`;
   const turns = projectedTurns.map((turn) => turn.messages);
   const fixed = measureRequest(compactedSystemPrompt, [], durableTools);
-  if (fixed.fixedTokens > maxInputTokens) {
-    throw new Error(`固定上下文预计 ${fixed.fixedTokens} tokens，超过 Model Context 预算 ${maxInputTokens}`);
-  }
   const recentOnly = selectCompactedTurns({
     systemPrompt: compactedSystemPrompt,
     turns,
@@ -96,6 +90,20 @@ export function prepareModelRequest(context, {
     prefixMessages: [],
     strictLatest: true,
   });
+  if (recentOnly.omittedMessages === 0) {
+    const measured = measureRequest(baseSystemPrompt, recentOnly.selectedMessages, durableTools);
+    return buildRequest(baseSystemPrompt, recentOnly.selectedMessages, durableTools, {
+      ...recentOnly,
+      ...measured,
+      maxInputTokens,
+      compacted: false,
+      strategy: CONTEXT_STRATEGY,
+      historyProjection: summarizeHistoricalToolProjection(projectedTurns),
+      activeToolProjection: summarizeActiveToolProjection(projectedTurns),
+      ...memoryPlan,
+      summary: summaryPlan(promptContext.contextSummary),
+    });
+  }
   let selection = recentOnly;
   let semanticMessage = null;
   let summary = summaryPlan(promptContext.contextSummary, {
@@ -177,6 +185,7 @@ function buildRequest(systemPrompt, messages, tools, contextPlan) {
       contextHashVersion: CONTEXT_HASH_VERSION,
       estimatorVersion: TOKEN_ESTIMATOR_VERSION,
       maxInputTokens: contextPlan.maxInputTokens,
+      estimatedOverTarget: contextPlan.estimatedInputTokens > contextPlan.maxInputTokens,
       estimatedInputTokens: contextPlan.estimatedInputTokens,
       fixedTokens: contextPlan.fixedTokens,
       messageTokens: contextPlan.messageTokens,
@@ -202,7 +211,15 @@ function selectCompactedTurns({ systemPrompt, turns, tools, maxInputTokens, pref
   const latest = measureRequest(systemPrompt, latestMessages, tools);
   if (latest.estimatedInputTokens > maxInputTokens) {
     if (!strictLatest) return null;
-    throw new Error(`当前 turn 预计 ${latest.messageTokens} tokens，超过 Model Context 预算 ${maxInputTokens} 可容纳的消息空间`);
+    const firstIncludedTurn = Math.max(0, turns.length - 1);
+    return {
+      selectedMessages: latestTurn,
+      firstIncludedTurn,
+      includedMessages: latestTurn.length,
+      omittedMessages: turns.flat().length - latestTurn.length,
+      includedTurns: latestTurn.length ? 1 : 0,
+      omittedTurns: firstIncludedTurn,
+    };
   }
   let firstIncludedTurn = Math.max(0, turns.length - 1);
   let selectedTurns = latestTurn.length ? [latestTurn] : [];

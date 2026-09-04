@@ -142,7 +142,14 @@ export class LocalWorkspaceAdapter {
           durationMs: Math.round(performance.now() - started),
         };
         if (signal?.aborted) {
-          reject(signal.reason || new WorkspaceExecutionError("本机执行已取消", { code: "cancelled", result }));
+          const reason = signal.reason;
+          const code = reason?.code === "timeout" || reason?.name === "TimeoutError" ? "timeout" : "cancelled";
+          reject(new WorkspaceExecutionError(
+            typeof reason?.message === "string" && reason.message
+              ? reason.message
+              : code === "timeout" ? `本机执行超时（${normalized.timeoutMs}ms）` : "本机执行已取消",
+            { code, result },
+          ));
           return;
         }
         if (timedOut) {
