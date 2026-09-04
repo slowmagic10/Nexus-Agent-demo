@@ -1,11 +1,10 @@
-import { promises as fs } from "node:fs";
-import path from "node:path";
+import { readContainedTextFile } from "./security/contained-text-file.js";
 
 export async function loadWorkspaceContext(workspace) {
   const sections = [];
   for (const name of ["AGENTS.md", "SOUL.md"]) {
     try {
-      const content = await fs.readFile(path.join(workspace, name), "utf8");
+      const content = await readContainedTextFile(workspace, name, { maxBytes: 48_000 });
       sections.push(`## ${name}\n${content.slice(0, 12_000)}`);
     } catch {}
   }

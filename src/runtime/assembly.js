@@ -11,6 +11,7 @@ import { retrieveContextMemories } from "../memory/context-retrieval.js";
 import { reconcileMemoryOutbox } from "../memory/outbox.js";
 import { createLocalMemoryScope } from "../memory/scope.js";
 import { SessionStore } from "../persistence/session-store.js";
+import { ensureManagedProjectWorkspace, ensureWorkspaceStateDirectory } from "../projects/catalog.js";
 import { loadWorkspacePolicy, WorkspacePolicy } from "../tools/authorization.js";
 import { ToolHost } from "../tools/host.js";
 import { createPermissionProfile } from "../tools/permission-profile.js";
@@ -32,6 +33,10 @@ export async function createRuntimeAssembly({
   }
 
   const workspace = path.resolve(config.workspace);
+  if (config.sources?.workspace === "default") {
+    await ensureManagedProjectWorkspace(workspace, { root: config.projects.root });
+  }
+  await ensureWorkspaceStateDirectory(workspace);
   const baseMemoryScope = createLocalMemoryScope(workspace);
   const agentProviders = createConfiguredAgentProviders(config);
   const defaultProviderBinding = agentProviders.get(config.agents.defaultProfile);

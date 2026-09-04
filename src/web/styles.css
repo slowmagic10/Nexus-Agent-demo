@@ -431,6 +431,43 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .permission-option.unavailable { opacity: .66; }
 .permission-option.unavailable:hover { background: color-mix(in srgb, var(--danger) 7%, transparent); }
 .permission-lock { color: var(--danger); font-size: 12px; font-style: normal; white-space: nowrap; }
+.project-dialog {
+  width: min(500px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 0;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow);
+}
+.project-dialog::backdrop { background: rgb(0 0 0 / 58%); backdrop-filter: blur(5px); }
+.project-form { padding: 24px; display: grid; gap: 15px; }
+.project-form header { display: grid; gap: 6px; }
+.project-form h2 { margin: 0; font-size: 20px; letter-spacing: -.02em; }
+.project-form header p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+.project-kicker { color: var(--accent); font-size: 11px; font-weight: 760; letter-spacing: .09em; text-transform: uppercase; }
+.project-field { display: grid; gap: 6px; }
+.project-field > span { color: var(--text-soft); font-size: 12px; font-weight: 650; }
+.project-field select, .project-field input {
+  width: 100%;
+  min-height: 42px;
+  padding: 8px 10px;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  outline: 0;
+}
+.project-field select:focus, .project-field input:focus { border-color: var(--accent); }
+.project-create-toggle { justify-self: start; padding: 0; color: var(--text-soft); background: transparent; border: 0; cursor: pointer; font-size: 12px; font-weight: 650; }
+.project-create-toggle:hover { color: var(--accent); }
+.project-create-fields { display: grid; gap: 6px; }
+.project-create-fields small { color: var(--muted); font-size: 12px; }
+.project-error { min-height: 18px; margin: -4px 0 0; color: var(--danger); font-size: 12px; }
+.project-form footer { display: flex; justify-content: flex-end; gap: 8px; padding-top: 3px; }
+.project-form footer button { min-height: 36px; padding: 7px 12px; background: transparent; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); cursor: pointer; font-size: 12px; font-weight: 650; }
+.project-form footer .primary { color: #151907; background: var(--accent); border-color: var(--accent); }
 .danger-confirm-backdrop { position: fixed; z-index: 40; inset: 0; background: rgb(0 0 0 / 58%); backdrop-filter: blur(5px); }
 .danger-confirm {
   position: fixed;
@@ -937,6 +974,8 @@ html[data-theme="light"] .toast { background: #ffffff; border-color: #d4d9d1; }
   .starters { grid-template-columns: 1fr; }
   .welcome { min-height: 38vh; }
   .shortcut { display: none; }
+  .project-dialog { width: calc(100vw - 20px); max-height: calc(100dvh - 20px); }
+  .project-form { padding: 20px 17px; }
   .user-bubble { max-width: 88%; }
   .inspector { width: 100vw; height: 100dvh; }
   .inspector.review-mode { width: 100vw; }

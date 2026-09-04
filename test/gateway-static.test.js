@@ -16,6 +16,7 @@ test("Gateway 静态资源白名单包含 Web 子模块且拒绝任意路径", (
   assert.equal(isGatewayStaticAsset("/review-workspace.js"), true);
   assert.equal(isGatewayStaticAsset("/task-thread.js"), true);
   assert.equal(isGatewayStaticAsset("/composer.js"), true);
+  assert.equal(isGatewayStaticAsset("/project-picker.js"), true);
   assert.equal(isGatewayStaticAsset("/keyboard.js"), false);
   assert.equal(isGatewayStaticAsset("/app.js"), true);
   assert.equal(isGatewayStaticAsset("/../package.json"), false);

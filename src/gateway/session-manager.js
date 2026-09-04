@@ -187,8 +187,11 @@ export class GatewaySessionManager {
     return session.state;
   }
 
-  list() {
-    return this.store.list(this.workspace);
+  list(limit = 20) {
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
+      throw new GatewayError(400, "Session 列表 limit 必须是 1 到 1000 的整数");
+    }
+    return this.store.list(this.workspace, limit);
   }
 
   runtimeInfo() {

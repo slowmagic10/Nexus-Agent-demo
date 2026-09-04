@@ -1,4 +1,5 @@
 import { createComposer } from "/composer.js";
+import { createProjectPicker } from "/project-picker.js";
 import { grantViewModel } from "/grants.js";
 import { objectivePlanViewModel } from "/plan-view.js";
 import { profileDriftViewModel, providerThinkingLabel } from "/profile-view.js";
@@ -18,7 +19,11 @@ const state = {
   editingTitle: false,
   journalEvents: [],
   journalDirty: true,
+  sessionProjects: new Map(),
+  lastProjectId: null,
 };
+let runtimeLoadVersion = 0;
+let sessionSelectionVersion = 0;
 
 const elements = {
   sessionList: $("#session-list"),
@@ -61,6 +66,7 @@ const elements = {
   dangerConfirmBackdrop: $("#danger-confirm-backdrop"),
   dangerConfirmAccept: $("#danger-confirm-accept"),
   agentProfileSelect: $("#agent-profile-select"),
+  inspectorTitle: $("#inspector-title"),
 };
 
 const taskNavigation = createTaskNavigation({
@@ -120,6 +126,20 @@ const composer = createComposer({
   }),
   isOverlayOpen,
 });
+const projectPicker = createProjectPicker({
+  dialog: $("#project-dialog"),
+  form: $("#project-form"),
+  projectSelect: $("#project-select"),
+  createToggle: $("#project-create-toggle"),
+  createFields: $("#project-create-fields"),
+  nameInput: $("#project-name"),
+  cancelButton: $("#project-cancel"),
+  submitButton: $("#project-submit"),
+  errorNode: $("#project-error"),
+  loadProjects: () => api("/projects"),
+  createProject: ({ name }) => api("/projects", { method: "POST", body: { name } }),
+  createSession: ({ projectId }) => createProjectSession(projectId),
+});
 const reviewWorkspace = createReviewWorkspace({
   root: $("#review-workspace"),
   loadArtifact: async ({ sessionId, artifactId }) => {
@@ -167,7 +187,8 @@ const taskThread = createTaskThread({
   useStarter: async ({ sessionId, prompt }) => {
     if (sessionId === null) {
       if (sessionProjection.sessionId) return;
-      await createSession();
+      const session = await createSession();
+      if (!session) return;
     } else if (sessionProjection.sessionId !== sessionId) {
       return;
     }
@@ -176,6 +197,7 @@ const taskThread = createTaskThread({
 });
 window.addEventListener("beforeunload", () => {
   composer.destroy();
+  projectPicker.destroy();
   taskThread.destroy();
   sessionProjection.close();
   reviewWorkspace.destroy();
@@ -184,7 +206,9 @@ window.addEventListener("beforeunload", () => {
 }, { once: true });
 
 applyTheme(savedTheme());
-$("#new-session").addEventListener("click", createSession);
+$("#new-session").addEventListener("click", () => {
+  void createSession().catch((error) => toast(error.message || "无法创建任务"));
+});
 let evaluationTimer = null;
 elements.export.addEventListener("click", exportSession);
 elements.themeToggle.addEventListener("click", toggleTheme);
@@ -248,16 +272,35 @@ async function checkHealth() {
   }
 }
 
-async function loadRuntime() {
-  state.runtime = await api("/runtime");
-  state.selectedPermissionProfile = state.runtime.permission.defaultProfile;
-  state.selectedAgentProfileId = state.runtime.agentProfiles?.defaultProfile || state.runtime.agentProfile?.id || "default";
+async function loadRuntime(projectId = null, { preserveSelection = false, selectionTicket = null } = {}) {
+  const requestVersion = ++runtimeLoadVersion;
+  const previousAgentProfileId = state.selectedAgentProfileId;
+  const previousPermissionProfile = state.selectedPermissionProfile;
+  const runtime = await api(projectId
+    ? `/projects/${encodeURIComponent(projectId)}/runtime`
+    : "/runtime");
+  if (requestVersion !== runtimeLoadVersion
+    || (selectionTicket !== null && selectionTicket !== sessionSelectionVersion)) return null;
+  state.runtime = runtime;
+  const profiles = runtime.agentProfiles?.profiles || [];
+  state.selectedAgentProfileId = preserveSelection && profiles.some((profile) => profile.id === previousAgentProfileId)
+    ? previousAgentProfileId
+    : runtime.agentProfiles?.defaultProfile || runtime.agentProfile?.id || "default";
+  const modes = runtime.permission?.modes || [];
+  state.selectedPermissionProfile = preserveSelection && modes.some((mode) => mode.id === previousPermissionProfile && mode.available)
+    ? previousPermissionProfile
+    : profiles.find((profile) => profile.id === state.selectedAgentProfileId)?.permissionProfile
+      || runtime.permission.defaultProfile;
   renderAgentProfileControl();
   renderPermissionControl();
+  return runtime;
 }
 
 async function loadSessions() {
   const { sessions } = await api("/sessions");
+  state.sessionProjects = new Map(sessions
+    .filter((session) => session.project?.id)
+    .map((session) => [session.id, session.project.id]));
   elements.sessionCount.textContent = sessions.length;
   elements.sessionList.replaceChildren(...sessions.map(sessionButton));
 }
@@ -277,17 +320,26 @@ function sessionButton(session) {
 
   const detail = document.createElement("span");
   detail.className = "session-detail";
-  detail.textContent = `${phaseLabel(session.phase)} · ${relativeTime(session.updatedAt)}`;
+  detail.textContent = `${session.project?.name || "本地项目"} · ${phaseLabel(session.phase)} · ${relativeTime(session.updatedAt)}`;
   button.append(row, detail);
-  button.addEventListener("click", () => selectSession(session.id));
+  button.addEventListener("click", () => {
+    void selectSession(session.id).catch((error) => toast(error.message || "无法打开任务"));
+  });
   return button;
 }
 
 async function createSession() {
   taskNavigation.close();
+  return projectPicker.open({ preferredProjectId: state.lastProjectId });
+}
+
+async function createProjectSession(projectId) {
+  const runtime = await loadRuntime(projectId, { preserveSelection: true });
+  if (!runtime) return null;
   const { session } = await api("/sessions", {
     method: "POST",
     body: {
+      projectId,
       agentProfileId: state.selectedAgentProfileId,
       permissionProfile: state.selectedPermissionProfile,
       ...(state.selectedPermissionProfile === "danger-full-access" ? { permissionConfirmation: "danger-full-access" } : {}),
@@ -300,17 +352,39 @@ async function createSession() {
 }
 
 async function selectSession(id) {
+  const selectionTicket = ++sessionSelectionVersion;
+  const previousSessionId = sessionProjection.sessionId;
+  // Invalidate an older baseline request immediately. Without this, a slow
+  // Project runtime lookup for A can start select(A) after a later click on B.
+  sessionProjection.close();
   taskNavigation.close();
   closeTitleEditor();
-  const selected = await sessionProjection.select(id);
-  if (!selected) return;
-  await Promise.allSettled([
-    loadSessions(),
-    loadGrants(),
-    loadMemories(),
-    loadCandidates(),
-    ...(state.inspectorTab === "overview" && inspectorShell.isOpen() ? [loadEvaluation()] : []),
-  ]);
+  const projectId = state.sessionProjects.get(id);
+  try {
+    if (projectId && state.runtime?.project?.id !== projectId) {
+      const runtime = await loadRuntime(projectId, { selectionTicket });
+      if (!runtime || selectionTicket !== sessionSelectionVersion) return null;
+    }
+    if (selectionTicket !== sessionSelectionVersion) return null;
+    const selected = await sessionProjection.select(id);
+    if (!selected || selectionTicket !== sessionSelectionVersion) return null;
+    await Promise.allSettled([
+      loadSessions(),
+      loadGrants(),
+      loadMemories(),
+      loadCandidates(),
+      ...(state.inspectorTab === "overview" && inspectorShell.isOpen() ? [loadEvaluation()] : []),
+    ]);
+    return selected;
+  } catch (error) {
+    if (selectionTicket !== sessionSelectionVersion) return null;
+    if (selectionTicket === sessionSelectionVersion
+      && previousSessionId
+      && sessionProjection.sessionId === previousSessionId) {
+      void sessionProjection.refresh().catch(() => {});
+    }
+    throw error;
+  }
 }
 
 async function handleSessionEvent(event) {
@@ -325,11 +399,13 @@ async function handleSessionEvent(event) {
 }
 
 function renderSession(session) {
+  state.lastProjectId = session.project?.id || state.lastProjectId;
   state.selectedPermissionProfile = session.permissionProfile || state.runtime?.permission.defaultProfile || "workspace-auto";
   const title = session.displayTitle || "新任务";
   elements.title.textContent = title;
   document.title = `${title} · Nexus`;
   elements.phaseDot.className = `phase-dot ${phaseClass(session.phase)}`;
+  elements.inspectorTitle.textContent = session.project?.name || "本地工作区";
   renderStatus(session);
 
   const busy = ["thinking", "executing", "awaiting_approval"].includes(session.phase);
@@ -369,6 +445,7 @@ function renderSession(session) {
 function renderStatus(session) {
   const parts = [
     [phaseLabel(session.phase), `status-chip phase ${phaseClass(session.phase)}`],
+    [session.project?.name || "本地项目", "status-chip"],
     [agentProfileLabel(session.agentProfile?.id), "status-chip"],
     [session.provider || "本地模型", "status-chip"],
     [permissionLabel(session.permissionProfile), "status-chip"],
@@ -1164,6 +1241,7 @@ function renderEvents(events) {
 
 function isOverlayOpen() {
   return !elements.dangerConfirm.classList.contains("hidden")
+    || projectPicker.isOpen()
     || state.editingTitle
     || inspectorShell.isModalOpen()
     || !elements.permissionMenu.classList.contains("hidden")

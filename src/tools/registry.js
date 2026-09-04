@@ -9,6 +9,7 @@ import { assertArtifactStore } from "../artifacts/interface.js";
 import { executeMemoryMutation } from "../memory/outbox.js";
 import { applyWorkspacePatch } from "./apply-patch.js";
 import { createPermissionProfile } from "./permission-profile.js";
+import { readContainedTextFile, resolveContainedDirectory } from "../security/contained-text-file.js";
 
 const NATIVE_TOOL_OWNER = "nexus:native-tools";
 const SAFE_READ_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
@@ -46,7 +47,10 @@ export function createToolRegistry({
   const configuredMemory = memory || memoryStore?.memory || memoryStore || null;
   const memoryAdapter = configuredMemory ? assertMemoryInterface(configuredMemory) : null;
   const artifactAdapter = artifactStore ? assertArtifactStore(artifactStore) : null;
-  const skillRoots = [path.join(root, ".nexus", "skills"), bundledSkills];
+  const skillRoots = [
+    { boundary: root, relative: path.join(".nexus", "skills") },
+    ...(bundledSkills ? [{ boundary: path.resolve(bundledSkills), relative: "." }] : []),
+  ];
   assertCapabilityRuntime(capabilityRuntime);
   const define = (tool, owner = NATIVE_TOOL_OWNER) => {
     const { capabilityOwner: _capabilityOwner, ...definition } = tool;
@@ -501,7 +505,7 @@ export function createToolRegistry({
     execute: async ({ name }, context) => {
       const skill = (await discoverSkills(skillRoots)).find((item) => item.name === name);
       if (!skill) throw new Error(`未找到 Skill：${name}`);
-      const content = await fs.readFile(skill.file, "utf8");
+      const content = await readContainedTextFile(skill.boundary, skill.relativeFile, { maxBytes: 256_000 });
       await context.dispatch({ type: "SKILL_LOADED", skill: { name, content } });
       return `已加载 Skill：${name}\n${truncate(content, 6000)}`;
     },
@@ -610,15 +614,16 @@ async function walk(root, limit, workspace, accessPolicy) {
 
 async function discoverSkills(roots) {
   const found = [];
-  for (const root of roots) {
+  for (const source of roots) {
     try {
-      for (const entry of await fs.readdir(root, { withFileTypes: true })) {
-        if (!entry.isDirectory()) continue;
-        const file = path.join(root, entry.name, "SKILL.md");
+      const directory = await resolveContainedDirectory(source.boundary, source.relative);
+      for (const entry of await fs.readdir(directory, { withFileTypes: true })) {
+        if (!entry.isDirectory() || entry.isSymbolicLink()) continue;
+        const relativeFile = path.join(source.relative, entry.name, "SKILL.md");
         try {
-          const first = await fs.readFile(file, "utf8");
+          const first = await readContainedTextFile(source.boundary, relativeFile, { maxBytes: 64_000 });
           const description = first.match(/description:\s*(.+)/)?.[1] || first.split("\n").find((line) => line && !line.startsWith("#")) || "无描述";
-          found.push({ name: entry.name, description, file });
+          found.push({ name: entry.name, description, boundary: source.boundary, relativeFile });
         } catch {}
       }
     } catch {}

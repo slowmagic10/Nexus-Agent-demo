@@ -200,6 +200,14 @@ _Avoid_: Global reusable approval, replayable call-bound grant, grant without po
 由用户在实时 Approval 中显式签发、存放于用户私有 SQLite Store 的跨 Session 授权。它绑定规范 workspace 身份、tool、capabilityHash、policyVersion 与精确资源，最长 30 天；工作区文件不能创建或提升 Project Grant。移动/复制 workspace 不复用，策略或 Capability 变化后不命中，并提供列出、撤销和审计。Web Grant Manager 只投影未消费、未撤销且未过期的授权，显示脱敏资源与到期时间；撤销时由 Gateway 核对真实 scope，运行中 fail closed。
 _Avoid_: Project grants stored in the repository, raw secret-bearing shell commands, path-agnostic global grants
 
+**Project Workspace**:
+一个规范化真实目录，是 Session、Workspace Context、文件工具、执行沙箱、Memory scope、Artifact 与 Project Grant 的共同边界。CLI/Gateway 未显式指定时使用 `~/Nexus Projects/Default`；Web 新任务先选择 Project Workspace，或在受管 Projects Root 下创建一个新的直接子目录。Session 一经创建，其 workspace 永远不变；切换项目意味着创建或打开另一个 Session，不在活动 Turn 中重绑定目录。进入模型上下文的 `AGENTS.md`、`SOUL.md` 和 workspace Skill 只通过有界 no-follow 普通文件读取，canonical target 必须仍在该 Workspace 内。
+_Avoid_: Source repository as an implicit default workspace, changing workspace inside a session, nested or symlink-managed project roots, context files following host symlinks
+
+**Project Catalog / Gateway Project Coordinator**:
+Project Catalog 只枚举受管 Projects Root 的真实直接子目录及显式注册的 legacy workspace，并以 canonical workspace 的 `projectIdentity` 作为稳定 ID。列举项目和未加载 Session 只读取各项目 Store，不激活 Execution、Tool Registry 或 MCP；创建/恢复任务时 Coordinator 才为所属项目懒加载一套独立 Runtime Assembly 与 GatewaySessionManager。HTTP Session ID 仍是全局路由键，因此跨项目重复 ID 必须 fail closed；有界列表不能证明唯一 owner，resume/latest 与首次 ID 路由必须精确扫描。关闭时先等待每个 Manager 取消并收束活动 Run，再关闭 Assembly/Store，同时等待并回收尚在创建中的 Runtime。受信 MCP 相对路径在 Gateway 启动时固定到初始 workspace，不能随项目重新解析。受管 workspace 的 `.gitignore`、`.nexus` 和 SQLite sidecar 必须拒绝符号链接，避免本地状态写出项目边界。Web Picker 和 Session 切换以操作代次丢弃迟到响应。
+_Avoid_: One mutable runtime switching cwd, project listing spawning MCP, session IDs silently shadowing across projects, following internal state symlinks, stale project responses taking over a newer selection
+
 **Tool Execution Unknown**:
 有副作用且非 safe 的工具在显式 deadline 到达、用户取消或进程中断后，即使进程树已完成清理，也可能无法证明此前副作用是否生效。它写入 durable audit，补全工具协议，并禁止自动重放。
 只有 Adapter Implementation 已经启动且结果不可证明时才进入 unknown；启动前取消属于确定未执行，补全 cancelled result。
@@ -214,11 +222,11 @@ WorkspaceExecution 在运行期间发布有序的 stdout/stderr observation，To
 _Avoid_: Browser-only terminal output, raw chunk per journal event, persisting incomplete credential-bearing lines, replacing final Tool Result with a live preview
 
 **Config Composition**:
-把内置默认值、workspace profile、本机私有配置、环境变量和 CLI 覆盖合成为唯一 RuntimeConfig 的 deep Module。每个 leaf 字段保留最终来源；CLI/Gateway 只消费规范化结果，inspection 永不返回原始 Secret。workspace 内 JSON 配置不能启用 MCP、切换 WorkspaceExecution 或选择 Permission Profile，只有受信任环境或显式 CLI 可以。显式 `--demo` 是最高优先级的强制离线选择：所有 Named Agent Profile 保留行为配置但删除 Provider override，Thinking 归一为 `provider-default`；同层 `--provider`/`--provider-thinking` 冲突必须拒绝。
+把内置默认值、workspace profile、Nexus 应用级私有配置、环境变量和 CLI 覆盖合成为唯一 RuntimeConfig 的 deep Module。每个 leaf 字段保留最终来源；CLI/Gateway 只消费规范化结果，inspection 永不返回原始 Secret。Project Workspace 只提供共享 `nexus.config.json`；其 `.nexus/config.local.json` 不参与合成。共享 JSON 不能启用 MCP、切换 WorkspaceExecution、选择 Permission Profile，也不能选择 credential-bearing `provider.type/baseUrl`；这些边界只接受固定应用目录的私有配置、受信任环境或显式 CLI。显式 `--demo` 是最高优先级的强制离线选择：所有 Named Agent Profile 保留行为配置但删除 Provider override，Thinking 归一为 `provider-default`；同层 `--provider`/`--provider-thinking` 冲突必须拒绝。
 _Avoid_: Entrypoint-specific parsing, hidden precedence, printing raw secrets, process launch from workspace config
 
 **Runtime Assembly**:
-从规范化 RuntimeConfig 构造并拥有 Store、Provider bindings、Capability Runtime、WorkspaceExecution、Permission Profiles、Tool Registry、MCP、Tool Hosts 与 Project Grant Store 的 deep Module。基础阶段只打开 Session Store，使 CLI 的列表、Import 和离线流程不会隐式启动 Execution 或 MCP；显式 activate 后才创建可执行对象图。CLI 与 Gateway 是入口 Adapter，不重复知道对象创建顺序；所有 owner-scoped capability、MCP、私有 Grant Store 和 Session Store 由同一个幂等 close 生命周期逆序收敛。MCP 子进程只继承精确枚举的非秘密运行与标准 locale 环境，以及其本机配置显式环境；不允许通过环境变量名前缀扩大继承范围。close 时等待真实 exit、超时强制终止。Gateway 的每个 AgentRuntime 也由该 Module 的 factory 创建，但 Session 路由、HTTP/SSE 和终端交互仍属于入口 Adapter。
+从规范化 RuntimeConfig 构造并拥有 Store、Provider bindings、Capability Runtime、WorkspaceExecution、Permission Profiles、Tool Registry、MCP、Tool Hosts 与 Project Grant Store 的 deep Module。基础阶段只打开 Session Store，使 CLI 的列表、Import 和离线流程不会隐式启动 Execution 或 MCP；显式 activate 后才创建可执行对象图。打开 Store 前必须确认 `.nexus`、`nexus.db` 及 SQLite sidecar 没有通过符号链接越出 workspace。CLI 与 Gateway 是入口 Adapter，不重复知道对象创建顺序；所有 owner-scoped capability、MCP、私有 Grant Store 和 Session Store 由同一个幂等 close 生命周期逆序收敛。MCP 子进程只继承精确枚举的非秘密运行与标准 locale 环境，以及其本机配置显式环境；不允许通过环境变量名前缀扩大继承范围。close 时等待真实 exit、超时强制终止。Gateway 的每个 Project Workspace 拥有独立 Assembly，每个 AgentRuntime 仍由所属 Assembly 的 factory 创建；项目/Session 路由、HTTP/SSE 和终端交互属于入口 Adapter。
 _Avoid_: Entrypoint-owned object graphs, MCP during session listing, duplicated shutdown order, Runtime Assembly absorbing CLI commands or Gateway routing
 
 **Provider Output Stream**:

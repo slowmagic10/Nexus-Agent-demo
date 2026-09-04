@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);
@@ -15,7 +15,7 @@ export function createGatewayServer({ manager, host = "127.0.0.1", port = 4317, 
 
   const server = http.createServer(async (request, response) => {
     try {
-      await route(request, response, manager, staticRoot);
+      await routeGatewayRequest(request, response, manager, staticRoot);
     } catch (error) {
       if (response.headersSent) {
         response.end();
@@ -46,7 +46,7 @@ export function createGatewayServer({ manager, host = "127.0.0.1", port = 4317, 
   };
 }
 
-async function route(request, response, manager, staticRoot) {
+export async function routeGatewayRequest(request, response, manager, staticRoot) {
   const url = new URL(request.url, "http://localhost");
   const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
   validateBrowserOrigin(request);
@@ -65,38 +65,65 @@ async function route(request, response, manager, staticRoot) {
   }
 
   if (request.method === "GET" && url.pathname === "/runtime") {
-    sendJson(response, 200, manager.runtimeInfo());
+    sendJson(response, 200, await manager.runtimeInfo(url.searchParams.get("projectId") || null));
+    return;
+  }
+
+  if (request.method === "GET" && url.pathname === "/projects") {
+    sendJson(response, 200, await manager.listProjects());
+    return;
+  }
+
+  if (request.method === "POST" && url.pathname === "/projects") {
+    const body = await readJson(request);
+    sendJson(response, 201, { project: await manager.createProject({ name: body.name }) });
+    return;
+  }
+
+  if (request.method === "GET" && parts[0] === "projects" && parts[1] && parts[2] === "runtime" && parts.length === 3) {
+    sendJson(response, 200, await manager.runtimeInfo(parts[1]));
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/sessions") {
-    sendJson(response, 200, { sessions: manager.list() });
+    sendJson(response, 200, { sessions: await manager.list(url.searchParams.get("projectId") || null) });
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/memories") {
-    sendJson(response, 200, { memories: await manager.listMemories(url.searchParams.get("query") || "") });
+    sendJson(response, 200, { memories: await manager.listMemories(
+      url.searchParams.get("query") || "",
+      url.searchParams.get("projectId") || null,
+    ) });
     return;
   }
 
   if (request.method === "GET" && url.pathname === "/memory-candidates") {
-    sendJson(response, 200, { candidates: await manager.listMemoryCandidates() });
+    sendJson(response, 200, { candidates: await manager.listMemoryCandidates(url.searchParams.get("projectId") || null) });
     return;
   }
 
   if (request.method === "POST" && url.pathname === "/memories") {
     const body = await readJson(request);
-    sendJson(response, 201, { memory: await manager.addMemory(body.content, body.tags || []) });
+    sendJson(response, 201, { memory: await manager.addMemory(
+      body.content,
+      body.tags || [],
+      body.projectId || null,
+    ) });
     return;
   }
 
   if (request.method === "GET" && parts[0] === "memories" && parts[1] && parts.length === 2) {
-    sendJson(response, 200, { memory: await manager.verifyMemory(parts[1]) });
+    sendJson(response, 200, { memory: await manager.verifyMemory(parts[1], url.searchParams.get("projectId") || null) });
     return;
   }
 
   if (request.method === "DELETE" && parts[0] === "memories" && parts[1] && parts.length === 2) {
-    await manager.deleteMemory(parts[1], url.searchParams.get("reason") || "用户通过 Gateway 请求删除");
+    await manager.deleteMemory(
+      parts[1],
+      url.searchParams.get("reason") || "用户通过 Gateway 请求删除",
+      url.searchParams.get("projectId") || null,
+    );
     sendJson(response, 200, { deleted: true });
     return;
   }
@@ -105,6 +132,7 @@ async function route(request, response, manager, staticRoot) {
     const body = await readJson(request);
     const state = await manager.create({
       resume: body.resume,
+      projectId: body.projectId,
       agentProfileId: body.agentProfileId,
       permissionProfile: body.permissionProfile,
       permissionConfirmation: body.permissionConfirmation,
@@ -116,7 +144,7 @@ async function route(request, response, manager, staticRoot) {
   if (request.method === "POST" && url.pathname === "/sessions/imports") {
     const body = await readJson(request, { maxBytes: 10_000_000 });
     if (!body.archive) throw new GatewayError(400, "archive 必须是 portable journal 对象");
-    const state = await manager.importSession(body.archive, { id: body.id });
+    const state = await manager.importSession(body.archive, { id: body.id, projectId: body.projectId });
     sendJson(response, 201, { session: state });
     return;
   }

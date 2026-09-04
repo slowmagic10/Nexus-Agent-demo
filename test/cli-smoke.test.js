@@ -42,6 +42,7 @@ test("普通 CLI 可使用显式 Agent Profile 启动并退出", async (t) => {
   const result = await runCli([
     "--demo",
     `--workspace=${workspace}`,
+    `--local-config=${path.join(workspace, ".nexus", "config.local.json")}`,
     "--agent-profile=review",
   ], workspace, "/quit\n");
 

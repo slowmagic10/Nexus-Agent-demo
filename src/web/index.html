@@ -128,6 +128,32 @@
       </main>
 
     <div id="task-nav-backdrop" class="task-nav-backdrop hidden"></div>
+    <dialog id="project-dialog" class="project-dialog" aria-labelledby="project-dialog-title">
+      <form id="project-form" class="project-form">
+        <header>
+          <span class="project-kicker">新建任务</span>
+          <h2 id="project-dialog-title">选择项目工作区</h2>
+          <p>每个项目使用独立目录、会话记录、文件和长期记忆。任务创建后不会切换工作区。</p>
+        </header>
+        <label class="project-field" for="project-select">
+          <span>项目</span>
+          <select id="project-select" aria-describedby="project-location-note"></select>
+        </label>
+        <button id="project-create-toggle" class="project-create-toggle" type="button">新建项目</button>
+        <div id="project-create-fields" class="project-create-fields hidden">
+          <label class="project-field" for="project-name">
+            <span>新项目名称</span>
+            <input id="project-name" maxlength="80" autocomplete="off" placeholder="例如：数据分析实验">
+          </label>
+          <small id="project-location-note">将在 Nexus Projects 目录中创建同名文件夹。</small>
+        </div>
+        <p id="project-error" class="project-error" role="alert"></p>
+        <footer>
+          <button id="project-cancel" type="button">取消</button>
+          <button id="project-submit" class="primary" type="submit">创建任务</button>
+        </footer>
+      </form>
+    </dialog>
     <div id="danger-confirm-backdrop" class="danger-confirm-backdrop hidden"></div>
     <section id="danger-confirm" class="danger-confirm hidden" role="dialog" aria-modal="true" aria-labelledby="danger-confirm-title">
       <div class="danger-confirm-icon">!</div>

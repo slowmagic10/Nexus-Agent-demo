@@ -27,7 +27,11 @@ OPENAI_BASE_URL=https://你的服务/v1 \
 npm start
 ```
 
-通过 `--workspace=/绝对路径` 可切换工作区；默认使用本仓库根目录。
+CLI 与 Web Gateway 默认使用 `~/Nexus Projects/Default`，不再把 Nexus 源码仓库当作 Agent 的工作区。Web 点击“新建任务”会先选择项目，也可以直接输入名称创建一个独立目录；每个项目拥有自己的文件、Session Journal、Artifact 和 Memory scope，任务创建后不能在中途切换工作区。源码仓库原有会话仍可从“`Nexus Agent（旧工作区）`”项目打开，不做隐式搬迁。
+
+可用 `NEXUS_PROJECTS_ROOT=/绝对路径` 或 `--projects-root=/绝对路径` 修改受管项目根目录；`--workspace=/绝对路径` 继续用于 CLI 显式工作区或把一个已有目录设为 Gateway 默认项目。受管新项目只允许创建为 Projects Root 的直接子目录，项目列表本身不会启动 MCP 或执行环境，真正创建/恢复任务时才懒加载该项目 Runtime。
+
+项目中的 `AGENTS.md`、`SOUL.md` 和 `.nexus/skills/*/SKILL.md` 会影响模型行为，因此只读取 Workspace 边界内的普通文件；指向宿主其他位置的符号链接会被忽略。快速连续选择项目或任务时，旧请求的迟到结果也不会覆盖最后一次选择。
 
 ## 本地模型 API 配置
 
@@ -56,7 +60,7 @@ OPENAI_BASE_URL=https://api.openai.com/v1
 OPENAI_MODEL=你的OpenAI模型ID
 ```
 
-也可以在本机 `.nexus/config.local.json` 的全局 `provider` 或具名 Agent Profile 中设置 `"type": "openai-responses"`。原生 Adapter 使用 Responses 的 `instructions/input/function_call/function_call_output` 结构，主 turn 支持流式正文、工具调用和用量统计；工具往返需要的加密 reasoning item 会进入 durable Session，但不会作为可见思维文本展示。Context Summary 与 Memory Flush 继续调用同一个 Adapter 的非流式入口。
+也可以在 Nexus 应用目录的 `.nexus/config.local.json` 中，通过全局 `provider` 或具名 Agent Profile 设置 `"type": "openai-responses"`。该可信配置固定在应用目录，不会随所选 Project Workspace 改变；项目内部的同名文件不参与配置合成。原生 Adapter 使用 Responses 的 `instructions/input/function_call/function_call_output` 结构，主 turn 支持流式正文、工具调用和用量统计；工具往返需要的加密 reasoning item 会进入 durable Session，但不会作为可见思维文本展示。Context Summary 与 Memory Flush 继续调用同一个 Adapter 的非流式入口。
 
 启动本地模型 CLI：
 
@@ -78,9 +82,9 @@ npm run gateway:local
 
 `run_shell` 是前台工具调用：省略 `timeout_ms` 时会持续等待命令退出，并通过现有 durable output stream 展示进度；例如 `{ "command": "npm test", "timeout_ms": 1800000 }` 可设置 30 分钟上限。无自动 deadline 不等于后台任务，用户仍可随时点击停止或按 `Esc`，取消会终止整个执行进程树并留下可恢复的终态记录。
 
-配置按以下顺序覆盖：内置默认值、工作区 `nexus.config.json`、本机 `.nexus/config.local.json`、环境变量/`.env.local`、命令行参数。共享的 `nexus.config.json` 不允许保存 API Key；私有 JSON 和 `.env.local` 均由 Git 忽略。为防止不可信 workspace 在启动时拉起任意子进程或降低权限边界，两个 workspace JSON 配置层都不能启用 MCP、选择执行环境或全局 Permission Profile；这些能力只能由受信任环境变量或显式 CLI 参数启用。本机具名 Agent Profile 可以选择预先支持的安全权限档位，但不能配置 `danger-full-access`。
+配置按以下顺序覆盖：内置默认值、Project Workspace 的 `nexus.config.json`、Nexus 应用目录的 `.nexus/config.local.json`、环境变量/`.env.local`、命令行参数。共享的 `nexus.config.json` 不允许保存 API Key，也不能选择 `provider.type/baseUrl`，避免项目内容把本机密钥重定向到其他 Endpoint；项目内部的 `.nexus/config.local.json` 默认不会被读取。Provider Endpoint 只能来自应用级私有配置、受信任环境变量或 CLI。私有 JSON 和 `.env.local` 均由 Git 忽略。确需使用另一份本机配置时，可显式传 `--local-config=/绝对路径` 或设置 `NEXUS_LOCAL_CONFIG`；这代表用户信任该文件。为防止不可信 workspace 在启动时拉起任意子进程或降低权限边界，Workspace 配置不能启用 MCP、选择执行环境或全局 Permission Profile；这些能力只能由受信任环境变量或显式 CLI 参数启用。应用级具名 Agent Profile 可以选择预先支持的安全权限档位，但不能配置 `danger-full-access`。
 
-本机 `.nexus/config.local.json` 还可以定义具名 Agent Profile。它们复用当前 Provider，但可分别设置附加指令、默认权限和预算；非默认 Profile 使用自己的 Memory `agentId`，不会与其他 Agent 的长期记忆混用：
+Nexus 应用目录的 `.nexus/config.local.json` 还可以定义具名 Agent Profile。它们复用当前 Provider，但可分别设置附加指令、默认权限和预算；非默认 Profile 使用自己的 Memory `agentId`，不会与其他 Agent 的长期记忆混用：
 
 ```json
 {
@@ -260,6 +264,9 @@ Gateway 只允许绑定本机回环地址，并拒绝非本机网页来源。Web
 ```text
 GET    /health
 GET    /runtime
+GET    /projects
+POST   /projects
+GET    /projects/:id/runtime
 GET    /sessions
 POST   /sessions
 POST   /sessions/imports
@@ -286,10 +293,11 @@ POST   /sessions/:id/memories/:memoryId/pin
 示例：
 
 ```bash
-# 创建会话
+# 查看项目并在指定项目中创建会话
+curl http://127.0.0.1:4317/projects
 curl -X POST http://127.0.0.1:4317/sessions \
   -H 'content-type: application/json' \
-  -d '{"permissionProfile":"workspace-auto"}'
+  -d '{"projectId":"PROJECT_ID","permissionProfile":"workspace-auto"}'
 
 # 完全访问只适用于以 --execution=local 启动的 Gateway，并要求显式确认字段
 curl -X POST http://127.0.0.1:4317/sessions/SESSION_ID/permission-profile \

@@ -116,7 +116,7 @@ if (evaluationArchiveFile || comparisonArchiveFile) {
   }
 }
 const localEnvironment = loadLocalEnvironment(root);
-const config = await composeRuntimeConfig({ args, env: process.env, root, localEnvironment });
+const config = await composeRuntimeConfig({ args, env: process.env, root, localEnvironment, useProjectsDefault: true });
 if (config.printConfig) {
   console.log(JSON.stringify(inspectRuntimeConfig(config), null, 2));
   process.exit(0);

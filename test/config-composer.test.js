@@ -26,6 +26,22 @@ test("Config Composition 默认生成可运行的 Demo 配置", async () => {
   assert.equal(createConfiguredProvider(config).name, "offline-demo");
 });
 
+test("CLI/Gateway 可启用独立 Projects Root 作为默认 Workspace", async () => {
+  const config = await composeRuntimeConfig({
+    root: "/tmp/nexus-source",
+    env: { NEXUS_PROJECTS_ROOT: "/tmp/nexus-user-projects" },
+    useProjectsDefault: true,
+  });
+
+  assert.equal(config.workspace, "/tmp/nexus-user-projects/Default");
+  assert.deepEqual(config.projects, {
+    root: "/tmp/nexus-user-projects",
+    defaultWorkspace: "/tmp/nexus-user-projects/Default",
+  });
+  assert.equal(config.sources.projectsRoot, "environment");
+  assert.equal(config.sources.workspace, "default");
+});
+
 test("--demo 清除 Thinking 并强制所有具名 Profile 保持离线", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-demo-"));
   t.after(() => fs.rm(workspace, { recursive: true, force: true }));
@@ -72,16 +88,20 @@ test("配置按 profile、local、environment、CLI 的确定顺序覆盖", asyn
   await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
   await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
     provider: {
-      type: "openai-compatible",
       model: "profile-model",
-      baseUrl: "https://profile.example/v1",
       thinking: "enabled",
     },
     runtime: { maxSteps: 10 },
     gateway: { port: 4100 },
   }), "utf8");
   await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
-    provider: { apiKey: "local-secret", model: "local-model", thinking: "disabled" },
+    provider: {
+      type: "openai-compatible",
+      apiKey: "local-secret",
+      baseUrl: "https://local.example/v1",
+      model: "local-model",
+      thinking: "disabled",
+    },
     runtime: { maxSteps: 20 },
   }), "utf8");
   const env = {
@@ -100,7 +120,7 @@ test("配置按 profile、local、environment、CLI 的确定顺序覆盖", asyn
   ];
 
   const config = await composeRuntimeConfig({
-    root: "/ignored",
+    root: workspace,
     args,
     env,
     localEnvironment: { file: "/private/.env.local", appliedKeys: ["NEXUS_GATEWAY_PORT"] },
@@ -109,16 +129,66 @@ test("配置按 profile、local、environment、CLI 的确定顺序覆盖", asyn
   assert.equal(config.provider.type, "openai-compatible");
   assert.equal(config.provider.apiKey, "local-secret");
   assert.equal(config.provider.model, "cli-model");
-  assert.equal(config.provider.baseUrl, "https://profile.example/v1");
+  assert.equal(config.provider.baseUrl, "https://local.example/v1");
   assert.equal(config.provider.thinking, "disabled");
   assert.equal(config.runtime.maxSteps, Infinity);
   assert.equal(config.mcp.file, "cli-mcp.json");
   assert.equal(config.gateway.port, 4300);
   assert.equal(config.sources["provider.apiKey"], "local_private");
   assert.equal(config.sources["provider.model"], "cli");
-  assert.equal(config.sources["provider.baseUrl"], "workspace_profile");
+  assert.equal(config.sources["provider.baseUrl"], "local_private");
   assert.equal(config.sources["provider.thinking"], "cli");
   assert.equal(config.sources["gateway.port"], "cli");
+});
+
+test("共享 Workspace 配置不能把受信 API Key 重定向到项目端点", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-endpoint-boundary-"));
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({
+    provider: {
+      type: "openai-compatible",
+      baseUrl: "https://attacker.invalid/v1",
+      model: "attacker-model",
+    },
+  }), "utf8");
+
+  await assert.rejects(
+    composeRuntimeConfig({ root: workspace, env: { OPENAI_API_KEY: "trusted-secret" } }),
+    /不允许选择 provider\.type\/baseUrl/,
+  );
+});
+
+test("项目内同名 local config 不属于可信配置来源", async (t) => {
+  const fixture = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-project-local-boundary-"));
+  const trustedRoot = path.join(fixture, "nexus-app");
+  const workspace = path.join(fixture, "project");
+  await fs.mkdir(path.join(trustedRoot, ".nexus"), { recursive: true });
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  t.after(() => fs.rm(fixture, { recursive: true, force: true }));
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    provider: {
+      type: "openai-compatible",
+      apiKey: "project-secret",
+      baseUrl: "https://attacker.invalid/v1",
+      model: "attacker-model",
+    },
+  }), "utf8");
+  await fs.writeFile(path.join(trustedRoot, ".nexus", "config.local.json"), JSON.stringify({
+    provider: { model: "trusted-model" },
+  }), "utf8");
+
+  const config = await composeRuntimeConfig({
+    root: trustedRoot,
+    args: [`--workspace=${workspace}`],
+    env: {
+      OPENAI_API_KEY: "environment-secret",
+      OPENAI_BASE_URL: "http://127.0.0.1:18001/v1",
+    },
+  });
+  assert.equal(config.provider.apiKey, "environment-secret");
+  assert.equal(config.provider.baseUrl, "http://127.0.0.1:18001/v1");
+  assert.equal(config.provider.model, "trusted-model");
+  assert.equal(config.files.local, path.join(trustedRoot, ".nexus", "config.local.json"));
 });
 
 test("本地私有配置可定义具名 Agent Profile 并由 CLI 显式选择", async (t) => {

@@ -1,5 +1,6 @@
 // FOUNDATION — one normalized, inspectable configuration for every Nexus entrypoint.
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DemoProvider } from "../providers/demo.js";
 import { OpenAICompatibleProvider } from "../providers/openai-compatible.js";
@@ -29,14 +30,35 @@ export async function composeRuntimeConfig({
   env = process.env,
   root = process.cwd(),
   localEnvironment = { file: null, appliedKeys: [] },
+  useProjectsDefault = false,
 } = {}) {
+  const projectsRootArg = valueArg(args, "projects-root");
+  const projectsRoot = path.resolve(projectsRootArg || env.NEXUS_PROJECTS_ROOT || path.join(os.homedir(), "Nexus Projects"));
+  const projectsRootSource = projectsRootArg
+    ? "cli"
+    : env.NEXUS_PROJECTS_ROOT
+      ? environmentSource("NEXUS_PROJECTS_ROOT", localEnvironment)
+      : "default";
   const workspaceArg = valueArg(args, "workspace");
-  const workspace = path.resolve(workspaceArg || env.NEXUS_WORKSPACE || root);
+  const workspace = path.resolve(
+    workspaceArg
+      || env.NEXUS_WORKSPACE
+      || (useProjectsDefault ? path.join(projectsRoot, "Default") : root),
+  );
   const workspaceSource = workspaceArg ? "cli" : env.NEXUS_WORKSPACE ? environmentSource("NEXUS_WORKSPACE", localEnvironment) : "default";
   const profileFile = path.join(workspace, PROFILE_FILE);
-  const localFile = path.join(workspace, LOCAL_FILE);
-  const profile = await readConfigFile(profileFile, { label: "workspace profile", allowApiKey: false });
-  const local = await readConfigFile(localFile, { label: "local private config", allowApiKey: true });
+  const localConfigArg = valueArg(args, "local-config");
+  const localFile = path.resolve(localConfigArg || env.NEXUS_LOCAL_CONFIG || path.join(path.resolve(root), LOCAL_FILE));
+  const profile = await readConfigFile(profileFile, {
+    label: "workspace profile",
+    allowApiKey: false,
+    allowProviderEndpoint: false,
+  });
+  const local = await readConfigFile(localFile, {
+    label: "local private config",
+    allowApiKey: true,
+    allowProviderEndpoint: true,
+  });
   const values = {
     "provider.type": "auto",
     "provider.apiKey": null,
@@ -86,6 +108,10 @@ export async function composeRuntimeConfig({
 
   return {
     workspace,
+    projects: {
+      root: projectsRoot,
+      defaultWorkspace: workspace,
+    },
     provider: {
       type: values["provider.type"],
       apiKey: values["provider.apiKey"],
@@ -107,7 +133,7 @@ export async function composeRuntimeConfig({
     mcp: { file: values["mcp.file"] },
     gateway: { port: values["gateway.port"] },
     printConfig: args.includes("--print-config"),
-    sources: { workspace: workspaceSource, ...sources },
+    sources: { workspace: workspaceSource, projectsRoot: projectsRootSource, ...sources },
     files: {
       profile: profile?.file || null,
       local: local?.file || null,
@@ -160,6 +186,7 @@ function providerDescriptor(provider) {
 export function inspectRuntimeConfig(config) {
   return {
     workspace: config.workspace,
+    projects: { ...config.projects },
     provider: {
       type: config.provider.type,
       apiKey: config.provider.apiKey ? "[REDACTED]" : null,
@@ -182,7 +209,7 @@ export function inspectRuntimeConfig(config) {
   };
 }
 
-async function readConfigFile(file, { label, allowApiKey }) {
+async function readConfigFile(file, { label, allowApiKey, allowProviderEndpoint }) {
   let payload;
   try {
     payload = JSON.parse(await fs.readFile(file, "utf8"));
@@ -197,7 +224,10 @@ async function readConfigFile(file, { label, allowApiKey }) {
     assertObject(payload.provider, `${label}.provider`);
     assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model", "thinking"]), `${label}.provider`);
     if (payload.provider.apiKey !== undefined && !allowApiKey) {
-      throw new Error(`${label} 不允许保存 provider.apiKey；请使用 .env.local 或 .nexus/config.local.json`);
+      throw new Error(`${label} 不允许保存 provider.apiKey；请使用 .env.local 或 Nexus 应用目录的 .nexus/config.local.json`);
+    }
+    if (!allowProviderEndpoint && (payload.provider.type !== undefined || payload.provider.baseUrl !== undefined)) {
+      throw new Error(`${label} 不允许选择 provider.type/baseUrl；请使用受信任的环境、CLI 或 Nexus 应用级私有配置`);
     }
     copyDefined(values, "provider.type", payload.provider.type);
     copyDefined(values, "provider.apiKey", payload.provider.apiKey);
