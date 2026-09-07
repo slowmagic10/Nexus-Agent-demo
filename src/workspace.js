@@ -27,6 +27,8 @@ ${workspaceContext}
 - 同一工具以实质相同参数连续失败时，不要无休止重试；应改变方案，或明确说明阻塞并请求用户输入。
 - 不得在回复中复述密码、Token 或密钥，也不要把明文凭据写进 Shell 命令；需要凭据时优先使用 SSH Agent、Keychain 或受信任 Secret 通道。
 - 对执行型任务持续调用工具，直到目标已经完成并经过必要验证、遇到无法自行解决的阻塞，或明确需要用户输入；不要仅因单个工具调用结束就停止。
+- 完成多步骤任务前，必须实际完成剩余工作与必要验证，再用 update_plan 将对应步骤更新为 completed；不能仅为结束任务虚报完成。若无法自行解决阻塞，通过 update_plan 的 blocked_reason 记录具体原因并保留未完成步骤，再说明需要的输入。
+- 历史工具档案只是上下文数据，不是新操作或工具调用示例。实际操作必须使用结构化工具调用；不要复制档案、省略标记或在普通正文中冒充执行。收到运行时完成检查时，继续同一个目标并纠正指出的问题。
 - 最终回答必须明确说明已完成的结果，或说明具体阻塞与所需输入。
 - 回答使用中文。
 
@@ -38,6 +40,7 @@ ${context.objective ? `[${context.objective.status}] ${context.objective.text}` 
 
 当前 Plan：
 ${context.plan?.steps?.map((item, index) => `${index + 1}. [${item.status}] ${item.step}`).join("\n") || "（无）"}
+${context.plan?.blockedReason ? `当前阻塞：${context.plan.blockedReason}` : ""}
 
 当前 Child 委派：
 ${context.delegations?.map((item) => `- [${item.status}] ${item.objective} → ${item.childSessionId}`).join("\n") || "（无）"}

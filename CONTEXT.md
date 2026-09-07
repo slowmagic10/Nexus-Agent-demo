@@ -53,11 +53,11 @@ _Avoid_: Full state, UI state, prompt state
 _Avoid_: Message slice, token truncation
 
 **Historical Tool Transcript Projection**:
-Context Lifecycle 在 Context Window Plan 之前对已完成历史 turn 生成的确定性有界投影。即使 Provider 拥有大窗口，旧 turn 也只有在整个投影确实更省 Token 时，才把完整 assistant tool call 与对应 tool result 一起改写为带工具名、参数/结果短预览的普通 assistant 历史记录，避免把低价值原始日志反复发送或留下孤立 tool message。用户消息、最终回答和消息位置不变，完整参数与结果继续保存在 Durable Session Event/Artifact；每次 Model Context 计划记录版本、投影调用/结果数量及实际估算 Token 节省。它不调用模型、不修改 Journal，也不替代语义摘要或 Artifact。
+Context Lifecycle 在 Context Window Plan 之前对已完成历史 turn 生成的确定性有界投影。即使 Provider 拥有大窗口，旧 turn 也只有在整个投影确实更省 Token 时，才把完整 assistant tool call 与对应 tool result 一起改写为带来源、工具名和参数/结果摘录的 JSON 数据档案。档案只在 Provider 请求中使用 user 角色承载，并由系统说明明确标为不可信历史数据、不是新用户目标或 assistant 调用示例；说明成本计入预算和 Context Hash。真实用户消息、最终回答和消息位置不变，完整参数与结果继续保存在 Durable Session Event/Artifact；每次 Model Context 计划记录 v2 版本、投影数量及估算 Token 节省。它不调用模型、不修改 Journal，也不替代语义摘要或 Artifact。
 _Avoid_: Mutating durable messages, orphan tool results, claiming character count equals token savings
 
 **Active Tool Transcript Projection**:
-Context Lifecycle 对当前用户 turn 内已经闭合的较早工具轮生成的确定性有界投影。最近两个 assistant tool call + 对应 tool result 轮始终逐字保留；更早轮次只有在各自完整成对投影确实更省 Token 时，才改写为带工具名和短预览的普通 assistant 记录。一个 turn 只要包含任意 opaque `provider_items`，该 turn 的全部工具协议就保持逐字不变，避免改写 Provider 私有状态的配对上下文。用户目标、普通 assistant 正文和 Durable Session Event 均不修改；Context Window Plan 独立记录 eligible/preserved/compacted rounds 与估算节省。它减少长任务每次模型调用重复携带旧工具正文的成本，但不是语义摘要，也不允许拆散或截断最近工具协议。
+Context Lifecycle 对当前用户 turn 内已经闭合的较早工具轮生成的确定性有界投影。最近两个 assistant tool call + 对应 tool result 轮始终逐字保留；更早轮次只有在各自完整成对投影确实更省 Token 时，才改写为与历史投影相同的带来源 JSON 数据档案。一个 turn 只要包含任意 opaque `provider_items`，该 turn 的全部工具协议就保持逐字不变，避免改写 Provider 私有状态的配对上下文。用户目标、普通 assistant 正文和 Durable Session Event 均不修改；Context Window Plan 独立记录 eligible/preserved/compacted rounds 与估算节省。它减少长任务每次模型调用重复携带旧工具正文的成本，但不是语义摘要，也不允许拆散或截断最近工具协议。
 _Avoid_: Keeping only the last message, orphan tool results, compacting the latest two tool rounds, mutating Session state, model-generated active summary
 
 **Context Lifecycle**:
@@ -69,19 +69,27 @@ _Avoid_: Agent loop coordinating summary batches, caller-owned overflow retries,
 _Avoid_: Hidden cap, context window equals cumulative cost, dropping a paid final response
 
 **Objective**:
-当前用户 turn 要完成的 durable 任务目标。`USER_MESSAGE` 创建新的 Objective；完成、失败、取消会同步闭合 Objective，恢复旧 Session 后收到新输入会先暂停旧 Objective。Objective 属于 Agent Session 投影，不是只存在于 system prompt 的提示词。
+可跨用户 turn 延续的 durable 任务目标。Runtime 在写入 `USER_MESSAGE` 前决定 `objectiveMode=new/continue`：明确的短句继续命令或未完成任务的状态询问保留原目标与计划，一般新任务重新创建；已完成目标不自动复活，已取消目标必须收到用户明确继续命令才能恢复。状态询问保留已知阻塞，明确继续清除旧阻塞标记。旧 Journal 中没有 mode 的 action 仍按原有新建行为重放。完成、普通失败、取消会闭合 Objective；完成检查耗尽或真实阻塞以可恢复失败结束本轮，并暂停原 Objective/Plan。Objective 属于 Agent Session 投影，不是只存在于 system prompt 的提示词。
 _Avoid_: Prompt-only goal, workflow definition, untracked task text
 
 **Durable Plan**:
-绑定当前 Objective 的可修订步骤投影。内置 `update_plan` 通过 Tool Host 写入 `PLAN_UPDATED` Durable Session Event；每个版本最多一个 `in_progress` 步骤，Objective 终止时 Plan 同步终止。它只表达当前单 Agent turn 的执行意图，不等同于 Workflow graph，也不承担 child delegation。
+绑定当前 Objective 的可修订步骤投影。内置 `update_plan` 通过 Tool Host 写入 `PLAN_UPDATED` Durable Session Event；每个版本最多一个 `in_progress` 步骤，Objective 终止时 Plan 同步终止。`blocked_reason` 可显式记录无法自行解决的阻塞，保留未完成步骤；正常更新或明确继续清除该标记。它表达当前单 Agent 目标的执行意图，可跨继续轮次保留，不等同于 Workflow graph，也不承担 child delegation。
 _Avoid_: Assistant prose checklist, workflow DAG, UI-only todo list
+
+**Completion Guard**:
+AgentRuntime 在接受无 Tool Call 的最终响应前，检查空回答、未完成 Plan、运行中 Child 和将历史工具档案当作新操作的异常正文。检查不通过时通过 `COMPLETION_REJECTED` 写入本轮系统纠正与审计，在同一用户轮最多纠正两次；额外请求仍受累计 Token 和 maxSteps 边界约束。耗尽纠正或遇到显式阻塞时写可恢复 `FAILED`，保持原目标/计划为 paused，不伪造完成。请求投影将当前轮可信纠正按顺序放入首部 systemPrompt，原位置换为固定只读占位；旧轮纠正降为失效历史说明。预算估算、压缩选择和 Hash 使用前置后的真实请求，Durable Messages 与消息游标不变。用户、工具或 assistant 的角色伪装不能提升到系统指令。它不解析执行普通正文中的命令，也不能证明模型声称完成的工作已经通过所有业务验收。
+_Avoid_: No tool calls means task success, unlimited automatic continuation, executing truncated prose commands, rewriting historical completion events
+
+**Model Request Retry**:
+Context Lifecycle 在同一个模型步骤内恢复暂态传输错误，最多两次、默认退避 250ms/1000ms，复用原请求且不重放已经执行的工具。未完整返回的模型文本和工具参数在重试前丢弃；用户取消中止退避与请求，失败用量（未知时明确估算）计入本轮预算。网络重试与 Context overflow replan 分别计数且互不重置，同一步总请求最多四次。`model.request_failed/retry_requested/retry_exhausted` 记录安全固定分类、状态码、用量和耗时；永久格式/鉴权/配额错误不重试，耗尽或预算不足保留 paused 目标和计划。
+_Avoid_: Replaying tool side effects, infinite reconnect, retrying invalid credentials, raw transport causes in durable logs, treating unknown failed usage as free
 
 **Single-level Delegation**:
 Parent Session 通过内置 `delegate_task` 创建一个拥有独立 Journal 的 Child Session，并只传显式 context subset、受 Parent 上限约束的子预算和单一 Objective。Parent 等待 Child 终态并通过工具结果归并；Child 的 Approval 代理到 Parent，Parent 取消会级联取消 Child。Child 不暴露 `delegate_task`，恢复时未闭合委派标记为 interrupted 且不自动重放。Child 的 durable Profile 预算也是恢复上限；有效预算取 durable Child 与当前同名 Profile 的更严格值，重启只能保持或收紧，不能扩张。
 _Avoid_: Copying parent transcript, nested delegation, hidden child approval, automatic replay after interruption
 
 **Client Session Projection**:
-浏览器对一个已选 Agent Session 的只读 durable 投影。它公开 `select / refresh / close / query` 与当前 snapshot；内部原子读取 baseline 和 cursor、按 cursor 连接 SSE、只应用连续 patch、忽略重复或过期选择/事件源，并在游标缺口或无效 patch 时重新读取 baseline。Session-scoped feature query 绑定当前 Session 与 Projection revision，同一 query key 只保留最新请求，选择、刷新或关闭会取消全部旧请求。它复用共享 State Patch Module，不拥有 DOM、Memory/Grant 等 feature data，也不是恢复事实来源。
+浏览器对一个已选 Agent Session 的只读 durable 投影。它公开 `select / refresh / close / clear / query` 与当前 snapshot；内部原子读取 baseline 和 cursor、按 cursor 连接 SSE、只应用连续 patch、忽略重复或过期选择/事件源，并在游标缺口或无效 patch 时重新读取 baseline。Session-scoped feature query 绑定当前 Session 与 Projection revision，同一 query key 只保留最新请求，选择、刷新或关闭会取消全部旧请求。`clear` 同时移除 Session 身份与 cursor；收到 `session_deleted` 或确认当前 Session 返回 404 时清理投影并通知 app，避免无限重连或被迟到数据恢复。它复用共享 State Patch Module，不拥有 DOM、Memory/Grant 等 feature data，也不是恢复事实来源。
 _Avoid_: UI-owned EventSource, browser reducer, patch without cursor, stale selection overwriting the current view, all-Web global store, source of truth
 
 **Display Turn Projection**:
@@ -119,6 +127,14 @@ _Avoid_: Hiding sidebar without an entry point, duplicate mobile session list, p
 **Session Checkpoint**:
 从某个 durable event cursor 派生并带校验和的恢复加速投影；它可以丢弃或重建，不能替代 session journal 的事实地位。
 _Avoid_: New baseline, source of truth
+
+**Session Deletion**:
+用户明确删除一个任务及其委派后代的生命周期操作。Gateway 先阻止目标的新操作，取消 Runtime、审批与子任务，并等待执行、在途 API 与 dispatch 队列收束；SessionStore 在单一事务中删除 Session、Journal、Checkpoint 和 Artifact，仅保留 ID 与删除时间的 tombstone，阻止旧写入及原 ID 恢复。独立 Branch、项目文件、长期记忆和 Project Grant 不属于删除范围；仍由 Parent 等待的 Child 单独删除返回冲突。删除通知是提交后的控制消息，不伪装成已被删除的 Journal Event。
+_Avoid_: List-only removal, deleting workspace files, cascading through independent branches, stale writers recreating deleted sessions
+
+**Task Deletion Module**:
+Task Workbench 删除确认交互模块，公开 `open / isOpen / destroy`，拥有固定目标身份、确认与取消、防重复提交、错误及焦点恢复。App 将删除结果中的所有 ID 从列表和缓存中移除，仅在当前选择被删除时清理线程、输入与详情；列表请求版本和已删除 ID 集合阻止迟到结果复活任务。
+_Avoid_: Reading current session inside delayed confirmation, clearing another task's draft, treating request start as deletion success
 
 **Session Branch**:
 从父 Agent Session 的指定 durable cursor 投影出的独立新 Session；它通过 lineage 引用父身份与 cursor，但拥有自己的 baseline 和后续 journal。

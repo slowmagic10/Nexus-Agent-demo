@@ -365,14 +365,14 @@ test("Provider Context overflow 会缩减完整 turn 并自动重试一次", asy
   assert.equal(runtime.state.metrics.modelCalls, 3);
 });
 
-test("非 Context overflow 的 Provider 错误不会自动重试", async () => {
+test("配额耗尽的 Provider 错误不会自动重试或触发 Context replan", async () => {
   let calls = 0;
   const runtime = createRuntime({
     provider: {
       complete: async () => {
         calls += 1;
         throw createProviderHttpError(429, JSON.stringify({
-          error: { code: "rate_limit_exceeded", message: "Too many requests" },
+          error: { code: "insufficient_quota", message: "Quota exhausted" },
         }));
       },
     },

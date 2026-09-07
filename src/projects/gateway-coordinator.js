@@ -13,6 +13,7 @@ export class GatewayProjectCoordinator {
   #bundles = new Map();
   #bundlePromises = new Map();
   #sessionProjects = new Map();
+  #sessionIndexRevision = 0;
   #closed = false;
 
   constructor({ catalog, createProjectManager } = {}) {
@@ -87,6 +88,7 @@ export class GatewayProjectCoordinator {
       const { project, manager } = await this.#managerForProject(projectId);
       const state = await manager.create(options);
       this.#sessionProjects.set(state.id, project.id);
+      this.#sessionIndexRevision += 1;
       return annotate(state, project);
     }
     const project = await this.#project(projectId);
@@ -107,6 +109,7 @@ export class GatewayProjectCoordinator {
     const { manager } = await this.#managerForProject(project.id);
     const state = await manager.create({ ...options, ...(resume ? { resume } : {}) });
     this.#sessionProjects.set(state.id, project.id);
+    this.#sessionIndexRevision += 1;
     return annotate(state, project);
   }
 
@@ -121,6 +124,7 @@ export class GatewayProjectCoordinator {
     }
     const state = await manager.importSession(archive, { id });
     this.#sessionProjects.set(state.id, project.id);
+    this.#sessionIndexRevision += 1;
     return annotate(state, project);
   }
 
@@ -146,6 +150,7 @@ export class GatewayProjectCoordinator {
     const resolved = await this.#managerForSession(id);
     const state = await resolved.manager.branch(id, options);
     this.#sessionProjects.set(state.id, resolved.project.id);
+    this.#sessionIndexRevision += 1;
     return annotate(state, resolved.project);
   }
 
@@ -159,6 +164,14 @@ export class GatewayProjectCoordinator {
 
   async cancel(id) {
     return this.#stateOperation(id, "cancel");
+  }
+
+  async deleteSession(id) {
+    const resolved = await this.#managerForSession(id);
+    const result = await resolved.manager.deleteSession(id);
+    for (const sessionId of result.deletedSessionIds) this.#sessionProjects.delete(sessionId);
+    this.#sessionIndexRevision += 1;
+    return result;
   }
 
   async retryMemoryMutation(id, mutationId) {
@@ -325,12 +338,24 @@ export class GatewayProjectCoordinator {
 
   async #managerForSession(id) {
     if (typeof id !== "string" || !id) throw new GatewayError(404, "Session 不存在");
-    const indexed = this.#sessionProjects.get(id);
-    if (indexed) return this.#managerForProject(indexed);
-    const owner = await this.#findStoredOwner(id);
-    if (!owner) throw new GatewayError(404, `未找到会话：${id}`);
-    this.#sessionProjects.set(id, owner.id);
-    return this.#managerForProject(owner.id);
+    while (true) {
+      const indexed = this.#sessionProjects.get(id);
+      if (indexed) return this.#managerForProject(indexed);
+      const revision = this.#sessionIndexRevision;
+      let owner;
+      try {
+        owner = await this.#findStoredOwner(id);
+      } catch (error) {
+        if (revision !== this.#sessionIndexRevision) continue;
+        throw error;
+      }
+      // Scanning unopened projects can yield to a delete/import. Never refill
+      // an ownership entry from a scan that predates that mutation.
+      if (revision !== this.#sessionIndexRevision) continue;
+      if (!owner) throw new GatewayError(404, `未找到会话：${id}`);
+      this.#sessionProjects.set(id, owner.id);
+      return this.#managerForProject(owner.id);
+    }
   }
 
   async #findStoredOwner(id) {

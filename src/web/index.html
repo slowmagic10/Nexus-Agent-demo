@@ -43,6 +43,7 @@
               <span id="phase-dot" class="phase-dot idle"></span>
               <h1 id="session-title">准备开始</h1>
               <button id="rename-session" class="rename-session" type="button" aria-label="重命名当前任务" disabled>重命名</button>
+              <button id="delete-session" class="delete-session" type="button" aria-label="删除当前任务" disabled>删除</button>
             </div>
             <form id="title-form" class="title-editor hidden">
               <input id="title-input" maxlength="500" autocomplete="off" aria-label="任务名称" placeholder="输入任务名称">
@@ -151,6 +152,19 @@
         <footer>
           <button id="project-cancel" type="button">取消</button>
           <button id="project-submit" class="primary" type="submit">创建任务</button>
+        </footer>
+      </form>
+    </dialog>
+    <dialog id="delete-task-dialog" class="delete-task-dialog" aria-labelledby="delete-task-title" aria-describedby="delete-task-description delete-task-running">
+      <form id="delete-task-form" class="delete-task-form">
+        <h2 id="delete-task-title">删除这个任务？</h2>
+        <p id="delete-task-name" class="delete-task-name"></p>
+        <p id="delete-task-description">将永久删除此任务及其子任务的聊天、执行记录和附件，无法撤销。项目文件和长期记忆会保留。</p>
+        <p id="delete-task-running" class="delete-task-running" hidden>任务正在运行，将先停止任务及其子任务，再删除记录。</p>
+        <p id="delete-task-error" class="delete-task-error" role="alert"></p>
+        <footer>
+          <button id="delete-task-cancel" type="button" autofocus>取消</button>
+          <button id="delete-task-submit" type="submit">删除任务</button>
         </footer>
       </form>
     </dialog>

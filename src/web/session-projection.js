@@ -6,14 +6,15 @@ export function createSessionProjection({
   eventSourceFactory = (url) => new EventSource(url),
   onChange = () => {},
   onEvent = () => {},
+  onDeleted = () => {},
   onDisconnect = () => {},
 } = {}) {
   if (typeof readSession !== "function") throw new Error("Client Session Projection 需要 readSession");
   if (typeof eventSourceFactory !== "function") throw new Error("Client Session Projection 需要 EventSource factory");
-  for (const [label, callback] of Object.entries({ onChange, onEvent, onDisconnect })) {
+  for (const [label, callback] of Object.entries({ onChange, onEvent, onDeleted, onDisconnect })) {
     if (typeof callback !== "function") throw new Error(`Client Session Projection ${label} 必须是函数`);
   }
-  return new ClientSessionProjection({ readSession, eventSourceFactory, onChange, onEvent, onDisconnect });
+  return new ClientSessionProjection({ readSession, eventSourceFactory, onChange, onEvent, onDeleted, onDisconnect });
 }
 
 class ClientSessionProjection {
@@ -21,6 +22,7 @@ class ClientSessionProjection {
   #eventSourceFactory;
   #onChange;
   #onEvent;
+  #onDeleted;
   #onDisconnect;
   #sessionId = null;
   #session = null;
@@ -35,6 +37,7 @@ class ClientSessionProjection {
     this.#eventSourceFactory = options.eventSourceFactory;
     this.#onChange = options.onChange;
     this.#onEvent = options.onEvent;
+    this.#onDeleted = options.onDeleted;
     this.#onDisconnect = options.onDisconnect;
   }
 
@@ -95,6 +98,10 @@ class ClientSessionProjection {
     try {
       payload = await this.#readSession(id);
     } catch (error) {
+      if (this.#handleMissing(error, id, revision)) {
+        if (revision === this.#revision && this.#sessionId) this.#connect(revision);
+        return null;
+      }
       if (revision === this.#revision && this.#sessionId) this.#connect(revision);
       if (revision !== this.#revision) return null;
       throw error;
@@ -116,6 +123,7 @@ class ClientSessionProjection {
     try {
       payload = await this.#readSession(id);
     } catch (error) {
+      if (this.#handleMissing(error, id, revision)) return null;
       if (revision === this.#revision) this.#connect(revision);
       if (revision !== this.#revision) return null;
       throw error;
@@ -131,6 +139,14 @@ class ClientSessionProjection {
     this.#revision += 1;
     this.#cancelQueries();
     this.#disconnect();
+  }
+
+  clear() {
+    this.close();
+    this.#sessionId = null;
+    this.#session = null;
+    this.#cursor = 0;
+    this.#onChange(this.#snapshot(), "cleared");
   }
 
   #isCurrentQuery(name, ticket) {
@@ -153,10 +169,30 @@ class ClientSessionProjection {
       throw new Error("Client Session Projection 收到无效 EventSource");
     }
     this.#source = source;
+    let checkingDeletion = false;
     source.addEventListener("session_event", (message) => this.#enqueueEvent(message, revision, source));
+    source.addEventListener("session_deleted", (message) => {
+      if (revision !== this.#revision || source !== this.#source) return;
+      try {
+        const deletion = JSON.parse(message.data);
+        if (deletion.sessionId !== this.#sessionId || deletion.deleted !== true) return;
+        this.clear();
+        Promise.resolve(this.#onDeleted(deletion)).catch((error) => this.#notifyDisconnect(error));
+      } catch (error) {
+        this.#notifyDisconnect(error);
+      }
+    });
     source.onerror = () => {
       if (revision !== this.#revision || source !== this.#source) return;
       this.#notifyDisconnect(new Error("事件流暂时断开，浏览器将自动重连"));
+      // A deletion can occur while this browser is disconnected, so its final
+      // SSE event may never arrive. Verify 404 before leaving EventSource retrying.
+      if (checkingDeletion) return;
+      checkingDeletion = true;
+      const id = this.#sessionId;
+      Promise.resolve().then(() => this.#readSession(id)).catch((error) => {
+        if (source === this.#source) this.#handleMissing(error, id, revision);
+      }).finally(() => { checkingDeletion = false; });
     };
   }
 
@@ -210,9 +246,23 @@ class ClientSessionProjection {
 
   async #recover(revision, source) {
     const id = this.#sessionId;
-    const payload = await this.#readSession(id);
+    let payload;
+    try {
+      payload = await this.#readSession(id);
+    } catch (error) {
+      if (this.#handleMissing(error, id, revision)) return;
+      throw error;
+    }
     if (revision !== this.#revision || source !== this.#source) return;
     this.#commit(normalizeReadPayload(payload, id), "recovered");
+  }
+
+  #handleMissing(error, id, revision) {
+    if (error?.status !== 404 || revision !== this.#revision) return false;
+    if (id === this.#sessionId) this.clear();
+    Promise.resolve(this.#onDeleted({ deleted: true, sessionId: id, deletedSessionIds: [id], alreadyDeleted: true }))
+      .catch((error) => this.#notifyDisconnect(error));
+    return true;
   }
 
   #commit(current, reason) {

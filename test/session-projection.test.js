@@ -132,6 +132,121 @@ test("Client Session Projection 取消迟到的 feature query 且同类请求只
   });
 });
 
+test("清空删除任务会断开事件源、清游标、取消 feature query 并拒绝迟到 baseline", async () => {
+  let resolveRead;
+  let delaying = false;
+  const queries = [];
+  const sources = [];
+  const projection = createSessionProjection({
+    readSession: async (id) => delaying
+      ? new Promise((resolve) => { resolveRead = resolve; })
+      : { session: session(id, "idle"), cursor: 8 },
+    eventSourceFactory: (url) => { const source = new FakeEventSource(url); sources.push(source); return source; },
+  });
+  await projection.select("a");
+  const query = projection.query("memories", (sessionId, { signal }) => pendingQuery(queries, sessionId, signal));
+  projection.clear();
+  assert.equal(queries[0].signal.aborted, true);
+  queries[0].resolve({ memories: ["stale"] });
+  assert.equal(await query, null);
+  assert.equal(sources[0].closed, true);
+  assert.equal(projection.sessionId, null);
+  assert.equal(projection.session, null);
+  assert.equal(projection.cursor, 0);
+  delaying = true;
+  const selection = projection.select("a");
+  projection.clear();
+  resolveRead({ session: session("a", "completed"), cursor: 9 });
+  assert.equal(await selection, null);
+  assert.equal(projection.sessionId, null);
+  assert.equal(sources.length, 1);
+});
+
+test("跨标签删除事件立即清空当前投影，切换后的旧删除事件不会清空新任务", async () => {
+  const sources = [];
+  const deletions = [];
+  const changes = [];
+  const projection = createSessionProjection({
+    readSession: async (id) => ({ session: session(id, "idle"), cursor: 1 }),
+    eventSourceFactory: (url) => { const source = new FakeEventSource(url); sources.push(source); return source; },
+    onDeleted: (event) => deletions.push(event),
+    onChange: (snapshot, reason) => changes.push({ snapshot, reason }),
+  });
+  await projection.select("a");
+  await projection.select("b");
+  sources[0].emitDeleted({ sessionId: "a", deleted: true, deletedSessionIds: ["a"] });
+  assert.equal(projection.sessionId, "b");
+  sources[1].emitDeleted({ sessionId: "a", deleted: true, deletedSessionIds: ["a"] });
+  assert.equal(projection.sessionId, "b");
+  sources[1].emitDeleted({ sessionId: "b", deleted: true, deletedSessionIds: ["b", "child"] });
+  assert.equal(projection.sessionId, null);
+  assert.equal(projection.cursor, 0);
+  assert.equal(sources[1].closed, true);
+  assert.equal(deletions.length, 1);
+  assert.equal(changes.at(-1).reason, "cleared");
+  assert.equal(changes.at(-1).snapshot.session, null);
+  await sources[1].emit({ cursor: 2, type: "STALE", patch: { set: { phase: "thinking" } } });
+  assert.equal(projection.session, null);
+});
+
+test("refresh 和事件缺口恢复期间漏掉删除事件时，404 仍清空任务且不重新连接", async () => {
+  for (const action of ["refresh", "recover", "select"]) {
+    let missing = false;
+    const sources = [];
+    const deleted = [];
+    const projection = createSessionProjection({
+      readSession: async (id) => {
+        if (missing) throw Object.assign(new Error("任务不存在"), { status: 404 });
+        return { session: session(id, "idle"), cursor: 1 };
+      },
+      eventSourceFactory: (url) => { const source = new FakeEventSource(url); sources.push(source); return source; },
+      onDeleted: (event) => deleted.push(event),
+    });
+    await projection.select("a");
+    missing = true;
+    if (action === "refresh") await projection.refresh();
+    if (action === "recover") await sources[0].emit({ cursor: 3, type: "GAPPED" });
+    if (action === "select") await projection.select("a");
+    assert.equal(projection.sessionId, null, action);
+    assert.equal(sources.length, 1, action);
+    assert.equal(sources[0].closed, true, action);
+    assert.deepEqual(deleted[0].deletedSessionIds, ["a"], action);
+  }
+});
+
+test("SSE 断线后探测 404 停止重连，迟到的探测不影响已切换任务", async () => {
+  const sources = [];
+  let rejectProbe;
+  let probing = false;
+  const projection = createSessionProjection({
+    readSession: async (id) => {
+      if (probing && id === "a") return new Promise((resolve, reject) => { rejectProbe = reject; });
+      return { session: session(id, "idle"), cursor: 1 };
+    },
+    eventSourceFactory: (url) => { const source = new FakeEventSource(url); sources.push(source); return source; },
+  });
+  await projection.select("a");
+  probing = true;
+  sources[0].onerror();
+  sources[0].onerror();
+  await Promise.resolve();
+  rejectProbe(Object.assign(new Error("任务不存在"), { status: 404 }));
+  for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  assert.equal(projection.sessionId, null);
+  assert.equal(sources[0].closed, true);
+
+  probing = false;
+  await projection.select("a");
+  probing = true;
+  sources[1].onerror();
+  await Promise.resolve();
+  await projection.select("b");
+  rejectProbe(Object.assign(new Error("任务不存在"), { status: 404 }));
+  for (let index = 0; index < 6; index += 1) await Promise.resolve();
+  assert.equal(projection.sessionId, "b");
+  projection.close();
+});
+
 function session(id, phase) {
   return { id, phase, messages: [], events: [] };
 }
@@ -154,6 +269,10 @@ class FakeEventSource {
 
   emit(event) {
     return this.listeners.get("session_event")?.({ data: JSON.stringify(event) });
+  }
+
+  emitDeleted(event) {
+    return this.listeners.get("session_deleted")?.({ data: JSON.stringify(event) });
   }
 
   close() {

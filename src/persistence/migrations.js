@@ -195,6 +195,24 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 9,
+    up(db) {
+      // Keep only an ID tombstone so stale writers cannot recreate deleted tasks.
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS deleted_sessions (
+          id TEXT PRIMARY KEY,
+          deleted_at TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS sessions_reject_deleted_id
+        BEFORE INSERT ON sessions
+        WHEN EXISTS (SELECT 1 FROM deleted_sessions WHERE id = NEW.id)
+        BEGIN
+          SELECT RAISE(ABORT, '会话已删除，不能恢复原 ID');
+        END;
+      `);
+    },
+  },
 ];
 
 export function migrateDatabase(db) {

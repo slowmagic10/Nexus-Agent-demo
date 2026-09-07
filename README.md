@@ -185,7 +185,11 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 - 模型流式输出：OpenAI-compatible/DeepSeek 与原生 OpenAI Responses 两个真实 Adapter 都把各自的 SSE 方言规范化为 `text_delta/completed`；Runtime 合并并脱敏正文片段后写入 durable Session Event，Web 可实时显示，刷新或 Gateway 重启后仍能恢复已生成部分。取消会直接中止模型请求并保留部分输出；Context overflow 重试前不会复用旧增量。普通 JSON 兼容端会安全降级，Context Summary 与 Memory Flush 继续使用非流式调用。
 - 状态与事件：追加式事件流、明确执行阶段、错误与取消状态，可供 CLI、Web 或其他客户端复用。
 - 安全任务标题：任务列表和页头使用 durable `Session Display Title`；首条输入及用户自定义名称都会先统一脱敏和泛化，服务器地址、账号、凭据或网络端点不会直接出现在侧栏。页头“重命名”可设置自定义名称，清空后回到安全派生标题。
-- Objective 与计划：每个用户任务建立 durable Objective；复杂任务可通过内置 `update_plan` 维护有版本的步骤状态，Journal 恢复和 Web Client Projection 会保留同一计划。
+- 删除任务：任务列表与页头提供删除入口，确认后删除该任务及委派子任务的聊天、执行日志、Checkpoint 和附件。运行中的任务会先停止；项目文件、长期记忆和独立分支保留。删除当前任务回到欢迎页，其他打开该任务的页面同步退出；已删除 ID 无法被迟到写入或恢复操作重新创建。
+- Objective 与计划：每个新任务建立 durable Objective；复杂任务通过 `update_plan` 维护有版本的步骤状态。未完成任务收到“继续吧”“修复好了吗”等明确短句时保留原目标和计划；已取消任务需要用户明确说“继续”才能恢复，已完成任务不自动复活。一般新任务仍创建新目标。
+- 完成检查：模型无工具调用时，Runtime 会检查剩余计划、未结束委派、空回答和误输出的历史工具档案；不合格则在同一轮最多自动纠正两次，仍受 Token/步骤预算与取消控制。真实阻塞通过 `update_plan.blocked_reason` 上报；纠正耗尽或存在阻塞时明确显示停止原因，保留原目标和计划供后续继续，避免把未完成工作标成成功。
+- 请求恢复：当轮完成纠正放入请求首部系统指令，兼容只允许首部 system 的模型服务；历史日志和消息游标保持不变。模型请求遇到暂态连接故障或 HTTP 408/429/500/502/503/504 时，默认等待 250ms、1000ms，最多额外重试两次；不重放已执行工具，取消立即生效，失败请求用量计入预算（未知用量明确标为估算）。鉴权、配额、协议格式等永久错误不重试；持续失败会显示安全错误码并保留目标和计划。明确状态询问如“跑完了吗”会继续原目标。
+- 工具历史档案：压缩后的工具参数和结果以带来源的 JSON 数据档案进入请求，不再充当 assistant 的调用示例。系统说明明确其为不可信历史数据，说明成本计入上下文预算；最近两个真实工具轮和 opaque Provider 状态继续保留，原始日志不变。
 - 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。Child 重启恢复时预算只能保持或继续收紧，不能被具名 Profile 默认值扩大。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
 - Agent Profile：每个 Session baseline 保存不含密钥的 Provider/model、提示词与工具 schema hash、Policy、Execution、Memory scope 和预算版本；恢复配置变化会留下带字段分类和影响等级的 durable diff。可在本地私有配置中定义具名 Profile，并在 Web/CLI 创建新任务时显式选择；Child 继承身份并单独收紧预算。
 - Artifact：长 Shell、MCP、文件读取等成功或失败工具输出在 Tool Host 统一脱敏后保存到 Session 专属 SQLite Artifact Store，消息只保留预览和引用；模型可用 `read_artifact` 分段读取，Web 工具卡可加载完整输出。Portable Journal 可携带 Artifact，Import 与 Branch 会复制到目标 Session scope，运行时仍禁止直接跨 Session 访问。
@@ -275,6 +279,7 @@ GET    /sessions
 POST   /sessions
 POST   /sessions/imports
 GET    /sessions/:id
+DELETE /sessions/:id
 GET    /sessions/:id/evaluation
 GET    /sessions/:id/memories
 POST   /sessions/:id/memories
@@ -293,6 +298,8 @@ DELETE /memories/:id
 GET    /sessions/:id/memories?query=关键词
 POST   /sessions/:id/memories/:memoryId/pin
 ```
+
+`DELETE /sessions/:id` 成功返回 `{ "deleted": true, "sessionId": "...", "deletedSessionIds": ["..."] }`，不存在返回 404；仍被父任务等待的子任务不能单独删除，返回 409，应从父任务入口删除。删除不支持撤销；需要备份时应先导出，之后可用新 Session ID 导入。
 
 示例：
 

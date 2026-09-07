@@ -88,7 +88,14 @@ export function reduceSession(state, action) {
   };
 
   switch (action.type) {
-    case "USER_MESSAGE":
+    case "USER_MESSAGE": {
+      if (action.objectiveMode !== undefined && !["new", "continue"].includes(action.objectiveMode)) {
+        throw new Error("objectiveMode 必须是 new 或 continue");
+      }
+      const continuing = action.objectiveMode === "continue";
+      if (continuing && !["active", "paused", "failed", "cancelled"].includes(next.objective?.status)) {
+        throw new Error("没有可继续的未完成 Objective");
+      }
       next.phase = "thinking";
       next.turnStartedAt = at;
       next.modelStream = null;
@@ -96,17 +103,32 @@ export function reduceSession(state, action) {
       next.toolStreams = {};
       next.messages.push({ role: "user", content: action.content });
       next.displayTitle ||= deriveSessionDisplayTitle(next.messages);
-      next.objective = {
-        id: `objective-${next.events.length + 1}`,
-        text: redactSensitiveValue(typeof action.objective === "string" && action.objective.trim() ? action.objective.trim() : action.content),
-        status: "active",
-        createdAt: at,
-        updatedAt: at,
-      };
-      next.plan = null;
-      emit("objective.created", { objectiveId: next.objective.id, preview: next.objective.text.slice(0, 160) });
+      if (continuing) {
+        const previousStatus = next.objective.status;
+        next.objective.status = "active";
+        next.objective.updatedAt = at;
+        delete next.objective.completedAt;
+        next.lastError = null;
+        if (next.plan?.objectiveId === next.objective.id) {
+          next.plan.status = "active";
+          next.plan.updatedAt = at;
+          if (action.preserveBlockedReason !== true) delete next.plan.blockedReason;
+        }
+        emit("objective.continued", { objectiveId: next.objective.id, previousStatus });
+      } else {
+        next.objective = {
+          id: `objective-${next.events.length + 1}`,
+          text: redactSensitiveValue(typeof action.objective === "string" && action.objective.trim() ? action.objective.trim() : action.content),
+          status: "active",
+          createdAt: at,
+          updatedAt: at,
+        };
+        next.plan = null;
+        emit("objective.created", { objectiveId: next.objective.id, preview: next.objective.text.slice(0, 160) });
+      }
       emit("message.user", { preview: action.content.slice(0, 120) });
       break;
+    }
     case "SESSION_DISPLAY_TITLE_CHANGED": {
       if (action.title !== null && typeof action.title !== "string") {
         throw new Error("Session Display Title 必须是字符串或 null");
@@ -156,6 +178,34 @@ export function reduceSession(state, action) {
       break;
     case "MODEL_CONTEXT_PREPARED":
       emit(action.plan.compacted ? "model.context_compacted" : "model.context_prepared", action.plan);
+      break;
+    case "MODEL_REQUEST_FAILED": {
+      const usage = normalizeSummaryUsage(action.usage);
+      addTokenUsage(next.metrics, usage);
+      next.metrics.modelDurationMs += action.durationMs || 0;
+      emit("model.request_failed", {
+        contextHash: action.contextHash,
+        failure: structuredClone(action.failure),
+        durationMs: action.durationMs || 0,
+        usage,
+        usageEstimated: action.usageEstimated === true,
+      });
+      break;
+    }
+    case "MODEL_RETRY_REQUESTED":
+      emit("model.retry_requested", {
+        attempt: action.attempt,
+        maxRetries: action.maxRetries,
+        delayMs: action.delayMs,
+        failure: structuredClone(action.failure),
+      });
+      break;
+    case "MODEL_RETRY_EXHAUSTED":
+      emit("model.retry_exhausted", {
+        retries: action.retries,
+        reason: action.reason,
+        failure: structuredClone(action.failure),
+      });
       break;
     case "MODEL_CONTEXT_REPLAN_REQUESTED":
       next.metrics.modelDurationMs += action.durationMs || 0;
@@ -657,12 +707,14 @@ export function reduceSession(state, action) {
         throw new Error("Plan 只能更新当前 active Objective");
       }
       const steps = normalizePlanSteps(action.steps);
+      const blockedReason = normalizePlanBlockedReason(action.blockedReason);
       const revision = next.plan?.objectiveId === next.objective.id ? next.plan.revision + 1 : 1;
       next.plan = {
         objectiveId: next.objective.id,
         revision,
         status: "active",
         explanation: typeof action.explanation === "string" ? redactSensitiveValue(action.explanation.trim()).slice(0, 1000) : "",
+        ...(blockedReason ? { blockedReason } : {}),
         steps,
         createdAt: next.plan?.objectiveId === next.objective.id ? next.plan.createdAt : at,
         updatedAt: at,
@@ -671,6 +723,7 @@ export function reduceSession(state, action) {
         objectiveId: next.objective.id,
         revision,
         explanation: next.plan.explanation,
+        ...(blockedReason ? { blockedReason } : {}),
         steps: structuredClone(steps),
       });
       break;
@@ -765,6 +818,28 @@ export function reduceSession(state, action) {
       });
       break;
     }
+    case "COMPLETION_REJECTED": {
+      if (!Number.isSafeInteger(action.attempt) || action.attempt < 1) {
+        throw new Error("COMPLETION_REJECTED attempt 必须是正整数");
+      }
+      if (!Array.isArray(action.reasons) || !action.reasons.length
+          || action.reasons.some((reason) => typeof reason !== "string" || !reason.trim())) {
+        throw new Error("COMPLETION_REJECTED reasons 必须是非空字符串数组");
+      }
+      if (typeof action.message !== "string" || !action.message.trim()) {
+        throw new Error("COMPLETION_REJECTED message 必须是非空字符串");
+      }
+      const message = redactSensitiveValue(action.message.trim());
+      next.phase = "thinking";
+      next.messages.push({ role: "system", content: message, runtime_feedback: "completion" });
+      emit("session.completion_rejected", {
+        objectiveId: next.objective?.id || null,
+        attempt: action.attempt,
+        reasons: redactSensitiveValue(action.reasons),
+        message,
+      });
+      break;
+    }
     case "COMPLETED":
       next.toolStreams = {};
       next.phase = "completed";
@@ -791,8 +866,23 @@ export function reduceSession(state, action) {
       next.pendingApproval = null;
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
       next.turnStartedAt = null;
-      finalizeObjective(next, "failed", at, emit);
-      emit("session.failed", { error: action.error, durationMs: next.metrics.lastTurnDurationMs });
+      if (action.recoverable === true && ["active", "paused"].includes(next.objective?.status)) {
+        next.objective.status = "paused";
+        next.objective.updatedAt = at;
+        delete next.objective.completedAt;
+        if (next.plan?.objectiveId === next.objective.id) {
+          next.plan.status = "paused";
+          next.plan.updatedAt = at;
+        }
+        emit("objective.paused", { objectiveId: next.objective.id, reason: action.reason || "recoverable_failure" });
+      } else {
+        finalizeObjective(next, "failed", at, emit);
+      }
+      emit("session.failed", {
+        error: action.error,
+        durationMs: next.metrics.lastTurnDurationMs,
+        ...(action.recoverable === true ? { recoverable: true } : {}),
+      });
       break;
     case "CANCELLED":
       for (const call of findUnresolvedToolCalls(next.messages)) {
@@ -1113,6 +1203,14 @@ function normalizePlanSteps(value) {
   });
   if (inProgress > 1) throw new Error("Plan 最多一个步骤处于 in_progress");
   return steps;
+}
+
+function normalizePlanBlockedReason(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !value.trim() || value.trim().length > 1000) {
+    throw new Error("Plan blockedReason 必须是 1 到 1000 字符的非空字符串");
+  }
+  return redactSensitiveValue(value.trim());
 }
 
 function finalizeObjective(state, status, at, emit) {

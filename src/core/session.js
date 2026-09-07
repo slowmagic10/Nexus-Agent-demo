@@ -12,6 +12,7 @@ export class AgentSession {
   #dispatchTail = Promise.resolve();
   #cursor = 0;
   #modelContext;
+  #closed = false;
 
   constructor({ state, reducer, journal = null, onState = null }) {
     if (!state?.id) throw new Error("AgentSession 需要有效的初始状态");
@@ -40,9 +41,24 @@ export class AgentSession {
   }
 
   dispatch(action) {
+    if (this.#closed) return Promise.reject(new Error(`会话已删除或关闭：${this.id}`));
     const operation = this.#dispatchTail.then(() => this.#commit(action));
     this.#dispatchTail = operation.catch(() => {});
     return operation;
+  }
+
+  async drain() {
+    let tail;
+    do {
+      tail = this.#dispatchTail;
+      await tail;
+    } while (tail !== this.#dispatchTail);
+  }
+
+  close() {
+    this.#closed = true;
+    this.#subscribers.clear();
+    this.#eventSubscribers.clear();
   }
 
   subscribe(listener, { immediate = false } = {}) {
@@ -82,6 +98,7 @@ export class AgentSession {
   }
 
   async #commit(action) {
+    if (this.#closed) throw new Error(`会话已删除或关闭：${this.id}`);
     const durableAction = normalizeAction(action);
     const next = this.#reducer(this.#state, durableAction);
     const patch = createStatePatch(this.#state, next);

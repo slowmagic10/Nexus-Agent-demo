@@ -61,8 +61,21 @@ const PERMISSION_MODE_INFO = Object.freeze([
   }),
 ]);
 const DEFAULT_MAX_INPUT_TOKENS = 32_000;
+// Every public ID-scoped operation participates in deletion's quiescence barrier.
+// Runtime work is tracked separately because sendMessage returns before it ends.
+const SESSION_OPERATIONS = [
+  "setPermissionProfile", "get", "setDisplayTitle", "listArtifacts", "getArtifact", "view", "branch",
+  "exportSession", "sendMessage", "delegate", "decideApproval", "listGrants", "revokeGrant", "cancel",
+  "retryMemoryMutation", "discardMemoryMutation", "resolveMemoryMutation", "listSessionMemories",
+  "listSessionMemoryCandidates", "evaluate", "addSessionMemory", "deleteSessionMemory", "setMemoryPinned",
+  "approveMemoryCandidate", "rejectMemoryCandidate", "subscribe", "subscribeEvents", "cursor",
+];
 
 export class GatewaySessionManager {
+  #deleting = new Set();
+  #deletions = new Map();
+  #operations = new Map();
+
   constructor({ workspace, provider, providerDescriptor, agentProfile, agentProfiles, agentProviders, tools, toolHost, permissionToolHosts, defaultPermissionProfile, workspacePolicy, projectGrantStore = null, executionInfo = null, systemPrompt, store, memory = store?.memory, artifactStore = store?.artifacts, memoryScope, maxSteps, maxTokensPerTurn, maxInputTokens, memoryFlushPolicy, runtimeFactory = null }) {
     this.workspace = workspace;
     this.provider = provider;
@@ -131,9 +144,18 @@ export class GatewaySessionManager {
     }
     this.agentProfile = this.#currentAgentProfile(this.defaultAgentProfileId);
     this.sessions = new Map();
+    for (const name of SESSION_OPERATIONS) {
+      const operation = this[name].bind(this);
+      this[name] = (id, ...args) => this.#trackOperation(id, () => operation(id, ...args));
+    }
   }
 
-  async create({ resume, agentProfileId, permissionProfile, permissionConfirmation } = {}) {
+  async create(options = {}) {
+    const id = options.resume === "latest" ? this.store.latest(this.workspace)?.id : options.resume;
+    return id ? this.#trackOperation(id, () => this.#create({ ...options, resume: id })) : this.#create(options);
+  }
+
+  async #create({ resume, agentProfileId, permissionProfile, permissionConfirmation } = {}) {
     let state = resume === "latest"
       ? this.store.latest(this.workspace)
       : resume
@@ -143,6 +165,7 @@ export class GatewaySessionManager {
     if (resume && (!state || state.workspace !== this.workspace)) {
       throw new GatewayError(404, resume === "latest" ? "没有可恢复的会话" : `未找到会话：${resume}`);
     }
+    if (state) this.#assertAvailable(state.id);
 
     const existing = state ? this.sessions.get(state.id) : null;
     if (existing) {
@@ -318,11 +341,16 @@ export class GatewaySessionManager {
   }
 
   async importSession(archive, { id } = {}) {
+    const targetId = id || archive?.session?.id;
+    return this.#trackOperation(targetId, () => this.#importSession(archive, { id }));
+  }
+
+  async #importSession(archive, { id } = {}) {
     try {
       const imported = this.store.importJournal(archive, { id, workspace: this.workspace });
       return await this.#downgradeImportedDangerousSession(imported);
     } catch (error) {
-      if (/会话已存在/.test(error.message)) throw new GatewayError(409, error.message);
+      if (/会话已存在|会话已删除/.test(error.message)) throw new GatewayError(409, error.message);
       throw new GatewayError(400, error.message);
     }
   }
@@ -366,6 +394,7 @@ export class GatewaySessionManager {
     let child;
     const delegatedAt = new Date().toISOString();
     try {
+      this.#assertAvailable(id);
       const state = createDelegatedSession(parent.state, {
         id: childSessionId,
         delegationId,
@@ -447,7 +476,7 @@ export class GatewaySessionManager {
         scope: approved ? scope : null,
       });
     }
-    resolve(approved ? { approved: true, scope } : false);
+    resolve(approved && !this.#deleting.has(id) ? { approved: true, scope } : false);
     return entry.state;
   }
 
@@ -498,6 +527,60 @@ export class GatewaySessionManager {
     if (!entry.run && !entry.children.size) throw new GatewayError(409, "该会话当前没有正在运行的任务");
     this.#cancelEntry(entry, "用户通过 Gateway 取消了任务");
     return entry.state;
+  }
+
+  async deleteSession(id) {
+    // Concurrent DELETE callers share one result; later calls receive 404.
+    const existing = this.#deletions.get(id);
+    if (existing) return existing;
+    const ids = this.store.sessionDeletionIds(id);
+    if (!ids.length) throw new GatewayError(404, `未找到会话：${id}`);
+    for (const sessionId of ids) this.#assertAvailable(sessionId);
+    const state = this.sessions.get(id)?.state || this.store.load(id);
+    const parentId = state.lineage?.kind === "delegation" ? state.lineage.parentSessionId : null;
+    if (parentId && this.sessions.get(parentId)?.children.has(id)) {
+      throw new GatewayError(409, `该子任务仍由父任务等待，请删除父任务：${parentId}`);
+    }
+    for (const sessionId of ids) this.#deleting.add(sessionId);
+    const operation = this.#deleteSessions(id, ids).finally(() => {
+      for (const sessionId of ids) this.#deleting.delete(sessionId);
+      this.#deletions.delete(id);
+    });
+    this.#deletions.set(id, operation);
+    return operation;
+  }
+
+  async #deleteSessions(id, ids) {
+    // Cancel before waiting: pending approvals and delegation calls need abort
+    // to settle. In-flight API writes finish while their entries still exist.
+    while (true) {
+      const pending = [];
+      for (const sessionId of ids) {
+        const entry = this.sessions.get(sessionId);
+        this.#cancelEntry(entry, "用户通过 Gateway 删除了任务");
+        if (entry?.run) pending.push(entry.run);
+        pending.push(...(this.#operations.get(sessionId) || []));
+      }
+      if (!pending.length) break;
+      await Promise.allSettled(pending);
+    }
+    for (const sessionId of ids) await this.sessions.get(sessionId)?.session.drain();
+    const deletedSessionIds = this.store.deleteSessions(ids);
+    const result = { deleted: true, sessionId: id, deletedSessionIds };
+    for (const sessionId of ids) {
+      const entry = this.sessions.get(sessionId);
+      if (!entry) continue;
+      for (const subscription of [...entry.eventSubscriptions]) {
+        try {
+          Promise.resolve(subscription.listener({ ...result, type: "SESSION_DELETED", sessionId })).catch(() => {});
+        } catch {}
+        subscription.unsubscribe();
+      }
+      entry.subscribers.clear();
+      entry.session.close();
+      this.sessions.delete(sessionId);
+    }
+    return result;
   }
 
   async retryMemoryMutation(id, mutationId) {
@@ -672,7 +755,16 @@ export class GatewaySessionManager {
 
   async subscribeEvents(id, listener, { after = 0 } = {}) {
     const entry = await this.ensureLoaded(id);
-    return entry.session.subscribeEvents(listener, { after });
+    const stop = entry.session.subscribeEvents(listener, { after });
+    const subscription = {
+      listener,
+      unsubscribe: () => {
+        stop();
+        entry.eventSubscriptions.delete(subscription);
+      },
+    };
+    entry.eventSubscriptions.add(subscription);
+    return subscription.unsubscribe;
   }
 
   async cursor(id) {
@@ -683,20 +775,20 @@ export class GatewaySessionManager {
   async close() {
     const runs = [];
     for (const entry of this.sessions.values()) {
-      if (entry.run) {
-        this.#cancelEntry(entry, "Gateway 正在关闭");
-        runs.push(entry.run);
-      }
+      this.#cancelEntry(entry, "Gateway 正在关闭");
+      if (entry.run) runs.push(entry.run);
     }
-    await Promise.allSettled(runs);
+    await Promise.allSettled([...runs, ...this.#deletions.values(), ...[...this.#operations.values()].flatMap((items) => [...items])]);
   }
 
   async ensureLoaded(id) {
+    this.#assertAvailable(id);
     const existing = this.sessions.get(id);
     if (existing) return existing;
     const stored = this.store.load(id);
     if (!stored || stored.workspace !== this.workspace) throw new GatewayError(404, `未找到会话：${id}`);
     await this.create({ resume: id });
+    this.#assertAvailable(id);
     return this.sessions.get(id);
   }
 
@@ -714,6 +806,7 @@ export class GatewaySessionManager {
       approval: null,
       children: new Set(),
       subscribers: new Set(),
+      eventSubscriptions: new Set(),
     };
     const runtimeOptions = {
       session,
@@ -765,11 +858,16 @@ export class GatewaySessionManager {
   }
 
   #startRun(entry, content, options = {}) {
+    this.#assertAvailable(entry.session.id);
     if (entry.run) throw new GatewayError(409, "该会话已有正在运行的任务");
     const operation = entry.runtime.runTurn(content, (call, description, approvalSignal) => (
       options.approvalParent
         ? this.#requestDelegationApproval(options.approvalParent, entry, options.delegationId, call, description, approvalSignal)
         : new Promise((resolve) => {
+        if (this.#deleting.has(entry.session.id)) {
+          resolve(false);
+          return;
+        }
         entry.approval = {
           call,
           description,
@@ -843,6 +941,27 @@ export class GatewaySessionManager {
 
   #assertMutationIdle(entry) {
     if (entry.run) throw new GatewayError(409, "会话运行期间不能处理 Memory mutation");
+  }
+
+  #assertAvailable(id) {
+    if (this.#deleting.has(id)) throw new GatewayError(409, "任务正在删除，请稍候");
+  }
+
+  async #trackOperation(id, action) {
+    this.#assertAvailable(id);
+    const pending = this.#operations.get(id) || new Set();
+    this.#operations.set(id, pending);
+    const operation = Promise.resolve().then(() => {
+      this.#assertAvailable(id);
+      return action();
+    });
+    pending.add(operation);
+    try {
+      return await operation;
+    } finally {
+      pending.delete(operation);
+      if (!pending.size) this.#operations.delete(id);
+    }
   }
 
   #assertPermissionProfile(profile, confirmation = null) {

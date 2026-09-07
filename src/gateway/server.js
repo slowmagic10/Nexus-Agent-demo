@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js", "/task-deletion.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);
@@ -151,6 +151,10 @@ export async function routeGatewayRequest(request, response, manager, staticRoot
 
   if (parts[0] === "sessions" && parts[1]) {
     const id = parts[1];
+    if (request.method === "DELETE" && parts.length === 2) {
+      sendJson(response, 200, await manager.deleteSession(id));
+      return;
+    }
     if (request.method === "GET" && parts.length === 2) {
       const view = await manager.view(id);
       sendJson(response, 200, {
@@ -279,7 +283,44 @@ export async function routeGatewayRequest(request, response, manager, staticRoot
 }
 
 async function openEventStream(request, response, manager, id, after) {
-  await manager.get(id);
+  let unsubscribe = () => {};
+  let heartbeat;
+  let opened = false;
+  let ended = false;
+  const buffered = [];
+  const cleanup = () => {
+    ended = true;
+    clearInterval(heartbeat);
+    unsubscribe();
+  };
+  const emit = (event) => {
+    if (ended) return;
+    if (!opened) {
+      buffered.push(event);
+      return;
+    }
+    if (event.type === "SESSION_DELETED") {
+      response.write(`event: session_deleted\ndata: ${JSON.stringify(event)}\n\n`);
+      cleanup();
+      response.end();
+    } else {
+      response.write(`id: ${event.cursor}\nevent: session_event\ndata: ${JSON.stringify(event)}\n\n`);
+    }
+  };
+  request.once("close", cleanup);
+  try {
+    // Register before committing headers; a deletion race can still return an
+    // HTTP error and cannot strand an empty SSE connection or heartbeat.
+    unsubscribe = await manager.subscribeEvents(id, emit, { after });
+  } catch (error) {
+    cleanup();
+    request.removeListener("close", cleanup);
+    throw error;
+  }
+  if (ended) {
+    unsubscribe();
+    return;
+  }
   response.writeHead(200, {
     "content-type": "text/event-stream; charset=utf-8",
     "cache-control": "no-cache, no-transform",
@@ -287,14 +328,9 @@ async function openEventStream(request, response, manager, id, after) {
     "x-accel-buffering": "no",
   });
   response.flushHeaders?.();
-  const unsubscribe = await manager.subscribeEvents(id, (event) => {
-    response.write(`id: ${event.cursor}\nevent: session_event\ndata: ${JSON.stringify(event)}\n\n`);
-  }, { after });
-  const heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
-  request.once("close", () => {
-    clearInterval(heartbeat);
-    unsubscribe();
-  });
+  opened = true;
+  for (const event of buffered) emit(event);
+  if (!ended) heartbeat = setInterval(() => response.write(": heartbeat\n\n"), 15_000);
 }
 
 function eventCursor(url, request) {

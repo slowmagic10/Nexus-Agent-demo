@@ -1,6 +1,8 @@
 import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
 import { ToolHost } from "../tools/host.js";
 import { ContextLifecycle } from "./context-lifecycle.js";
+import { completionIssues, completionFeedback, MAX_COMPLETION_CORRECTIONS, RecoverableTaskError } from "./completion-guard.js";
+import { resolveObjectiveMode, isObjectiveStatusQuestion } from "./objective-continuation.js";
 
 export class AgentRuntime {
   constructor({
@@ -20,6 +22,7 @@ export class AgentRuntime {
     memorySearchTimeoutMs = 2_000,
     memoryReconcileTimeoutMs = 2_000,
     contextSummaryTimeoutMs = 15_000,
+    modelRetryDelaysMs,
   }) {
     if (!session) throw new Error("AgentRuntime 需要 AgentSession");
     if (!toolHost && !tools) throw new Error("AgentRuntime 需要 Tool Host");
@@ -60,6 +63,7 @@ export class AgentRuntime {
       maxInputTokens,
       memorySearchTimeoutMs,
       contextSummaryTimeoutMs,
+      modelRetryDelaysMs,
     });
     if (typeof this.contextLifecycle.startTurn !== "function") {
       throw new Error("AgentRuntime Context Lifecycle Interface 无效");
@@ -74,7 +78,8 @@ export class AgentRuntime {
     return this.session.dispatch(action);
   }
 
-  async runTurn(content, requestApproval, { objective } = {}) {
+  async runTurn(content, requestApproval, { objective, objectiveMode } = {}) {
+    const resolvedObjectiveMode = resolveObjectiveMode(this.state, content, { objective, objectiveMode });
     const abortController = new AbortController();
     this.abortController = abortController;
     try {
@@ -96,17 +101,30 @@ export class AgentRuntime {
     }
     if (["completed", "failed", "cancelled"].includes(this.state.phase)) await this.dispatch({ type: "READY" });
     const tokenBaseline = this.state.metrics.totalTokens || 0;
-    await this.dispatch({ type: "USER_MESSAGE", content, ...(objective ? { objective } : {}) });
+    await this.dispatch({
+      type: "USER_MESSAGE",
+      content,
+      objectiveMode: resolvedObjectiveMode,
+      ...(resolvedObjectiveMode === "continue" && isObjectiveStatusQuestion(content) ? { preserveBlockedReason: true } : {}),
+      ...(objective ? { objective } : {}),
+    });
     const turnSourceCursor = this.session.cursor;
+    let completionCorrections = 0;
 
     try {
       const contextTurn = await this.contextLifecycle.startTurn({
         query: content,
         signal: abortController.signal,
+        assertCanRequest: () => {
+          if (this.state.metrics.totalTokens - tokenBaseline >= this.maxTokensPerTurn) {
+            throw new RecoverableTaskError(`本轮累计 Token 用量已达到预算 ${this.maxTokensPerTurn}；不能追加模型请求，已保留目标与计划。`, "model_token_budget");
+          }
+        },
       });
       for (let index = 0; index < this.maxSteps; index += 1) {
         throwIfAborted(abortController.signal);
         const response = await contextTurn.completeModelStep();
+        throwIfAborted(abortController.signal);
 
         const assistantMessage = {
           role: "assistant",
@@ -126,6 +144,30 @@ export class AgentRuntime {
         assertNormalModelFinish(response);
 
         if (!response.toolCalls.length) {
+          throwIfAborted(abortController.signal);
+          if (this.state.plan?.blockedReason) {
+            throw new RecoverableTaskError(`任务存在阻塞：${this.state.plan.blockedReason}`, "objective_blocked");
+          }
+          const reasons = completionIssues(this.state, response.text);
+          if (reasons.length) {
+            if (completionCorrections >= MAX_COMPLETION_CORRECTIONS) {
+              throw new RecoverableTaskError(`模型提前结束，自动纠正 ${MAX_COMPLETION_CORRECTIONS} 次后仍未满足完成条件；已保留目标与计划，可继续任务。`, "completion_validation_exhausted");
+            }
+            if (this.state.metrics.totalTokens - tokenBaseline >= this.maxTokensPerTurn) {
+              throw new RecoverableTaskError(`本轮累计 Token 用量已达到预算 ${this.maxTokensPerTurn}；无法追加完成纠正请求，任务尚未完成。`, "completion_token_budget");
+            }
+            if (index + 1 >= this.maxSteps) {
+              throw new RecoverableTaskError(`达到最大步骤数 ${this.maxSteps}；任务未通过完成检查，已保留目标与计划。`, "completion_step_budget");
+            }
+            completionCorrections += 1;
+            await this.dispatch({
+              type: "COMPLETION_REJECTED",
+              attempt: completionCorrections,
+              reasons,
+              message: completionFeedback(reasons, completionCorrections),
+            });
+            continue;
+          }
           await this.dispatch({ type: "COMPLETED" });
           try {
             await this.flushMemory({
@@ -161,7 +203,11 @@ export class AgentRuntime {
       if (abortController.signal.aborted) {
         await this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务" });
       } else {
-        await this.dispatch({ type: "FAILED", error: redactSensitiveText(error.message) });
+        await this.dispatch({
+          type: "FAILED",
+          error: redactSensitiveText(error.message),
+          ...(error instanceof RecoverableTaskError ? { recoverable: true, reason: error.reason } : {}),
+        });
       }
       return this.state;
     } finally {

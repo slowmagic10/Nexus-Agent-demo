@@ -416,6 +416,7 @@ export function createToolRegistry({
     capability: scopedCapability("session", "write", "R0", false),
     parameters: objectSchema({
       explanation: { type: "string", description: "可选的计划调整原因" },
+      blocked_reason: { type: "string", description: "仅当存在无法自行解决的真实阻塞或必须由用户提供的信息时填写具体原因（1–1000 字符）；保留未完成步骤，最终说明阻塞。后续正常更新不填写此字段会清除阻塞。" },
       plan: {
         type: "array",
         items: {
@@ -429,9 +430,10 @@ export function createToolRegistry({
         },
       },
     }, ["plan"]),
-    execute: async ({ explanation = "", plan }, context) => {
-      await context.dispatch({ type: "PLAN_UPDATED", explanation, steps: plan });
+    execute: async ({ explanation = "", plan, blocked_reason }, context) => {
+      await context.dispatch({ type: "PLAN_UPDATED", explanation, steps: plan, ...(blocked_reason !== undefined ? { blockedReason: blocked_reason } : {}) });
       const active = plan.find((item) => item.status === "in_progress");
+      if (blocked_reason) return `计划已保留，已记录阻塞：${blocked_reason}。请在最终答复说明阻塞与需要的输入，不要把未完成步骤标为 completed。`;
       return `计划已更新（${plan.length} 步）${active ? `，当前：${active.step}` : ""}`;
     },
   });

@@ -79,6 +79,66 @@ export function contextOverflowInfo(error) {
   };
 }
 
+const TRANSIENT_HTTP_STATUSES = new Set([408, 429, 500, 502, 503, 504]);
+const PERMANENT_PROVIDER_CODES = new Set([
+  "invalid_api_key", "authentication_error", "permission_denied", "access_denied",
+  "permission_error", "model_not_found", "invalid_request_error", "invalid_request",
+  "insufficient_quota", "quota_exceeded", "billing_not_active", "billing_error",
+  "credit_balance_exhausted", "payment_required",
+]);
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ECONNABORTED", "EPIPE", "ETIMEDOUT", "EAI_AGAIN",
+  "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+  "UND_ERR_BODY_TIMEOUT", "UND_ERR_SOCKET",
+]);
+const SAFE_PROVIDER_CODES = new Set([
+  ...PERMANENT_PROVIDER_CODES, "rate_limit_exceeded", "rate_limit_error", "server_error",
+  "internal_server_error", "overloaded_error", "timeout", "request_timeout",
+]);
+
+// Only fixed protocol fields cross the durable boundary. Never copy messages,
+// endpoints, headers, arbitrary provider codes, or raw transport causes here.
+export function providerRequestFailureInfo(error) {
+  if (!error || typeof error !== "object" || contextOverflowInfo(error)) return null;
+  const status = Number.isInteger(error.status) && error.status >= 400 && error.status <= 599 ? error.status : null;
+  const providerCode = String(error.providerCode || "").trim().toLowerCase();
+  const providerType = String(error.providerType || "").trim().toLowerCase();
+  if (status !== null) {
+    const permanentCode = [providerCode, providerType].find((code) => PERMANENT_PROVIDER_CODES.has(code));
+    const quotaMessage = /insufficient[\s_-]*quota|exceed(?:ed|s)? (?:your )?(?:current )?quota|(?:credit|account) balance (?:is )?(?:too low|exhausted|insufficient)|billing (?:is )?(?:not active|disabled)|余额不足|配额(?:耗尽|用尽)/i.test(String(error.message || ""));
+    const systemPosition = /system message must be at the beginning/i.test(String(error.message || ""));
+    return {
+      kind: "http_error",
+      status,
+      code: permanentCode || (quotaMessage ? "insufficient_quota" : systemPosition ? "system_message_position" : SAFE_PROVIDER_CODES.has(providerCode) ? providerCode : `http_${status}`),
+      retryable: !permanentCode && !quotaMessage && !systemPosition && TRANSIENT_HTTP_STATUSES.has(status),
+    };
+  }
+
+  const chain = [];
+  const queue = [error];
+  for (let index = 0; index < queue.length && chain.length < 8; index += 1) {
+    const item = queue[index];
+    if (!item || typeof item !== "object" || chain.includes(item)) continue;
+    chain.push(item);
+    if (item.cause) queue.push(item.cause);
+    if (Array.isArray(item.errors)) queue.push(...item.errors.slice(0, 8));
+  }
+  if (chain.some((item) => item.name === "AbortError")) return null;
+  const codes = chain.map((item) => typeof item.code === "string" ? item.code.toUpperCase() : null).filter(Boolean);
+  const networkCode = codes.find((code) => TRANSIENT_NETWORK_CODES.has(code));
+  // A known permanent cause (for example expired TLS or ENOTFOUND) must not be
+  // promoted to transient merely because fetch's outer error is generic.
+  if (codes.some((code) => !TRANSIENT_NETWORK_CODES.has(code))) {
+    return { kind: "transport_error", status: null, code: "non_transient_transport", retryable: false };
+  }
+  if (networkCode) return { kind: "transport_error", status: null, code: networkCode, retryable: true };
+  if (error.name === "TypeError" && /^fetch failed$/i.test(String(error.message || "").trim())) {
+    return { kind: "transport_error", status: null, code: "fetch_failed", retryable: true };
+  }
+  return null;
+}
+
 function matchesContextOverflow({ status, providerCode, providerType, declaredKind, message }) {
   const normalizedCode = String(providerCode || "").trim().toLowerCase();
   const normalizedType = String(providerType || "").trim().toLowerCase();

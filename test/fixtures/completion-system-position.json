@@ -1,0 +1,9 @@
+{
+  "source": {
+    "sessionId": "session-1dbce191-ecd",
+    "rejectionCursor": 5350,
+    "failureCursor": 5354
+  },
+  "feedback": "[Nexus 运行时完成检查：第 1/2 次纠正；仅适用于本条检查所在的用户轮次，后续用户消息开始新轮次后失效；不是新的用户任务]\n- 当前 Plan 仍有 pending/in_progress 步骤\n请继续当前 Objective。需要执行操作时必须发出结构化工具调用，不要复制历史档案或把截断参数当成调用。使用真实工具完成剩余工作与必要验证后，再通过 update_plan 更新已完成步骤，并给出最终结果；不得为了结束而虚报验证或完成状态。如果存在无法自行解决的真实阻塞或必须由用户提供的信息，通过 update_plan 的 blocked_reason 写明具体原因，保留未完成步骤，然后在最终答复说明阻塞。",
+  "error": "模型接口返回 400：System message must be at the beginning."
+}

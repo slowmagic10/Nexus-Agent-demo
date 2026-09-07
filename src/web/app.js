@@ -9,6 +9,7 @@ import { createTaskNavigation } from "/task-navigation.js";
 import { createInspectorShell } from "/inspector-shell.js";
 import { createReviewWorkspace } from "/review-workspace.js";
 import { createTaskThread } from "/task-thread.js";
+import { createTaskDeletion } from "/task-deletion.js";
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
@@ -20,10 +21,14 @@ const state = {
   journalEvents: [],
   journalDirty: true,
   sessionProjects: new Map(),
+  sessions: new Map(),
+  deletedSessionIds: new Set(),
   lastProjectId: null,
 };
 let runtimeLoadVersion = 0;
 let sessionSelectionVersion = 0;
+let sessionsLoadVersion = 0;
+let selectingSessionId = null;
 
 const elements = {
   sessionList: $("#session-list"),
@@ -40,6 +45,7 @@ const elements = {
   titleForm: $("#title-form"),
   titleInput: $("#title-input"),
   renameSession: $("#rename-session"),
+  deleteSession: $("#delete-session"),
   meta: $("#session-meta"),
   phaseDot: $("#phase-dot"),
   input: $("#message-input"),
@@ -105,8 +111,9 @@ $("#mobile-nav-toggle").addEventListener("click", () => inspectorShell.close());
 const sessionProjection = createSessionProjection({
   readSession: (id) => api(`/sessions/${encodeURIComponent(id)}`),
   eventSourceFactory: (url) => new EventSource(url),
-  onChange: ({ session }) => renderSession(session),
+  onChange: ({ session }) => session ? renderSession(session) : renderWelcome(),
   onEvent: handleSessionEvent,
+  onDeleted: handleDeletedSessions,
   onDisconnect: (error) => toast(error.message),
 });
 const composer = createComposer({
@@ -195,10 +202,22 @@ const taskThread = createTaskThread({
     composer.setDraft(prompt, { focus: true });
   },
 });
+const taskDeletion = createTaskDeletion({
+  dialog: $("#delete-task-dialog"),
+  form: $("#delete-task-form"),
+  titleNode: $("#delete-task-name"),
+  runningNode: $("#delete-task-running"),
+  errorNode: $("#delete-task-error"),
+  cancelButton: $("#delete-task-cancel"),
+  submitButton: $("#delete-task-submit"),
+  deleteSession: ({ sessionId }) => api(`/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }, { silent: true }),
+  onDeleted: handleDeletedSessions,
+});
 window.addEventListener("beforeunload", () => {
   composer.destroy();
   projectPicker.destroy();
   taskThread.destroy();
+  taskDeletion.destroy();
   sessionProjection.close();
   reviewWorkspace.destroy();
   taskNavigation.destroy();
@@ -217,6 +236,7 @@ elements.permissionTrigger.addEventListener("click", togglePermissionMenu);
 elements.permissionMenu.addEventListener("click", choosePermissionMode);
 elements.agentProfileSelect.addEventListener("change", chooseAgentProfile);
 elements.renameSession.addEventListener("click", openTitleEditor);
+elements.deleteSession.addEventListener("click", () => requestTaskDeletion(sessionProjection.session));
 elements.titleForm.addEventListener("submit", saveDisplayTitle);
 $("#title-cancel").addEventListener("click", closeTitleEditor);
 elements.dangerConfirmAccept.addEventListener("click", confirmDangerFullAccess);
@@ -297,7 +317,15 @@ async function loadRuntime(projectId = null, { preserveSelection = false, select
 }
 
 async function loadSessions() {
+  const version = ++sessionsLoadVersion;
   const { sessions } = await api("/sessions");
+  if (version !== sessionsLoadVersion) return;
+  state.sessions = new Map(sessions.filter((session) => !state.deletedSessionIds.has(session.id)).map((session) => [session.id, session]));
+  renderSessionList();
+}
+
+function renderSessionList() {
+  const sessions = [...state.sessions.values()];
   state.sessionProjects = new Map(sessions
     .filter((session) => session.project?.id)
     .map((session) => [session.id, session.project.id]));
@@ -306,9 +334,13 @@ async function loadSessions() {
 }
 
 function sessionButton(session) {
+  const item = document.createElement("div");
+  item.className = `session-item${session.id === sessionProjection.sessionId ? " active" : ""}`;
+  item.dataset.sessionId = session.id;
   const button = document.createElement("button");
-  button.className = `session-item${session.id === sessionProjection.sessionId ? " active" : ""}`;
-  button.dataset.sessionId = session.id;
+  button.type = "button";
+  button.className = "session-open";
+  if (session.id === sessionProjection.sessionId) button.setAttribute("aria-current", "true");
 
   const row = document.createElement("span");
   row.className = "session-name-row";
@@ -325,7 +357,77 @@ function sessionButton(session) {
   button.addEventListener("click", () => {
     void selectSession(session.id).catch((error) => toast(error.message || "无法打开任务"));
   });
-  return button;
+  const remove = document.createElement("button");
+  remove.type = "button";
+  remove.className = "session-delete";
+  remove.textContent = "删除";
+  remove.title = `删除任务：${session.title || "新任务"}`;
+  remove.setAttribute("aria-label", remove.title);
+  remove.addEventListener("click", () => requestTaskDeletion(state.sessions.get(session.id) || session));
+  item.append(button, remove);
+  return item;
+}
+
+function requestTaskDeletion(session) {
+  if (!session || state.deletedSessionIds.has(session.id)) return;
+  closeTitleEditor();
+  closePermissionMenu();
+  taskNavigation.close();
+  void taskDeletion.open({ id: session.id, title: session.displayTitle || session.title || "新任务", phase: session.phase });
+}
+
+function handleDeletedSessions({ sessionId, deletedSessionIds = [sessionId] }) {
+  const ids = new Set([sessionId, ...deletedSessionIds].filter(Boolean));
+  const changed = [...ids].some((id) => !state.deletedSessionIds.has(id));
+  for (const id of ids) {
+    state.deletedSessionIds.add(id);
+    state.sessions.delete(id);
+  }
+  sessionsLoadVersion += 1;
+  const pendingWasDeleted = selectingSessionId && ids.has(selectingSessionId);
+  if (pendingWasDeleted) {
+    sessionSelectionVersion += 1;
+    selectingSessionId = null;
+    sessionProjection.close();
+  }
+  if (ids.has(sessionProjection.sessionId) && !selectingSessionId) {
+    sessionSelectionVersion += 1;
+    sessionProjection.clear();
+  } else if (pendingWasDeleted && sessionProjection.sessionId) {
+    void selectSession(sessionProjection.sessionId).catch((error) => toast(error.message));
+  }
+  renderSessionList();
+  if (changed) {
+    toast("任务已删除");
+    void loadSessions().catch(() => toast("任务已删除，列表暂时无法刷新"));
+  }
+}
+
+function renderWelcome() {
+  clearTimeout(evaluationTimer);
+  closeTitleEditor();
+  closePermissionMenu();
+  inspectorShell.close();
+  elements.title.textContent = "准备开始";
+  document.title = "Nexus Agent";
+  elements.phaseDot.className = "phase-dot idle";
+  elements.meta.replaceChildren();
+  elements.inspectorTitle.textContent = "本地工作区";
+  elements.export.disabled = true;
+  elements.renameSession.disabled = true;
+  elements.deleteSession.disabled = true;
+  composer.update();
+  composer.setDraft("");
+  taskThread.showWelcome();
+  reviewWorkspace.reset();
+  renderReviewControl(reviewWorkspace.snapshot());
+  renderObjectivePlan(null, [], []);
+  renderContextObservability({});
+  stageJournal([]);
+  renderExecutionOverview(null, null);
+  renderFileChangeOverview(null, null);
+  renderPermissionControl();
+  void Promise.allSettled([loadEvaluation(), loadMemories(), loadCandidates(), loadGrants()]);
 }
 
 async function createSession() {
@@ -352,7 +454,9 @@ async function createProjectSession(projectId) {
 }
 
 async function selectSession(id) {
+  if (state.deletedSessionIds.has(id)) return null;
   const selectionTicket = ++sessionSelectionVersion;
+  selectingSessionId = id;
   const previousSessionId = sessionProjection.sessionId;
   // Invalidate an older baseline request immediately. Without this, a slow
   // Project runtime lookup for A can start select(A) after a later click on B.
@@ -368,6 +472,7 @@ async function selectSession(id) {
     if (selectionTicket !== sessionSelectionVersion) return null;
     const selected = await sessionProjection.select(id);
     if (!selected || selectionTicket !== sessionSelectionVersion) return null;
+    selectingSessionId = null;
     await Promise.allSettled([
       loadSessions(),
       loadGrants(),
@@ -378,6 +483,11 @@ async function selectSession(id) {
     return selected;
   } catch (error) {
     if (selectionTicket !== sessionSelectionVersion) return null;
+    selectingSessionId = null;
+    if (state.deletedSessionIds.has(sessionProjection.sessionId)) {
+      sessionProjection.clear();
+      throw error;
+    }
     if (selectionTicket === sessionSelectionVersion
       && previousSessionId
       && sessionProjection.sessionId === previousSessionId) {
@@ -420,6 +530,7 @@ function renderSession(session) {
   });
   elements.export.disabled = false;
   elements.renameSession.disabled = false;
+  elements.deleteSession.disabled = false;
   renderPermissionControl();
   setGrantActionAvailability(busy);
 
@@ -607,11 +718,17 @@ function permissionLabel(profile) {
 }
 
 function updateSelectedSession(session, title) {
+  if (state.sessions.has(session.id)) {
+    state.sessions.set(session.id, { ...state.sessions.get(session.id), title, phase: session.phase });
+  }
   const item = elements.sessionList.querySelector(`[data-session-id="${CSS.escape(session.id)}"]`);
   if (!item) return;
   item.querySelector("strong").textContent = title;
   item.querySelector(".session-phase").className = `session-phase ${phaseClass(session.phase)}`;
   item.querySelector(".session-detail").textContent = `${phaseLabel(session.phase)} · 刚刚`;
+  const remove = item.querySelector(".session-delete");
+  remove.title = `删除任务：${title}`;
+  remove.setAttribute("aria-label", remove.title);
 }
 
 function openTitleEditor() {
@@ -1241,6 +1358,7 @@ function renderEvents(events) {
 
 function isOverlayOpen() {
   return !elements.dangerConfirm.classList.contains("hidden")
+    || taskDeletion.isOpen()
     || projectPicker.isOpen()
     || state.editingTitle
     || inspectorShell.isModalOpen()
@@ -1658,7 +1776,9 @@ async function api(url, options = {}, { silent = false } = {}) {
   const payload = await response.json();
   if (!response.ok) {
     if (!silent) toast(payload.error || `请求失败 ${response.status}`);
-    throw new Error(payload.error);
+    const error = new Error(payload.error || `请求失败 ${response.status}`);
+    error.status = response.status;
+    throw error;
   }
   return payload;
 }

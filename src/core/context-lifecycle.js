@@ -1,5 +1,7 @@
-import { contextOverflowInfo } from "../providers/errors.js";
+import { setTimeout as delay } from "node:timers/promises";
+import { contextOverflowInfo, providerRequestFailureInfo } from "../providers/errors.js";
 import { redactSensitiveText } from "../security/redact.js";
+import { RecoverableTaskError } from "./completion-guard.js";
 import {
   createModelContextSummarizer,
   normalizeSemanticSummary,
@@ -9,6 +11,7 @@ import {
 const DEFAULT_MAX_INPUT_TOKENS = 32_000;
 const DEFAULT_MEMORY_SEARCH_TIMEOUT_MS = 2_000;
 const DEFAULT_CONTEXT_SUMMARY_TIMEOUT_MS = 15_000;
+const DEFAULT_MODEL_RETRY_DELAYS_MS = Object.freeze([250, 1_000]);
 
 // Deep Module for the complete lifecycle of model-visible context within one turn.
 export class ContextLifecycle {
@@ -23,6 +26,7 @@ export class ContextLifecycle {
     maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
     memorySearchTimeoutMs = DEFAULT_MEMORY_SEARCH_TIMEOUT_MS,
     contextSummaryTimeoutMs = DEFAULT_CONTEXT_SUMMARY_TIMEOUT_MS,
+    modelRetryDelaysMs = DEFAULT_MODEL_RETRY_DELAYS_MS,
   } = {}) {
     if (!session || typeof session.prepareModelRequest !== "function" || typeof session.dispatch !== "function") {
       throw new Error("Context Lifecycle 需要 Agent Session");
@@ -36,6 +40,10 @@ export class ContextLifecycle {
     validatePositiveInteger(maxInputTokens, "maxInputTokens");
     validatePositiveInteger(memorySearchTimeoutMs, "memorySearchTimeoutMs");
     validatePositiveInteger(contextSummaryTimeoutMs, "contextSummaryTimeoutMs");
+    if (!Array.isArray(modelRetryDelaysMs) || modelRetryDelaysMs.length !== 2
+      || modelRetryDelaysMs.some((value) => !Number.isSafeInteger(value) || value < 0 || value > 30_000)) {
+      throw new Error("Context Lifecycle modelRetryDelaysMs 必须包含两个 0 到 30000 的整数");
+    }
 
     this.session = session;
     this.provider = provider;
@@ -50,16 +58,18 @@ export class ContextLifecycle {
     this.maxInputTokens = maxInputTokens;
     this.memorySearchTimeoutMs = memorySearchTimeoutMs;
     this.contextSummaryTimeoutMs = contextSummaryTimeoutMs;
+    this.modelRetryDelaysMs = [...modelRetryDelaysMs];
   }
 
-  async startTurn({ query, signal } = {}) {
+  async startTurn({ query, signal, assertCanRequest = () => {} } = {}) {
+    if (typeof assertCanRequest !== "function") throw new Error("Context Lifecycle assertCanRequest 必须是函数");
     const turnSignal = signal || new AbortController().signal;
     await this.#retrieveMemory(String(query || ""), turnSignal);
     let effectiveMaxInputTokens = this.maxInputTokens;
 
     return Object.freeze({
       completeModelStep: async () => {
-        const completion = await this.#completeModelStep(turnSignal, effectiveMaxInputTokens);
+        const completion = await this.#completeModelStep(turnSignal, effectiveMaxInputTokens, assertCanRequest);
         effectiveMaxInputTokens = completion.maxInputTokens;
         return completion.response;
       },
@@ -85,10 +95,10 @@ export class ContextLifecycle {
     await this.session.dispatch({ type: "MEMORY_CONTEXT_SET", query, memories, retrieval });
   }
 
-  async #completeModelStep(signal, maxInputTokens) {
+  async #completeModelStep(signal, maxInputTokens, assertCanRequest) {
     let prepared = this.#prepareRequest(maxInputTokens);
     prepared = await this.#prepareDurableSummary(prepared, signal, maxInputTokens);
-    return this.#requestWithContextReplan(prepared, signal);
+    return this.#requestWithContextReplan(prepared, signal, assertCanRequest);
   }
 
   #prepareRequest(maxInputTokens) {
@@ -163,12 +173,19 @@ export class ContextLifecycle {
     return current;
   }
 
-  async #requestWithContextReplan(prepared, signal) {
+  async #requestWithContextReplan(prepared, signal, assertCanRequest) {
     let current = prepared;
-    for (let attempt = 0; attempt < 2; attempt += 1) {
+    let replanAttempts = 0;
+    let retries = 0;
+    // Two transport retries and one context replan share this model step. Neither
+    // counter resets when the other recovery path runs (at most four requests).
+    while (true) {
+      signal.throwIfAborted();
+      assertCanRequest();
       const { contextPlan, ...request } = current;
       await this.session.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
       await this.session.dispatch({ type: "MODEL_REQUESTED" });
+      signal.throwIfAborted();
       const started = performance.now();
       try {
         const response = await this.requestModel({ ...request, signal });
@@ -183,12 +200,51 @@ export class ContextLifecycle {
       } catch (error) {
         if (signal.aborted) throw error;
         const overflow = contextOverflowInfo(error);
-        if (!overflow) throw error;
+        if (!overflow) {
+          let failure = providerRequestFailureInfo(error);
+          if (!failure) throw error;
+          let failedUsage;
+          try {
+            failedUsage = failedRequestUsage(error, contextPlan, this.session.state, failure.retryable);
+          } catch {
+            failure = { kind: "protocol_error", status: failure.status, code: "invalid_token_usage", retryable: false };
+            failedUsage = { usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, usageEstimated: true };
+          }
+          await this.session.dispatch({
+            type: "MODEL_REQUEST_FAILED",
+            contextHash: contextPlan.contextHash,
+            failure,
+            ...failedUsage,
+            durationMs: Math.round(performance.now() - started),
+          });
+          if (this.session.state.modelStream) {
+            await this.session.dispatch({ type: "MODEL_STREAM_DISCARDED", reason: failure.retryable ? "model_retry" : "model_failure" });
+          }
+          if (!failure.retryable) {
+            throw new RecoverableTaskError(`模型请求失败（${describeFailure(failure)}）；已保留目标与计划，请修正接口配置或响应问题后继续。`, "model_request_failed");
+          }
+          if (retries >= this.modelRetryDelaysMs.length) {
+            await this.session.dispatch({ type: "MODEL_RETRY_EXHAUSTED", retries, failure, reason: "attempt_limit" });
+            throw new RecoverableTaskError(`模型请求因暂时性故障失败（${describeFailure(failure)}），自动重试 ${retries} 次后仍失败；已保留目标与计划，可稍后继续。`, "model_retry_exhausted");
+          }
+          try {
+            assertCanRequest();
+          } catch (budgetError) {
+            await this.session.dispatch({ type: "MODEL_RETRY_EXHAUSTED", retries, failure, reason: "token_budget" });
+            throw budgetError;
+          }
+          const delayMs = this.modelRetryDelaysMs[retries];
+          retries += 1;
+          await this.session.dispatch({ type: "MODEL_RETRY_REQUESTED", attempt: retries, maxRetries: this.modelRetryDelaysMs.length, delayMs, failure });
+          signal.throwIfAborted();
+          await delay(delayMs, undefined, { signal });
+          continue;
+        }
         if (this.session.state.modelStream) {
           await this.session.dispatch({ type: "MODEL_STREAM_DISCARDED", reason: "context_replan" });
         }
         const durationMs = Math.round(performance.now() - started);
-        if (attempt > 0) {
+        if (replanAttempts > 0) {
           await this.session.dispatch({
             type: "MODEL_CONTEXT_REPLAN_EXHAUSTED",
             contextHash: contextPlan.contextHash,
@@ -196,9 +252,10 @@ export class ContextLifecycle {
             durationMs,
             overflow,
           });
-          throw new Error("模型上下文在自动缩减并重试一次后仍然超限；请缩短当前消息或提高模型 Context Window");
+          throw new RecoverableTaskError("模型上下文在自动缩减并重试一次后仍然超限；请缩短当前消息或提高模型 Context Window", "context_replan_exhausted");
         }
 
+        replanAttempts += 1;
         const nextMaxInputTokens = nextOverflowBudget(contextPlan, overflow);
         await this.session.dispatch({
           type: "MODEL_CONTEXT_REPLAN_REQUESTED",
@@ -223,8 +280,55 @@ export class ContextLifecycle {
         current = replanned;
       }
     }
-    throw new Error("模型上下文自动重规划未能完成");
   }
+}
+
+function describeFailure(failure) {
+  const detail = failure.code === "system_message_position" ? "system_message_position：system 消息必须位于对话开头" : failure.code;
+  return `${failure.status ? `HTTP ${failure.status}，` : ""}${detail}`;
+}
+
+function failedRequestUsage(error, contextPlan, state, estimateInput) {
+  const partialText = (state.modelStreamChunks || []).join("");
+  const supplied = error.usage;
+  if (supplied != null) {
+    if (typeof supplied !== "object" || Array.isArray(supplied)) throw new Error("Provider Token usage 必须是对象");
+    for (const field of ["inputTokens", "prompt_tokens", "outputTokens", "completion_tokens", "totalTokens", "total_tokens"]) {
+      if (supplied[field] !== undefined) assertTokenCount(supplied[field], field);
+    }
+  }
+  const reportedTotal = supplied?.totalTokens ?? supplied?.total_tokens;
+  if (reportedTotal !== undefined) {
+    const reportedInput = supplied.inputTokens ?? supplied.prompt_tokens;
+    const reportedOutput = supplied.outputTokens ?? supplied.completion_tokens;
+    if ((reportedInput !== undefined && reportedInput > reportedTotal)
+      || (reportedOutput !== undefined && reportedOutput > reportedTotal)
+      || (reportedInput !== undefined && reportedOutput !== undefined && reportedInput + reportedOutput !== reportedTotal)) {
+      throw new Error("Provider Token usage 分项与总量不一致");
+    }
+    const outputTokens = reportedOutput ?? (reportedInput !== undefined
+      ? reportedTotal - reportedInput
+      : Math.min(reportedTotal, Math.ceil(partialText.length / 4)));
+    return {
+      usage: { inputTokens: reportedTotal - outputTokens, outputTokens, totalTokens: reportedTotal },
+      // A reported total plus either component determines the other exactly.
+      usageEstimated: reportedInput === undefined && reportedOutput === undefined,
+    };
+  }
+  if (supplied && (supplied.inputTokens !== undefined || supplied.prompt_tokens !== undefined
+    || supplied.outputTokens !== undefined || supplied.completion_tokens !== undefined)) {
+    const usage = normalizeUsage(supplied, [], partialText);
+    const hasInput = supplied.inputTokens !== undefined || supplied.prompt_tokens !== undefined;
+    const hasOutput = supplied.outputTokens !== undefined || supplied.completion_tokens !== undefined;
+    if (!hasInput) usage.inputTokens = estimateInput ? contextPlan.estimatedInputTokens : 0;
+    usage.totalTokens = usage.inputTokens + usage.outputTokens;
+    assertTokenCount(usage.totalTokens, "totalTokens");
+    return { usage, usageEstimated: !hasInput || !hasOutput };
+  }
+  const inputTokens = estimateInput ? contextPlan.estimatedInputTokens : 0;
+  const outputTokens = Math.ceil(partialText.length / 4);
+  assertTokenCount(inputTokens, "inputTokens");
+  return { usage: { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }, usageEstimated: true };
 }
 
 function validatePositiveInteger(value, label) {

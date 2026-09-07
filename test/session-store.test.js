@@ -297,7 +297,7 @@ test("旧数据库会按顺序执行显式 schema migration", async () => {
     assert.ok(eventColumns.includes("schema_version"));
     assert.ok(memoryEventColumns.includes("schema_version"));
     assert.ok(mutationColumns.includes("request_hash"));
-    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
     assert.ok(store.db.prepare("PRAGMA table_info(memories)").all().some((column) => column.name === "pinned"));
     assert.ok(store.db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_checkpoints'",

@@ -197,6 +197,47 @@ export class SessionStore {
     ));
   }
 
+  sessionDeletionIds(id) {
+    const root = this.db.prepare("SELECT workspace FROM sessions WHERE id = ?").get(id);
+    if (!root || root.workspace !== this.workspace) return [];
+    const rows = this.db.prepare(`
+      WITH RECURSIVE owned(id) AS (
+        SELECT id FROM sessions WHERE id = ? AND workspace = ?
+        UNION
+        SELECT child.id FROM sessions child JOIN owned parent
+          ON json_extract(child.state_json, '$.lineage.parentSessionId') = parent.id
+        WHERE child.workspace = ?
+          AND json_extract(child.state_json, '$.lineage.kind') = 'delegation'
+      )
+      SELECT id FROM owned
+    `).all(id, this.workspace, this.workspace);
+    return rows.map((row) => row.id);
+  }
+
+  deleteSessions(ids) {
+    if (!Array.isArray(ids) || !ids.length || ids.some((id) => typeof id !== "string" || !id)) {
+      throw new Error("删除会话需要非空 ID 列表");
+    }
+    const deletedAt = new Date().toISOString();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const exists = this.db.prepare("SELECT 1 FROM sessions WHERE id = ? AND workspace = ?");
+      const tombstone = this.db.prepare("INSERT INTO deleted_sessions (id, deleted_at) VALUES (?, ?)");
+      const remove = this.db.prepare("DELETE FROM sessions WHERE id = ? AND workspace = ?");
+      for (const id of new Set(ids)) {
+        if (!exists.get(id, this.workspace)) throw new Error(`未找到会话：${id}`);
+        tombstone.run(id, deletedAt);
+        // Foreign keys cascade to journal events, checkpoints, and artifacts.
+        remove.run(id, this.workspace);
+      }
+      this.db.exec("COMMIT");
+      return [...new Set(ids)];
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
   loadAt(id, cursor) {
     if (!Number.isInteger(cursor) || cursor < 1) throw new Error("分支 cursor 必须是正整数");
     const row = this.db.prepare("SELECT 1 AS found FROM sessions WHERE id = ?").get(id);
