@@ -178,6 +178,9 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .status-chip.phase.failed { color: var(--danger); }
 .status-chip.profile-drift { color: var(--warning); cursor: help; }
 .status-chip.profile-drift.high { color: var(--danger); }
+.task-runtime-timer { margin-top: 5px; padding-left: 16px; color: var(--muted); font-size: 12px; line-height: 1.5; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.task-runtime-timer[hidden] { display: none; }
+.task-runtime-timer[data-running="true"] { color: var(--accent); }
 .actions { display: flex; gap: 5px; }
 .icon-button, .close-button {
   padding: 7px 10px;
@@ -1001,6 +1004,7 @@ html[data-theme="light"] .toast { background: #ffffff; border-color: #d4d9d1; }
   .delete-session, .rename-session { min-height: 36px; padding-inline: 7px; }
   .title-editor input { flex: 1; min-width: 0; width: auto; }
   .status-line { display: block; margin-top: 2px; padding-left: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .task-runtime-timer { padding-left: 12px; }
   .status-chip { white-space: nowrap; }
   .status-chip + .status-chip::before { margin-left: 6px; }
   .actions { grid-area: actions; justify-self: end; gap: 0; }

@@ -4,7 +4,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js", "/task-deletion.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js", "/task-deletion.js", "/task-runtime-timer.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);

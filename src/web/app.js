@@ -10,6 +10,7 @@ import { createInspectorShell } from "/inspector-shell.js";
 import { createReviewWorkspace } from "/review-workspace.js";
 import { createTaskThread } from "/task-thread.js";
 import { createTaskDeletion } from "/task-deletion.js";
+import { createTaskRuntimeTimer } from "/task-runtime-timer.js";
 
 const $ = (selector) => document.querySelector(selector);
 const state = {
@@ -213,11 +214,13 @@ const taskDeletion = createTaskDeletion({
   deleteSession: ({ sessionId }) => api(`/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" }, { silent: true }),
   onDeleted: handleDeletedSessions,
 });
+const taskRuntimeTimer = createTaskRuntimeTimer({ root: $("#task-runtime-timer") });
 window.addEventListener("beforeunload", () => {
   composer.destroy();
   projectPicker.destroy();
   taskThread.destroy();
   taskDeletion.destroy();
+  taskRuntimeTimer.destroy();
   sessionProjection.close();
   reviewWorkspace.destroy();
   taskNavigation.destroy();
@@ -404,6 +407,7 @@ function handleDeletedSessions({ sessionId, deletedSessionIds = [sessionId] }) {
 }
 
 function renderWelcome() {
+  taskRuntimeTimer.update(null);
   clearTimeout(evaluationTimer);
   closeTitleEditor();
   closePermissionMenu();
@@ -509,6 +513,7 @@ async function handleSessionEvent(event) {
 }
 
 function renderSession(session) {
+  taskRuntimeTimer.update(session);
   state.lastProjectId = session.project?.id || state.lastProjectId;
   state.selectedPermissionProfile = session.permissionProfile || state.runtime?.permission.defaultProfile || "workspace-auto";
   const title = session.displayTitle || "新任务";

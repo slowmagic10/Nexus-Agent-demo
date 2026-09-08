@@ -124,6 +124,10 @@ _Avoid_: Raw first-message title, duplicate frontend truncation, credential-bear
 Web 工作台在窄屏下拥有任务抽屉的完整行为边界，公开 `open / close / isOpen / destroy`；内部统一处理 breakpoint、backdrop、Escape、ARIA 状态和桌面切换清理。Session 选择与创建只调用其 Interface，不各自操作 Sidebar class；Composer 只通过 `isOpen` 协调 Escape 优先级。桌面 Sidebar 仍是同一任务列表，不维护第二份 Session 状态。
 _Avoid_: Hiding sidebar without an entry point, duplicate mobile session list, page-level responsive event wiring
 
+**Task Runtime Timer**:
+当前选中 Session 的本轮总耗时显示。以 durable `turnStartedAt` 和当前真实 `message.user` 为开始边界，模型、工具、审批与重试阶段连续计时；本轮 `session.turn_completed / session.failed / session.cancelled` 的最终 duration 固定终态显示。新的用户消息开始新轮，完成后 Memory flush、改名及浏览器刷新不会改变最终时长。UI 仅每秒更新计时文本，切换、清空和销毁清理时钟；不产生 Journal Event，也不从 `updatedAt` 或上一轮 metrics 猜测中断时间。
+_Avoid_: Per-step resets, counting time since page load, using last-updated time as completion time, ticking the entire chat DOM, inventing restart downtime as runtime
+
 **Session Checkpoint**:
 从某个 durable event cursor 派生并带校验和的恢复加速投影；它可以丢弃或重建，不能替代 session journal 的事实地位。
 _Avoid_: New baseline, source of truth
