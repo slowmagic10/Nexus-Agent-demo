@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -7,6 +8,7 @@ import {
   assertAgentProfileSnapshot,
   compareAgentProfileSnapshots,
   createAgentProfileSnapshot,
+  deriveAgentProfileSnapshot,
 } from "../src/core/agent-profile.js";
 import { GatewaySessionManager } from "../src/gateway/session-manager.js";
 import { SessionStore } from "../src/persistence/session-store.js";
@@ -131,4 +133,74 @@ function provider(name, model) {
     model,
     complete: async () => ({ text: "完成", toolCalls: [] }),
   };
+}
+
+test("默认请求契约保留 schema 1 和先前 snapshot hash", () => {
+  const baseProvider = { name: "openai-compatible/default", adapter: "openai-compatible", model: "default" };
+  const profile = createAgentProfileSnapshot({ provider: baseProvider, workspace: "/tmp/profile-policy-fixture" });
+  const explicitDefaults = createAgentProfileSnapshot({ provider: { ...baseProvider,
+    contextTargetTokens: null, maxOutputTokens: null, outputTokenParameter: null, streamUsage: false,
+  }, workspace: "/tmp/profile-policy-fixture" });
+  assert.equal(profile.schemaVersion, 1);
+  assert.equal(profile.version, "17bd85027028ca849e861ac3a1529c795e7fd85db4a20904d4da4a3162019696");
+  assert.deepEqual(explicitDefaults, profile);
+  assert.deepEqual(assertAgentProfileSnapshot(profile), profile);
+  assert.deepEqual(deriveAgentProfileSnapshot(profile), profile);
+});
+
+test("非默认请求契约使用 schema 2，逐字段记录 drift 并在派生时保留", () => {
+  const options = { provider: { name: "openai-compatible/base", adapter: "openai-compatible", model: "base" },
+    workspace: "/tmp/profile-contract" };
+  const previous = createAgentProfileSnapshot(options);
+  const current = createAgentProfileSnapshot({ ...options, provider: { ...options.provider,
+    contextTargetTokens: 12_000, maxOutputTokens: 2_000, outputTokenParameter: "max_tokens", streamUsage: true,
+  } });
+  assert.equal(current.schemaVersion, 2);
+  assert.equal(current.provider.contextWindowTokens, 32_000);
+  assert.deepEqual(assertAgentProfileSnapshot(current), current);
+  assert.deepEqual(compareAgentProfileSnapshots(previous, current).map((change) => change.field), [
+    "provider.contextTargetTokens", "provider.maxOutputTokens", "provider.outputTokenParameter", "provider.streamUsage",
+  ]);
+  const child = deriveAgentProfileSnapshot(current, { workspace: "/tmp/profile-contract-child", budgets: { maxSteps: 2 } });
+  assert.equal(child.schemaVersion, 2);
+  assert.deepEqual(child.provider, current.provider);
+  assert.deepEqual(assertAgentProfileSnapshot(child), child);
+  const upgraded = deriveAgentProfileSnapshot(previous, { provider: current.provider });
+  assert.equal(upgraded.schemaVersion, 2);
+  assert.deepEqual(upgraded.provider, current.provider);
+  const cleared = deriveAgentProfileSnapshot(current, { provider: previous.provider });
+  assert.equal(cleared.schemaVersion, 1);
+  assert.deepEqual(cleared.provider, previous.provider);
+});
+
+test("Profile 不接受降级伪装或带合法 hash 的非法 schema 2 契约", () => {
+  const profile = createAgentProfileSnapshot({
+    provider: { name: "openai-compatible/base", adapter: "openai-compatible", model: "base",
+      contextTargetTokens: 10_000 }, workspace: "/tmp/profile-invalid-contract",
+  });
+  const legacy = rehashProfile({ ...profile, schemaVersion: 1 });
+  assert.throws(() => assertAgentProfileSnapshot(legacy), /需要 schema version 2/);
+  for (const changes of [
+    { contextTargetTokens: 0 }, { contextTargetTokens: "10000" }, { contextTargetTokens: 32_001 },
+    { maxOutputTokens: 1_000 }, { streamUsage: "true" }, { streamUsage: false },
+    { contextTargetTokens: null }, { extraUnrecognizedOption: true },
+  ]) {
+    const invalid = rehashProfile({ ...profile, provider: { ...profile.provider, ...changes } });
+    assert.throws(() => assertAgentProfileSnapshot(invalid));
+  }
+  const emptyV2 = rehashProfile({ ...profile, provider: Object.fromEntries(
+    Object.entries(profile.provider).filter(([key]) => key !== "contextTargetTokens")),
+  });
+  assert.throws(() => assertAgentProfileSnapshot(emptyV2), /规范化/);
+});
+
+function rehashProfile(value) {
+  const { version: _version, ...core } = value;
+  return { ...core, version: createHash("sha256").update(stable(core)).digest("hex") };
+}
+
+function stable(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stable).join(",")}]`;
+  return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stable(value[key])}`).join(",")}}`;
 }

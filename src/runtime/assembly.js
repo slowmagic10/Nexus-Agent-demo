@@ -2,6 +2,7 @@
 import path from "node:path";
 import { CapabilityRuntime } from "../capabilities/runtime.js";
 import { createConfiguredAgentProviders } from "../config/composer.js";
+import { configuredContextBudget, resolveContextBudget } from "../providers/request-policy.js";
 import { AgentRuntime } from "../core/agent.js";
 import { createWorkspaceExecution } from "../execution/factory.js";
 import { loadMcpConfig } from "../mcp/config.js";
@@ -171,15 +172,26 @@ class RuntimeAssembly {
     memoryFlushPolicy = null,
     maxSteps,
     maxTokensPerTurn,
-    maxInputTokens = this.config.runtime.maxInputTokens
-      ?? this.config.provider.contextWindowTokens
-      ?? 32_000,
+    contextBudget,
+    maxInputTokens,
   } = {}) {
     this.#assertOpen();
     if (!this.#activation) throw new Error("Runtime Assembly 尚未激活");
     if (!provider || typeof provider.complete !== "function") {
       throw new Error("Runtime Assembly 需要模型 Provider");
     }
+    const boundProfile = [...this.agentProviders.entries()].find(([, item]) => item.provider === provider);
+    const binding = boundProfile?.[1];
+    const descriptor = binding?.descriptor || this.config.provider;
+    const providerBudget = resolveContextBudget(descriptor);
+    const declaredContextBudget = configuredContextBudget(descriptor);
+    // Existing callers can supply a runtime-level override for the plain default
+    // profile. Named profiles and explicit context policies own their own limits.
+    const providerOwnsBudget = binding && (boundProfile[0] !== "default" || declaredContextBudget);
+    const effectiveMaxInputTokens = maxInputTokens ?? (providerOwnsBudget
+      ? providerBudget.maxInputTokens
+      : this.config.runtime.maxInputTokens ?? providerBudget.maxInputTokens);
+    const effectiveContextBudget = contextBudget === undefined ? declaredContextBudget : contextBudget;
     const flushPolicy = memoryFlushPolicy || new MemoryFlushPolicy({
       memory: this.store.memory,
       extractCandidates: createModelMemoryExtractor(provider),
@@ -201,7 +213,8 @@ class RuntimeAssembly {
       flushMemory: (input) => flushPolicy.flush(input),
       maxSteps,
       maxTokensPerTurn,
-      maxInputTokens,
+      maxInputTokens: effectiveMaxInputTokens,
+      contextBudget: effectiveContextBudget,
     });
   }
 

@@ -1,3 +1,5 @@
+import { diagnoseTurns } from "./turn-diagnostics.js";
+
 export const SESSION_EVALUATION_VERSION = "session-evaluation-v1";
 
 const RUNNING_PHASES = new Set(["thinking", "executing", "awaiting_approval"]);
@@ -20,9 +22,13 @@ export function evaluateSession(state) {
   });
   const planSteps = Array.isArray(state.plan?.steps) ? state.plan.steps : [];
   const delegations = Array.isArray(state.delegations) ? state.delegations : [];
+  const diagnostics = diagnoseTurns(events);
 
   return {
     version: SESSION_EVALUATION_VERSION,
+    diagnosticsVersion: diagnostics.version,
+    reliability: diagnostics.reliability,
+    turns: diagnostics.turns,
     sessionId: state.id,
     cursor: safeInteger(events.at(-1)?.seq),
     status: reportStatus(state.phase, state.objective?.status, issues),
@@ -33,6 +39,13 @@ export function evaluateSession(state) {
       completedSteps: planSteps.filter((step) => step.status === "completed").length,
       totalSteps: planSteps.length,
     },
+    ...(state.plan?.acceptance?.length ? { verification: {
+      required: state.plan.acceptance.length,
+      passed: state.plan.acceptance.filter((item) => item.status === "passed").length,
+      pending: state.plan.acceptance.filter((item) => item.status === "pending").length,
+      failed: state.plan.acceptance.filter((item) => item.status === "failed").length,
+      stale: state.plan.acceptance.filter((item) => item.status === "stale").length,
+    } } : {}),
     tools: {
       requested: ofType("tool.requested").length,
       completed: toolCompleted.length,

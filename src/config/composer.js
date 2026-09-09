@@ -6,6 +6,11 @@ import { DemoProvider } from "../providers/demo.js";
 import { OpenAICompatibleProvider } from "../providers/openai-compatible.js";
 import { OpenAIResponsesProvider } from "../providers/openai-responses.js";
 import {
+  normalizeProviderRequestPolicy,
+  providerRequestOverrides,
+  resolveContextBudget,
+} from "../providers/request-policy.js";
+import {
   formatMaxSteps,
   formatMaxTokensPerTurn,
   parseContextWindowTokens,
@@ -25,6 +30,7 @@ const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible", "openai-res
 const PROVIDER_THINKING_MODES = new Set(["provider-default", "enabled", "disabled"]);
 const EXECUTION_TYPES = new Set(["native", "local", "docker"]);
 const SAFE_PERMISSION_PROFILES = new Set(["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto"]);
+const REQUEST_POLICY_KEYS = ["contextTargetTokens", "maxOutputTokens", "outputTokenParameter", "streamUsage"];
 
 export async function composeRuntimeConfig({
   args = [],
@@ -67,6 +73,10 @@ export async function composeRuntimeConfig({
     "provider.model": "gpt-4.1-mini",
     "provider.thinking": "provider-default",
     "provider.contextWindowTokens": 32_000,
+    "provider.contextTargetTokens": null,
+    "provider.maxOutputTokens": null,
+    "provider.outputTokenParameter": null,
+    "provider.streamUsage": false,
     "runtime.maxSteps": Infinity,
     "runtime.maxTokensPerTurn": Infinity,
     "execution.type": "native",
@@ -105,6 +115,7 @@ export async function composeRuntimeConfig({
         model: values["provider.model"],
         thinking: values["provider.thinking"],
         contextWindowTokens: values["provider.contextWindowTokens"],
+        ...requestPolicyValues(values),
       },
     },
   );
@@ -122,11 +133,15 @@ export async function composeRuntimeConfig({
       model: values["provider.model"],
       thinking: values["provider.thinking"],
       contextWindowTokens: values["provider.contextWindowTokens"],
+      ...requestPolicyValues(values),
     },
     runtime: {
       maxSteps: values["runtime.maxSteps"],
       maxTokensPerTurn: values["runtime.maxTokensPerTurn"],
-      maxInputTokens: values["provider.contextWindowTokens"],
+      maxInputTokens: resolveContextBudget({
+        contextWindowTokens: values["provider.contextWindowTokens"],
+        ...requestPolicyValues(values),
+      }).maxInputTokens,
     },
     execution: {
       type: values["execution.type"],
@@ -165,6 +180,7 @@ function createProvider(provider) {
       apiKey: provider.apiKey,
       baseUrl: provider.baseUrl,
       model: provider.model,
+      ...providerRequestOverrides(provider),
     });
   }
   return new OpenAICompatibleProvider({
@@ -172,6 +188,7 @@ function createProvider(provider) {
     baseUrl: provider.baseUrl,
     model: provider.model,
     thinking: provider.thinking,
+    ...providerRequestOverrides(provider),
   });
 }
 
@@ -183,6 +200,7 @@ function providerDescriptor(provider) {
       model: "offline-demo",
       baseUrl: null,
       contextWindowTokens: provider.contextWindowTokens,
+      ...providerRequestOverrides(provider),
     };
   }
   return {
@@ -192,6 +210,7 @@ function providerDescriptor(provider) {
     baseUrl: provider.baseUrl,
     thinking: provider.thinking,
     contextWindowTokens: provider.contextWindowTokens,
+    ...providerRequestOverrides(provider),
   };
 }
 
@@ -206,6 +225,7 @@ export function inspectRuntimeConfig(config) {
       model: config.provider.model,
       thinking: config.provider.thinking,
       contextWindowTokens: config.provider.contextWindowTokens,
+      ...providerRequestOverrides(config.provider),
     },
     runtime: {
       maxSteps: formatMaxSteps(config.runtime.maxSteps),
@@ -236,7 +256,7 @@ async function readConfigFile(file, { label, allowApiKey, allowProviderEndpoint 
   const values = {};
   if (payload.provider !== undefined) {
     assertObject(payload.provider, `${label}.provider`);
-    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model", "thinking", "contextWindowTokens"]), `${label}.provider`);
+    assertKnownKeys(payload.provider, new Set(["type", "apiKey", "baseUrl", "model", "thinking", "contextWindowTokens", ...REQUEST_POLICY_KEYS]), `${label}.provider`);
     if (payload.provider.apiKey !== undefined && !allowApiKey) {
       throw new Error(`${label} 不允许保存 provider.apiKey；请使用 .env.local 或 Nexus 应用目录的 .nexus/config.local.json`);
     }
@@ -249,6 +269,7 @@ async function readConfigFile(file, { label, allowApiKey, allowProviderEndpoint 
     copyDefined(values, "provider.model", payload.provider.model);
     copyDefined(values, "provider.thinking", payload.provider.thinking);
     copyDefined(values, "provider.contextWindowTokens", payload.provider.contextWindowTokens);
+    for (const key of REQUEST_POLICY_KEYS) copyDefined(values, `provider.${key}`, payload.provider[key]);
   }
   if (payload.runtime !== undefined) {
     assertObject(payload.runtime, `${label}.runtime`);
@@ -287,6 +308,10 @@ function applyEnvironment(values, sources, env, localEnvironment) {
     OPENAI_MODEL: "provider.model",
     NEXUS_PROVIDER_THINKING: "provider.thinking",
     NEXUS_CONTEXT_WINDOW_TOKENS: "provider.contextWindowTokens",
+    NEXUS_CONTEXT_TARGET_TOKENS: "provider.contextTargetTokens",
+    NEXUS_MAX_OUTPUT_TOKENS: "provider.maxOutputTokens",
+    NEXUS_OUTPUT_TOKEN_PARAMETER: "provider.outputTokenParameter",
+    NEXUS_STREAM_USAGE: "provider.streamUsage",
     NEXUS_MAX_STEPS: "runtime.maxSteps",
     NEXUS_MAX_TOKENS_PER_TURN: "runtime.maxTokensPerTurn",
     NEXUS_EXECUTION: "execution.type",
@@ -299,7 +324,7 @@ function applyEnvironment(values, sources, env, localEnvironment) {
   };
   for (const [environmentKey, configKey] of Object.entries(mappings)) {
     if (env[environmentKey] === undefined || env[environmentKey] === "") continue;
-    values[configKey] = env[environmentKey];
+    values[configKey] = parseRequestPolicyOption(configKey, env[environmentKey]);
     sources[configKey] = environmentSource(environmentKey, localEnvironment);
   }
   if (typeof values["network.targets"] === "string") {
@@ -317,6 +342,10 @@ function applyCli(values, sources, args) {
     model: "provider.model",
     "provider-thinking": "provider.thinking",
     "context-window-tokens": "provider.contextWindowTokens",
+    "context-target-tokens": "provider.contextTargetTokens",
+    "max-output-tokens": "provider.maxOutputTokens",
+    "output-token-parameter": "provider.outputTokenParameter",
+    "stream-usage": "provider.streamUsage",
     "base-url": "provider.baseUrl",
     "max-steps": "runtime.maxSteps",
     "max-tokens-per-turn": "runtime.maxTokensPerTurn",
@@ -330,7 +359,7 @@ function applyCli(values, sources, args) {
   for (const [argument, configKey] of Object.entries(mappings)) {
     const value = valueArg(args, argument);
     if (value === undefined) continue;
-    values[configKey] = value;
+    values[configKey] = parseRequestPolicyOption(configKey, value);
     sources[configKey] = "cli";
   }
   const networkTargets = args.filter((value) => value.startsWith("--network-target=")).map((value) => value.slice("--network-target=".length));
@@ -343,6 +372,10 @@ function applyCli(values, sources, args) {
     sources["provider.type"] = "cli";
     values["provider.thinking"] = "provider-default";
     sources["provider.thinking"] = "cli";
+    for (const [key, value] of Object.entries({ maxOutputTokens: null, outputTokenParameter: null, streamUsage: false })) {
+      values[`provider.${key}`] = value;
+      sources[`provider.${key}`] = "cli";
+    }
   }
 }
 
@@ -350,8 +383,12 @@ function withoutProviderOverrides(profiles) {
   if (!profiles || typeof profiles !== "object" || Array.isArray(profiles)) return profiles;
   return Object.fromEntries(Object.entries(profiles).map(([id, value]) => {
     if (!value || typeof value !== "object" || Array.isArray(value)) return [id, value];
-    const { provider: _provider, ...profile } = value;
-    return [id, profile];
+    const { provider, ...profile } = value;
+    const planning = provider && typeof provider === "object" && !Array.isArray(provider)
+      ? Object.fromEntries(["contextWindowTokens", "contextTargetTokens"]
+          .filter((key) => provider[key] !== undefined).map((key) => [key, provider[key]]))
+      : {};
+    return [id, { ...profile, ...(Object.keys(planning).length ? { provider: planning } : {}) }];
   }));
 }
 
@@ -399,6 +436,28 @@ function validateProviderFeatures(values) {
   if (values["provider.thinking"] !== "provider-default" && values["provider.type"] !== "openai-compatible") {
     throw new Error("provider.thinking 的 enabled/disabled 首版只支持 openai-compatible Adapter");
   }
+  const normalized = normalizeProviderRequestPolicy({
+    contextWindowTokens: values["provider.contextWindowTokens"],
+    ...requestPolicyValues(values),
+  }, { adapter: values["provider.type"] });
+  for (const [key, value] of Object.entries(normalized)) values[`provider.${key}`] = value;
+}
+
+function requestPolicyValues(values) {
+  return Object.fromEntries(REQUEST_POLICY_KEYS.map((key) => [key, values[`provider.${key}`]]));
+}
+
+function parseRequestPolicyOption(key, value) {
+  if (key === "provider.contextTargetTokens" || key === "provider.maxOutputTokens") {
+    if (value === "provider-default") return null;
+    if (typeof value === "string" && /^\d+$/.test(value)) return Number(value);
+  }
+  if (key === "provider.outputTokenParameter" && value === "provider-default") return null;
+  if (key === "provider.streamUsage") {
+    if (value === "true") return true;
+    if (value === "false") return false;
+  }
+  return value;
 }
 
 function applyLayer(values, sources, layer, source) {

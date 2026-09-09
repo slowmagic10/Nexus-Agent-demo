@@ -6,6 +6,7 @@ import {
   parseMaxSteps,
   parseMaxTokensPerTurn,
 } from "../runtime-options.js";
+import { normalizeProviderRequestPolicy, providerRequestOverrides } from "../providers/request-policy.js";
 
 const SAFE_PERMISSION_PROFILES = new Set([
   "read-only",
@@ -17,6 +18,7 @@ const SAFE_PERMISSION_PROFILES = new Set([
 const PROFILE_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const PROVIDER_TYPES = new Set(["auto", "demo", "openai-compatible", "openai-responses"]);
 const PROVIDER_THINKING_MODES = new Set(["provider-default", "enabled", "disabled"]);
+const REQUEST_POLICY_KEYS = ["contextTargetTokens", "maxOutputTokens", "outputTokenParameter", "streamUsage"];
 
 export function normalizeNamedAgentProfiles(raw, {
   defaultId = "default",
@@ -79,6 +81,7 @@ export function inspectNamedAgentProfiles(catalog) {
         apiKey: profile.provider.apiKey ? "[REDACTED]" : null,
         thinking: profile.provider.thinking,
         contextWindowTokens: profile.provider.contextWindowTokens,
+        ...providerRequestOverrides(profile.provider),
       },
     })),
   };
@@ -130,7 +133,7 @@ function normalizeProvider(value, fallback, profileId) {
     throw new Error(`Agent Profile ${profileId}.provider 必须是对象`);
   }
   const override = value || {};
-  assertKnownKeys(override, new Set(["type", "apiKey", "baseUrl", "model", "thinking", "contextWindowTokens"]), `Agent Profile ${profileId}.provider`);
+  assertKnownKeys(override, new Set(["type", "apiKey", "baseUrl", "model", "thinking", "contextWindowTokens", ...REQUEST_POLICY_KEYS]), `Agent Profile ${profileId}.provider`);
   let type = override.type ?? fallback.type;
   if (!PROVIDER_TYPES.has(type)) {
     throw new Error(`Agent Profile ${profileId}.provider.type 必须是 auto、demo、openai-compatible 或 openai-responses`);
@@ -148,6 +151,17 @@ function normalizeProvider(value, fallback, profileId) {
       fallback.contextWindowTokens ?? 32_000,
     ),
   };
+  const policy = Object.fromEntries(REQUEST_POLICY_KEYS.map((key) => {
+    const inherited = changedAdapter && (key === "outputTokenParameter" || key === "streamUsage"
+      || (key === "maxOutputTokens" && (type === "demo"
+        || (type === "openai-compatible" && override.outputTokenParameter == null))))
+      ? undefined : fallback[key];
+    return [key, override[key] === undefined ? inherited : override[key]];
+  }));
+  Object.assign(provider, normalizeProviderRequestPolicy({
+    contextWindowTokens: provider.contextWindowTokens,
+    ...policy,
+  }, { adapter: type }));
   if (!PROVIDER_THINKING_MODES.has(provider.thinking)) {
     throw new Error(`Agent Profile ${profileId}.provider.thinking 必须是 provider-default、enabled 或 disabled`);
   }
@@ -162,6 +176,10 @@ function normalizeProvider(value, fallback, profileId) {
       model: "offline-demo",
       thinking: "provider-default",
       contextWindowTokens: provider.contextWindowTokens,
+      ...normalizeProviderRequestPolicy({
+        contextTargetTokens: provider.contextTargetTokens,
+        contextWindowTokens: provider.contextWindowTokens,
+      }, { adapter: "demo" }),
     });
   }
   if (provider.apiKey !== null && typeof provider.apiKey !== "string") {

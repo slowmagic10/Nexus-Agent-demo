@@ -1,0 +1,31 @@
+{
+  "id": "recovery-v1",
+  "tasks": [
+    {
+      "id": "locate-moved-config",
+      "prompt": "定位项目当前使用的 JSON 配置，把 enabled 改成 true，保留 theme。旧文档可能引用过时路径，请以实际文件为准。不要创建重复配置，不启动服务。",
+      "files": [
+        { "path": "README.md", "content": "# Config App\n\n配置已从 settings.json 移至 config/app.json。\n" },
+        { "path": "config/app.json", "content": "{\"enabled\":false,\"theme\":\"dark\"}\n" }
+      ],
+      "checks": [
+        { "id": "updated-config", "type": "json_equals", "path": "config/app.json", "expected": { "enabled": true, "theme": "dark" } },
+        { "id": "readme-preserved", "type": "file_equals", "path": "README.md", "expected": "# Config App\n\n配置已从 settings.json 移至 config/app.json。\n" }
+      ],
+      "maxSteps": 20,
+      "maxTokensPerTurn": 100000
+    },
+    {
+      "id": "recover-exact-edit",
+      "prompt": "修复 src/add.js：add(a, b) 应返回两个参数相加。保持原格式、其他函数和所有其他文件不变；如果编辑匹配失败，读取实际源码后再修正。不启动服务。",
+      "files": [
+        { "path": "src/add.js", "content": "export function add(a, b) {\n  return (a - b);\n}\n\nexport const untouched = 42;\n" }
+      ],
+      "checks": [
+        { "id": "exact-source", "type": "file_equals", "path": "src/add.js", "expected": "export function add(a, b) {\n  return (a + b);\n}\n\nexport const untouched = 42;\n" }
+      ],
+      "maxSteps": 20,
+      "maxTokensPerTurn": 100000
+    }
+  ]
+}

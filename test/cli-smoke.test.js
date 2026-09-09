@@ -248,3 +248,49 @@ function runCli(args, workspace, input) {
     child.stdin.end(input);
   });
 }
+
+test("CLI 任务效果评测使用隔离真实文件，Demo 通过或伪完成分别返回0或2", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-cli-task-outcome-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const file = path.join(directory, "suite.json");
+  const fixture = (prompt) => ({ id: "cli-outcome", tasks: [{
+    id: "write-output", prompt, files: [],
+    checks: [{ id: "content", type: "file_equals", path: "output.txt", expected: "demo-fixture" }],
+  }] });
+  await fs.writeFile(file, JSON.stringify(fixture("write output.txt with demo-fixture")));
+  const success = await execFileAsync(process.execPath, [path.join(root, "src", "cli.js"), "--demo", `--evaluate-tasks=${file}`], { cwd: root, timeout: 10000 });
+  const report = JSON.parse(success.stdout);
+  assert.equal(report.passed, true);
+  assert.equal(report.results[0].provider, "offline-demo");
+  assert.equal(report.results[0].execution.shell, false);
+  assert.equal(report.results[0].checks[0].passed, true);
+  assert.equal(success.stdout.includes("demo-fixture"), false);
+  await fs.writeFile(file, JSON.stringify(fixture("你好，只回答完成")));
+  await assert.rejects(execFileAsync(process.execPath, [path.join(root, "src", "cli.js"), "--demo", `--evaluate-tasks=${file}`], { cwd: root, timeout: 10000 }), (error) => {
+    assert.equal(error.code, 2);
+    const report = JSON.parse(error.stdout);
+    assert.equal(report.score.falseCompletions, 1);
+    assert.equal(report.results[0].checks[0].code, "file_missing");
+    return true;
+  });
+});
+
+test("CLI --suite-mode=experiment 保留策略变更但不将Context Hash差异视为回归", async (t) => {
+  const directory = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-cli-experiment-"));
+  t.after(() => fs.rm(directory, { recursive: true, force: true }));
+  const suiteDir = path.join(directory, "scenarios");
+  await fs.mkdir(suiteDir);
+  const fixtureFile = path.join(suiteDir, "task.json");
+  const baselineFile = path.join(directory, "baseline.json");
+  const fixture = { id: "change", prompt: "A", tools: [], provider: [{ text: "完成", toolCalls: [], usage: { inputTokens: 2, outputTokens: 1 } }] };
+  await fs.writeFile(fixtureFile, JSON.stringify(fixture));
+  const args = [path.join(root, "src", "cli.js"), `--evaluate-suite=${suiteDir}`];
+  const baseline = await execFileAsync(process.execPath, args, { cwd: root, timeout: 5000 });
+  await fs.writeFile(baselineFile, baseline.stdout);
+  await fs.writeFile(fixtureFile, JSON.stringify({ ...fixture, prompt: "B" }));
+  const compared = await execFileAsync(process.execPath, [...args, `--suite-baseline=${baselineFile}`, "--suite-mode=experiment"], { cwd: root, timeout: 5000 });
+  const report = JSON.parse(compared.stdout);
+  assert.equal(report.comparison.passed, true);
+  assert.equal(report.comparison.policy.mode, "experiment");
+  assert.ok(report.comparison.scenarios[0].changes.some((item) => item.code === "scenario_context_changed"));
+});

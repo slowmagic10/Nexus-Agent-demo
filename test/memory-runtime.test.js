@@ -8,6 +8,7 @@ import { AgentSession } from "../src/core/session.js";
 import { createSession, reduceSession } from "../src/core/state.js";
 import {
   discardMemoryMutation,
+  executeMemoryMutation,
   reconcileMemoryOutbox,
   resolveMemoryMutation,
   retryMemoryMutation,
@@ -16,6 +17,80 @@ import { MemoryMutationError } from "../src/memory/interface.js";
 import { createMemoryScope } from "../src/memory/scope.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 import { createToolRegistry } from "../src/tools/registry.js";
+import { ToolHost } from "../src/tools/host.js";
+
+test("重复 provider callId 的 Memory save/delete 绑定各自 durable occurrence", async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.close());
+  const { session } = createMemoryRuntime(fixture);
+  const host = new ToolHost({ registry: createToolRegistry({ workspace: fixture.workspace, memory: fixture.store.memory }) });
+  const execute = (name, args) => host.execute({ id: "provider-reused", name, arguments: args }, {
+    session, requestApproval: async () => true,
+  });
+  assert.equal((await execute("memory_save", { content: "same fact" })).ok, true);
+  assert.equal((await execute("memory_save", { content: "same fact" })).ok, true);
+  const [record] = await fixture.store.memory.search("same fact", { scope: fixture.scope });
+  assert.equal(record.version, 2);
+  assert.equal((await execute("memory_delete", { id: record.id })).ok, true);
+  assert.equal((await execute("memory_delete", { id: record.id })).ok, true);
+  const requested = fixture.store.readSessionEvents(session.id)
+    .filter((event) => event.type === "MEMORY_MUTATION_REQUESTED").map((event) => event.action.mutation);
+  assert.equal(new Set(requested.map((mutation) => mutation.id)).size, 4);
+  for (const mutation of requested) assert.ok(mutation.id.includes(`:tool:${mutation.provenance.sourceCursor}:`));
+  assert.deepEqual(session.state.memoryMutationIssues, []);
+});
+
+test("SQLite 确定性身份和来源拒绝不会标为未知副作用或允许重试", async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.close());
+  const { session } = createMemoryRuntime(fixture);
+  const original = mutationFixture(session, { id: "same-key", content: "first fact" });
+  const execute = (mutation) => executeMemoryMutation({ memory: fixture.store.memory,
+    dispatch: (action) => session.dispatch(action), mutation });
+  await execute(original);
+  for (const mutation of [
+    { ...original, candidate: { content: "different fact" } },
+    { ...original, operation: "delete", memoryId: "missing", reason: "delete" },
+    { ...original, id: "bad-source", provenance: { origin: "tool", sessionId: session.id, sourceCursor: 1, toolCallId: "absent" } },
+    { ...original, id: "bad-delete-source", operation: "delete", memoryId: "missing", reason: "delete",
+      provenance: { origin: "tool", sessionId: session.id, sourceCursor: 1, toolCallId: "absent" } },
+    { ...original, id: "bad-scope", scope: { ...fixture.scope, workspace: null } },
+  ]) {
+    await assert.rejects(execute(mutation));
+    const issue = session.state.memoryMutationIssues.find((item) => item.mutation.id === mutation.id);
+    assert.equal(issue.outcome, "non_retryable");
+    assert.equal(issue.retryable, false);
+  }
+});
+
+test("SQLite 写入前取消可确认没有副作用，不会误归为非法请求", async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.close());
+  const { session } = createMemoryRuntime(fixture);
+  const mutation = mutationFixture(session, { id: "aborted-before-apply", content: "not applied" });
+  await assert.rejects(executeMemoryMutation({ memory: fixture.store.memory,
+    dispatch: (action) => session.dispatch(action), mutation, signal: AbortSignal.abort() }));
+  assert.equal(session.state.memoryMutationIssues[0].outcome, "safe_to_retry");
+  assert.equal(session.state.memoryMutationIssues[0].retryable, true);
+  assert.deepEqual(await fixture.store.memory.search("not applied", { scope: fixture.scope }), []);
+});
+
+test("旧 mutation key 的 pending reconcile 保留身份且重复恢复只应用一次", async (t) => {
+  const fixture = createFixture();
+  t.after(() => fixture.close());
+  const { session } = createMemoryRuntime(fixture);
+  const oldId = `${session.id}:provider-old:memory.add`;
+  const mutation = mutationFixture(session, { id: oldId, content: "old pending" });
+  const record = await fixture.store.memory.add(mutation.candidate, {
+    scope: mutation.scope, provenance: mutation.provenance, mutationId: oldId,
+  });
+  await session.dispatch({ type: "MEMORY_MUTATION_REQUESTED", mutation });
+  const restored = new AgentSession({ state: fixture.store.load(session.id), reducer: reduceSession, journal: fixture.store });
+  const reconciled = await reconcileMemoryOutbox({ session: restored, memory: fixture.store.memory });
+  assert.equal(reconciled[0].mutationId, oldId);
+  assert.equal((await fixture.store.memory.get(record.id, { scope: fixture.scope })).version, 1);
+  assert.deepEqual(await reconcileMemoryOutbox({ session: restored, memory: fixture.store.memory }), []);
+});
 
 test("memory_save provenance 精确指向 TOOL_REQUESTED durable cursor", async () => {
   const fixture = createFixture();

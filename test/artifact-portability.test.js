@@ -5,8 +5,137 @@ import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { AgentSession } from "../src/core/session.js";
-import { createSession, reduceSession } from "../src/core/state.js";
-import { SessionStore } from "../src/persistence/session-store.js";
+import { createSession, reduceSession, SESSION_SCHEMA_VERSION } from "../src/core/state.js";
+import { createStatePatch } from "../src/state-patch.js";
+import { SessionStore, validateAndReplayJournalArchive } from "../src/persistence/session-store.js";
+import { GatewaySessionManager } from "../src/gateway/session-manager.js";
+
+test("raw v15/v16/v17 数据库迁移后导出保留来源 baseline schema，历史事实不改写", async (t) => {
+  const source = await fixture(t, "nexus-raw-legacy-export-");
+  const destination = await fixture(t, "nexus-raw-legacy-import-");
+  for (const version of [15, 16, 17]) {
+    const baseline = { ...createSession({ id: `raw-v${version}`, provider: "test", workspace: source.workspace,
+      createdAt: "2026-08-17T00:00:00.000Z" }), schemaVersion: version };
+    if (version === 15) delete baseline.displayTitle;
+    const action = { type: "USER_MESSAGE", content: "保留原来的任务", at: "2026-08-17T00:00:01.000Z" };
+    const oldProjection = { ...reduceSession(baseline, action), schemaVersion: version };
+    if (version === 15) delete oldProjection.displayTitle;
+    const payloads = [
+      JSON.stringify({ type: "SESSION_BASELINE", at: baseline.createdAt, state: baseline }),
+      JSON.stringify({ action, patch: createStatePatch(baseline, oldProjection) }),
+    ];
+    source.store.save(oldProjection);
+    const insert = source.store.db.prepare("INSERT INTO session_events(session_id,seq,at,type,event_json,schema_version) VALUES(?,?,?,?,?,1)");
+    insert.run(baseline.id, 1, baseline.createdAt, "SESSION_BASELINE", payloads[0]);
+    insert.run(baseline.id, 2, action.at, action.type, payloads[1]);
+    const loaded = source.store.load(baseline.id);
+    assert.equal(loaded.schemaVersion, SESSION_SCHEMA_VERSION);
+    const first = source.store.exportJournal(baseline.id);
+    assert.equal(first.session.stateSchemaVersion, version);
+    assert.equal(first.events[0].baseline.schemaVersion, version);
+    assert.equal(validateAndReplayJournalArchive(first).state.schemaVersion, SESSION_SCHEMA_VERSION);
+
+    const session = new AgentSession({ state: loaded, reducer: reduceSession, journal: source.store });
+    await session.dispatch({ type: "RESUMED", provider: "test", workspace: source.workspace, at: "2026-08-17T00:00:02.000Z" });
+    const archive = source.store.exportJournal(baseline.id);
+    assert.equal(archive.session.stateSchemaVersion, version);
+    assert.equal(validateAndReplayJournalArchive(archive).state.schemaVersion, SESSION_SCHEMA_VERSION);
+    const imported = destination.store.importJournal(archive, { id: `restored-v${version}`, workspace: destination.workspace });
+    assert.equal(imported.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.equal(imported.messages[0].content, action.content);
+    assert.equal(validateAndReplayJournalArchive(destination.store.exportJournal(imported.id)).state.schemaVersion, SESSION_SCHEMA_VERSION);
+    assert.deepEqual(source.store.db.prepare("SELECT event_json AS json FROM session_events WHERE session_id = ? AND seq <= 2 ORDER BY seq")
+      .all(baseline.id).map((row) => row.json), payloads);
+  }
+});
+
+test("成功导出的归档可通过 Gateway manager 删除后以新 ID 恢复全部内容", async (t) => {
+  const source = await fixture(t, "nexus-artifact-delete-restore-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-delete-restore");
+  const artifact = await attachArtifact(source.store, session, { callId: "preserve", content: "restore complete content" });
+  const manager = new GatewaySessionManager({
+    workspace: source.workspace, store: source.store, defaultPermissionProfile: "workspace-auto",
+    provider: { name: "test", complete: async () => ({ text: "", toolCalls: [] }) },
+    tools: { get: () => null, schemas: () => [] }, systemPrompt: () => "test",
+  });
+  try {
+    const archive = await manager.exportSession(session.id);
+    await manager.deleteSession(session.id);
+    assert.equal(source.store.load(session.id), null);
+    await assert.rejects(manager.importSession(archive), /会话已删除/);
+    const restored = await manager.importSession(archive, { id: "restored-safe-id" });
+    assert.equal((await source.store.artifacts.get(artifact.id, { sessionId: restored.id })).content, "restore complete content");
+    assert.equal(validateAndReplayJournalArchive(await manager.exportSession(restored.id)).artifactCount, 1);
+  } finally {
+    await manager.close();
+  }
+});
+
+test("255/256 个 Artifact 导出能恢复，257 个在导出边界明确拒绝", async (t) => {
+  const source = await fixture(t, "nexus-artifact-export-limit-");
+  const destination = await fixture(t, "nexus-artifact-restore-limit-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-limits");
+  for (let index = 0; index < 257; index += 1) {
+    await source.store.artifacts.put({ sessionId: session.id, callId: `call-${index}`, content: `part-${index}` });
+    if (index === 254 || index === 255) {
+      const archive = source.store.exportJournal(session.id);
+      assert.equal(validateAndReplayJournalArchive(archive).artifactCount, index + 1);
+      const imported = destination.store.importJournal(archive, { id: `restored-${index}` });
+      assert.equal((await destination.store.artifacts.list({ sessionId: imported.id, limit: 500 })).length, index + 1);
+    }
+  }
+  assert.throws(() => source.store.exportJournal(session.id), /Artifact 数量超过 256/);
+  assert.equal(source.store.db.prepare("SELECT count(*) AS count FROM artifacts").get().count, 257);
+});
+
+test("成功导出必须包含全部被引用内容，Artifact 全部丢失也不能伪装旧式包", async (t) => {
+  const source = await fixture(t, "nexus-artifact-missing-export-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-missing-export");
+  const artifact = await attachArtifact(source.store, session, { callId: "missing", content: "required payload" });
+  source.store.db.prepare("DELETE FROM artifacts WHERE session_id = ? AND id = ?").run(session.id, artifact.id);
+  assert.throws(() => source.store.exportJournal(session.id), /缺少被事件引用的 Artifact/);
+});
+
+test("导出使用实际 JSON UTF-8 envelope 大小，转义开销超过 Gateway 10M 时拒绝", async (t) => {
+  const source = await fixture(t, "nexus-artifact-wire-limit-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-wire-limit");
+  for (let index = 0; index < 2; index += 1) {
+    await source.store.artifacts.put({ sessionId: session.id, content: "\u0001".repeat(900_000) });
+  }
+  assert.throws(() => source.store.exportJournal(session.id), /可恢复导出.*10000000|10000000.*可恢复导出/);
+});
+
+test("旧的超过 Gateway 10M 的归档仍可通过 direct/CLI 完整恢复", async (t) => {
+  const source = await fixture(t, "nexus-legacy-large-archive-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-legacy-large");
+  const archive = source.store.exportJournal(session.id);
+  // exportedAt historically was transport metadata outside the archive checksum.
+  archive.exportedAt = "x".repeat(10_000_000);
+  assert.equal(validateAndReplayJournalArchive(archive).state.id, session.id);
+  const imported = source.store.importJournal(archive, { id: "session-legacy-large-restored" });
+  assert.equal(imported.id, "session-legacy-large-restored");
+});
+
+test("导出先检查 Artifact 元数据预算，不装入超量 BLOB", async (t) => {
+  const source = await fixture(t, "nexus-artifact-content-budget-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-content-budget");
+  for (let index = 0; index < 17; index += 1) {
+    const artifact = await source.store.artifacts.put({ sessionId: session.id, content: "small fixture" });
+    source.store.db.prepare("UPDATE artifacts SET byte_size = 4000000 WHERE session_id = ? AND id = ?").run(session.id, artifact.id);
+  }
+  assert.throws(() => source.store.exportJournal(session.id), /Artifact 总量超过 64000000/);
+});
+
+test("导出也严格校验 journal facts 与 patch，不返回只能导出不能重放的包", async (t) => {
+  const source = await fixture(t, "nexus-archive-replay-export-");
+  const session = await createArtifactSession(source.store, source.workspace, "session-invalid-patch");
+  await session.dispatch({ type: "USER_MESSAGE", content: "one task" });
+  const row = source.store.db.prepare("SELECT event_json AS json FROM session_events WHERE session_id = ? AND seq = 2").get(session.id);
+  const payload = JSON.parse(row.json);
+  payload.patch = { set: { phase: "completed" } };
+  source.store.db.prepare("UPDATE session_events SET event_json = ? WHERE session_id = ? AND seq = 2").run(JSON.stringify(payload), session.id);
+  assert.throws(() => source.store.exportJournal(session.id), /patch.*事实重放/);
+});
 
 test("Portable Journal 携带 Artifact 并在重映射 Session 后保持可读", async (t) => {
   const source = await fixture(t, "nexus-artifact-export-");

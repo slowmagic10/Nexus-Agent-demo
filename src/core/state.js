@@ -10,9 +10,12 @@ import {
   deriveAgentProfileSnapshot,
 } from "./agent-profile.js";
 import { CONTEXT_SUMMARY_VERSION, normalizeSemanticSummary } from "./context-summary.js";
+import { invalidateVerification, mergeAcceptance, recordVerificationToolResult, verificationIssues } from "./verification.js";
 import { deriveSessionDisplayTitle, normalizeSessionDisplayTitle } from "./session-display-title.js";
+import { progressFeedback } from "./progress-feedback.js";
+import { failureFingerprint } from "./progress-monitor.js";
 
-export const SESSION_SCHEMA_VERSION = 16;
+export const SESSION_SCHEMA_VERSION = 18;
 const PLAN_STEP_STATUSES = new Set(["pending", "in_progress", "completed"]);
 
 export function createSession({ provider, workspace, memoryScope, permissionProfile = "workspace-auto", agentProfile, id, createdAt }) {
@@ -263,7 +266,7 @@ export function reduceSession(state, action) {
       const summary = normalizeSemanticSummary(action.summary);
       const usage = normalizeSummaryUsage(action.usage);
       addTokenUsage(next.metrics, usage);
-      next.metrics.modelDurationMs += action.durationMs || 0;
+      if (action.modelCall !== false) next.metrics.modelDurationMs += action.durationMs || 0;
       next.contextSummary = {
         summaryVersion: CONTEXT_SUMMARY_VERSION,
         revision: (next.contextSummary?.revision || 0) + 1,
@@ -282,6 +285,7 @@ export function reduceSession(state, action) {
         model: next.contextSummary.model,
         durationMs: action.durationMs || 0,
         usage,
+        ...modelUsageMetadata(action),
         preview: summary.objective || summary.active[0] || summary.completed[0] || "已更新滚动摘要",
       });
       break;
@@ -289,13 +293,14 @@ export function reduceSession(state, action) {
     case "CONTEXT_SUMMARY_DEGRADED": {
       const usage = normalizeSummaryUsage(action.usage);
       addTokenUsage(next.metrics, usage);
-      next.metrics.modelDurationMs += action.durationMs || 0;
+      if (action.modelCall !== false) next.metrics.modelDurationMs += action.durationMs || 0;
       emit("context.summary_degraded", {
         fromMessage: action.fromMessage,
         throughMessage: action.throughMessage,
         sourceCursor: action.sourceCursor,
         durationMs: action.durationMs || 0,
         usage,
+        ...modelUsageMetadata(action),
         error: action.error,
       });
       break;
@@ -306,6 +311,7 @@ export function reduceSession(state, action) {
       emit("model.completed", {
         durationMs: action.durationMs,
         usage: action.usage,
+        ...modelUsageMetadata(action),
         finishReason: action.finishReason || null,
       });
       break;
@@ -555,11 +561,18 @@ export function reduceSession(state, action) {
       emit("tool.grant_revoked", { grantId: grant.id, tool: grant.tool, reason: action.reason || null });
       break;
     }
-    case "TOOL_RESULT":
+    case "TOOL_RESULT": {
+      if (Object.hasOwn(action, "resultHash") && (typeof action.resultHash !== "string" || !/^sha256:[a-f0-9]{64}$/.test(action.resultHash))) {
+        throw new Error("TOOL_RESULT resultHash 必须是 sha256 摘要");
+      }
+      if (Object.hasOwn(action, "sourceCursor") && (!Number.isSafeInteger(action.sourceCursor) || action.sourceCursor < 1)) {
+        throw new Error("TOOL_RESULT sourceCursor 必须是正安全整数");
+      }
       if (next.toolStreams) delete next.toolStreams[action.call.id];
       next.messages.push({ role: "tool", tool_call_id: action.call.id, content: action.result });
       next.phase = "thinking";
       next.metrics.toolDurationMs += action.durationMs || 0;
+      const verification = action.verification ? recordVerificationToolResult(next, action, at) : null;
       emit("tool.completed", {
         callId: action.call.id,
         tool: action.call.name,
@@ -569,10 +582,14 @@ export function reduceSession(state, action) {
         ...(Object.hasOwn(action, "effectiveTimeoutMs") ? { effectiveTimeoutMs: action.effectiveTimeoutMs } : {}),
         ...(Object.hasOwn(action, "terminationReason") ? { terminationReason: action.terminationReason } : {}),
         preview: action.result.slice(0, 160),
+        ...(Object.hasOwn(action, "resultHash") ? { resultHash: action.resultHash } : {}),
         ...(action.artifact ? { artifact: action.artifact } : {}),
         ...(action.fileChanges ? { fileChanges: action.fileChanges } : {}),
+        ...(verification ? { verification } : {}),
+        ...(Object.hasOwn(action, "sourceCursor") ? { sourceCursor: action.sourceCursor } : {}),
       });
       break;
+    }
     case "MEMORY_ADDED":
       next.memory.push({ content: action.content, at });
       emit("memory.added", { preview: action.content.slice(0, 120) });
@@ -702,12 +719,22 @@ export function reduceSession(state, action) {
       }
       emit("skill.loaded", { skill: action.skill.name });
       break;
-    case "PLAN_UPDATED": {
+    case "PLAN_UPDATED":
+    case "PLAN_ACCEPTANCE_UPDATED": {
+      if (action.type === "PLAN_UPDATED" && action.acceptance !== undefined) {
+        throw new Error("验收声明必须使用 PLAN_ACCEPTANCE_UPDATED，旧日志动作不能静默升级语义");
+      }
+      if (action.type === "PLAN_ACCEPTANCE_UPDATED" && action.acceptance === undefined) {
+        throw new Error("PLAN_ACCEPTANCE_UPDATED 需要 acceptance 声明");
+      }
       if (!next.objective || next.objective.status !== "active") {
         throw new Error("Plan 只能更新当前 active Objective");
       }
       const steps = normalizePlanSteps(action.steps);
       const blockedReason = normalizePlanBlockedReason(action.blockedReason);
+      const previousAcceptance = next.plan?.objectiveId === next.objective.id ? next.plan.acceptance : undefined;
+      const acceptance = action.acceptance !== undefined || previousAcceptance !== undefined
+        ? mergeAcceptance(previousAcceptance, action.acceptance) : undefined;
       const revision = next.plan?.objectiveId === next.objective.id ? next.plan.revision + 1 : 1;
       next.plan = {
         objectiveId: next.objective.id,
@@ -716,6 +743,7 @@ export function reduceSession(state, action) {
         explanation: typeof action.explanation === "string" ? redactSensitiveValue(action.explanation.trim()).slice(0, 1000) : "",
         ...(blockedReason ? { blockedReason } : {}),
         steps,
+        ...(acceptance !== undefined ? { acceptance } : {}),
         createdAt: next.plan?.objectiveId === next.objective.id ? next.plan.createdAt : at,
         updatedAt: at,
       };
@@ -725,9 +753,15 @@ export function reduceSession(state, action) {
         explanation: next.plan.explanation,
         ...(blockedReason ? { blockedReason } : {}),
         steps: structuredClone(steps),
+        ...(acceptance !== undefined ? { acceptance: structuredClone(acceptance) } : {}),
       });
       break;
     }
+    case "VERIFICATION_INVALIDATED":
+      if (invalidateVerification(next, action)) emit("verification.invalidated", {
+        objectiveId: action.objectiveId, id: action.id, sourceCursor: action.sourceCursor, reason: action.reason,
+      });
+      break;
     case "DELEGATION_REQUESTED": {
       if (next.lineage?.kind === "delegation") throw new Error("单层委派 Child Session 不能继续创建 Child");
       if ((next.delegations || []).some((item) => item.status === "running")) {
@@ -818,6 +852,23 @@ export function reduceSession(state, action) {
       });
       break;
     }
+    case "PROGRESS_INTERVENTION": {
+      assertProgressIntervention(next, action);
+      const message = progressFeedback(action.attempt);
+      next.phase = "thinking";
+      next.messages.push({ role: "system", content: message, runtime_feedback: "progress" });
+      emit("session.progress_intervened", {
+        version: action.version,
+        reason: action.reason,
+        objectiveId: next.objective.id,
+        attempt: action.attempt,
+        fingerprint: action.fingerprint,
+        // These positions identify display events, not durable journal cursors.
+        occurrences: structuredClone(action.occurrences),
+        message,
+      });
+      break;
+    }
     case "COMPLETION_REJECTED": {
       if (!Number.isSafeInteger(action.attempt) || action.attempt < 1) {
         throw new Error("COMPLETION_REJECTED attempt 必须是正整数");
@@ -841,6 +892,7 @@ export function reduceSession(state, action) {
       break;
     }
     case "COMPLETED":
+      if (verificationIssues(next).length) throw new Error("已声明验收项尚无有效的真实成功证据，不能完成 Objective");
       next.toolStreams = {};
       next.phase = "completed";
       next.metrics.lastTurnDurationMs = elapsedSince(next.turnStartedAt, at);
@@ -853,7 +905,9 @@ export function reduceSession(state, action) {
         next.messages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: "任务在工具启动前停止：该工具调用没有执行。",
+          content: action.toolBatchFailure === true
+            ? "本批工具结果未能完整记录；已启动调用不会自动重放。"
+            : "任务在工具启动前停止：该工具调用没有执行。",
         });
       }
       next.phase = "failed";
@@ -889,7 +943,9 @@ export function reduceSession(state, action) {
         next.messages.push({
           role: "tool",
           tool_call_id: call.id,
-          content: "任务已取消：该工具调用不会自动重放，执行状态未知。",
+          content: action.toolBatchFailure === true
+            ? "本批工具结果未能完整记录；已启动调用不会自动重放。"
+            : "任务已取消：该工具调用不会自动重放，执行状态未知。",
         });
       }
       next.phase = "cancelled";
@@ -1060,12 +1116,74 @@ export function reduceSession(state, action) {
   return next;
 }
 
+function assertProgressIntervention(state, action) {
+  const fail = (detail) => { throw new Error(`PROGRESS_INTERVENTION ${detail}`); };
+  const fields = new Set(["type", "at", "version", "reason", "attempt", "fingerprint", "occurrences"]);
+  if (Object.keys(action).some((key) => !fields.has(key))) fail("只能包含固定反馈协议字段");
+  if (!["progress-monitor-v1", "progress-monitor-v2"].includes(action.version) || action.reason !== "repeated_tool_failure") fail("version 或 reason 无效");
+  const parallel = action.version === "progress-monitor-v2";
+  if (![1, 2].includes(action.attempt)) fail("attempt 必须是 1 或 2");
+  if (typeof action.fingerprint !== "string" || !/^sha256:[a-f0-9]{64}$/.test(action.fingerprint)) fail("fingerprint 无效");
+  if (state.phase !== "thinking" || state.objective?.status !== "active" || state.pendingApproval
+      || findUnresolvedToolCalls(state.messages).length) fail("需要本轮工具协议已闭合的活跃目标");
+  const turnStart = state.events.findLastIndex((event) => event.type === "message.user");
+  if (turnStart < 0) fail("缺少本轮用户消息");
+  const events = state.events.slice(turnStart + 1);
+  const interventions = events.filter((event) => event.type === "session.progress_intervened");
+  if (action.attempt !== interventions.length + 1) fail("attempt 与本轮纠正次数不一致");
+  const afterSeq = interventions.at(-1)?.seq || state.events[turnStart].seq;
+  if (!Array.isArray(action.occurrences) || action.occurrences.length !== 3) fail("需要三个真实失败 occurrence");
+  const pending = new Map();
+  const completed = [];
+  for (const event of events) {
+    if (event.type === "tool.requested") {
+      // An overlapping reused call ID cannot prove which request produced a result.
+      if (parallel) {
+        const previous = pending.get(event.callId);
+        pending.set(event.callId, previous ? { request: null, count: previous.count + 1 } : { request: event, count: 1 });
+      } else pending.set(event.callId, pending.has(event.callId) ? null : event);
+    } else if (event.type === "tool.completed") {
+      if (parallel) {
+        const candidate = pending.get(event.callId);
+        completed.push({ request: candidate?.request, result: event });
+        if (candidate && --candidate.count === 0) pending.delete(event.callId);
+      } else {
+        completed.push({ request: pending.get(event.callId), result: event });
+        pending.delete(event.callId);
+      }
+    }
+  }
+  if (pending.size) fail("还有尚未闭合的工具请求");
+  const latest = completed.slice(-3);
+  if (latest.length !== 3) fail("本轮失败证据不足");
+  let previousResultSeq = afterSeq;
+  let previousRequestSeq = afterSeq;
+  action.occurrences.forEach((occurrence, index) => {
+    if (!occurrence || typeof occurrence !== "object" || Array.isArray(occurrence)
+        || Object.keys(occurrence).length !== 2
+        || !Number.isSafeInteger(occurrence.requestSeq) || !Number.isSafeInteger(occurrence.resultSeq)
+        || occurrence.requestSeq <= (parallel ? previousRequestSeq : previousResultSeq)
+        || occurrence.resultSeq <= previousResultSeq || occurrence.resultSeq <= occurrence.requestSeq) {
+      fail("occurrences 必须使用本轮严格有序的 eventSeq；不是 durable cursor");
+    }
+    const { request, result } = latest[index];
+    if (!request || request.seq !== occurrence.requestSeq || result.seq !== occurrence.resultSeq
+        || request.callId !== result.callId || request.tool !== result.tool
+        || failureFingerprint(request, result) !== action.fingerprint) {
+      fail("occurrences 与本轮最后三个同参同失败工具事实不一致");
+    }
+    previousResultSeq = occurrence.resultSeq;
+    previousRequestSeq = occurrence.requestSeq;
+  });
+}
+
 export function migrateSessionState(state) {
   if (!state || typeof state !== "object") throw new Error("会话状态必须是对象");
-  if (state.schemaVersion === SESSION_SCHEMA_VERSION) {
+  if ([SESSION_SCHEMA_VERSION, 17, 16].includes(state.schemaVersion)) {
     assertAgentProfileSnapshot(state.agentProfile);
     return {
       ...state,
+      schemaVersion: SESSION_SCHEMA_VERSION,
       displayTitle: normalizeSessionDisplayTitle(state.displayTitle)
         || deriveSessionDisplayTitle(state.messages),
     };
@@ -1498,6 +1616,15 @@ function normalizeSummaryUsage(value = {}) {
     ? value.totalTokens
     : inputTokens + outputTokens;
   return { inputTokens, outputTokens, totalTokens };
+}
+
+function modelUsageMetadata(action) {
+  if (action.usageEstimated === undefined) return {};
+  return {
+    usageEstimated: action.usageEstimated === true,
+    usageEstimator: action.usageEstimator || null,
+    usageMissingFields: structuredClone(action.usageMissingFields || []),
+  };
 }
 
 function addTokenUsage(metrics, usage = {}) {

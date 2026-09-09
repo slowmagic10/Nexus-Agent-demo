@@ -3,8 +3,9 @@ import http from "node:http";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { GatewayError } from "./session-manager.js";
+import { MAX_JOURNAL_IMPORT_BYTES } from "../persistence/archive-limits.js";
 
-const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js", "/task-deletion.js", "/task-runtime-timer.js"]);
+const STATIC_ASSETS = new Set(["/", "/app.js", "/styles.css", "/state-patch.js", "/json-value-equality.js", "/composer.js", "/project-picker.js", "/grants.js", "/plan-view.js", "/profile-view.js", "/artifact-view.js", "/context-view.js", "/session-projection.js", "/turn-view.js", "/task-navigation.js", "/execution-summary.js", "/inspector-shell.js", "/review-workspace.js", "/task-thread.js", "/task-deletion.js", "/task-runtime-timer.js"]);
 
 export function isGatewayStaticAsset(pathname) {
   return STATIC_ASSETS.has(pathname);
@@ -142,7 +143,7 @@ export async function routeGatewayRequest(request, response, manager, staticRoot
   }
 
   if (request.method === "POST" && url.pathname === "/sessions/imports") {
-    const body = await readJson(request, { maxBytes: 10_000_000 });
+    const body = await readJson(request, { maxBytes: MAX_JOURNAL_IMPORT_BYTES });
     if (!body.archive) throw new GatewayError(400, "archive 必须是 portable journal 对象");
     const state = await manager.importSession(body.archive, { id: body.id, projectId: body.projectId });
     sendJson(response, 201, { session: state });
@@ -386,7 +387,7 @@ function isLoopback(host) {
 
 async function sendStatic(response, root, pathname) {
   const file = pathname === "/" ? "index.html" : pathname.slice(1);
-  const target = file === "state-patch.js" ? path.resolve(root, "..", file) : path.join(root, file);
+  const target = ["state-patch.js", "json-value-equality.js"].includes(file) ? path.resolve(root, "..", file) : path.join(root, file);
   const body = await fs.readFile(target);
   const type = file.endsWith(".html") ? "text/html" : file.endsWith(".js") ? "text/javascript" : "text/css";
   response.writeHead(200, {

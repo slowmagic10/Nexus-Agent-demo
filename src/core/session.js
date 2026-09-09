@@ -1,7 +1,8 @@
 // FOUNDATION — the single durable mutation boundary for an Agent session.
 import { redactSensitiveValue } from "../security/redact.js";
 import { createStatePatch } from "../state-patch.js";
-import { applyModelContextEvent, prepareModelRequest, projectModelContext } from "./model-context.js";
+import { ModelContextProjection } from "./model-context.js";
+import { queryToolHistory } from "./tool-history.js";
 
 export class AgentSession {
   #state;
@@ -19,12 +20,13 @@ export class AgentSession {
     if (typeof reducer !== "function") throw new Error("AgentSession 需要 reducer");
     this.#reducer = reducer;
     this.#journal = journal;
-    this.#state = journal?.ensureJournal(state) || structuredClone(state);
-    this.#cursor = journal?.latestSessionCursor?.(this.#state.id) || 0;
-    const durableEvents = journal?.readProjectionEvents?.(this.#state.id)
+    const restored = journal?.ensureJournalWithReceipt?.(state);
+    this.#state = restored?.state || journal?.ensureJournal(state) || structuredClone(state);
+    this.#cursor = restored?.cursor ?? (journal?.latestSessionCursor?.(this.#state.id) || 0);
+    const durableEvents = restored?.events ?? (journal?.readProjectionEvents?.(this.#state.id)
       || journal?.readSessionEvents?.(this.#state.id)
-      || [];
-    this.#modelContext = projectModelContext(durableEvents, this.#state);
+      || []);
+    this.#modelContext = new ModelContextProjection(durableEvents, this.#state);
     if (onState) this.subscribe(onState);
   }
 
@@ -41,8 +43,12 @@ export class AgentSession {
   }
 
   dispatch(action) {
+    return this.dispatchWithReceipt(action).then(({ state }) => state);
+  }
+
+  dispatchWithReceipt(action, { includeState = true } = {}) {
     if (this.#closed) return Promise.reject(new Error(`会话已删除或关闭：${this.id}`));
-    const operation = this.#dispatchTail.then(() => this.#commit(action));
+    const operation = this.#dispatchTail.then(() => this.#commit(action, includeState));
     this.#dispatchTail = operation.catch(() => {});
     return operation;
   }
@@ -69,7 +75,12 @@ export class AgentSession {
   }
 
   prepareModelRequest(options) {
-    return prepareModelRequest(this.#modelContext, options);
+    return this.#modelContext.prepareRequest(options);
+  }
+
+  queryToolHistory(options = {}) {
+    if (this.#closed) throw new Error(`会话已删除或关闭：${this.id}`);
+    return queryToolHistory(this.#journal, this.id, options);
   }
 
   events({ after = 0, limit = 500 } = {}) {
@@ -97,12 +108,12 @@ export class AgentSession {
     return () => this.#eventSubscribers.delete(subscription);
   }
 
-  async #commit(action) {
+  async #commit(action, includeState) {
     if (this.#closed) throw new Error(`会话已删除或关闭：${this.id}`);
     const durableAction = normalizeAction(action);
     const next = this.#reducer(this.#state, durableAction);
     const patch = createStatePatch(this.#state, next);
-    const event = this.#journal?.commitSessionEvent(next, durableAction, patch) || {
+    const event = this.#journal?.commitSessionEvent(next, durableAction, patch, { expectedCursor: this.#cursor }) || {
       cursor: this.#cursor + 1,
       sessionId: this.id,
       type: durableAction.type,
@@ -112,14 +123,16 @@ export class AgentSession {
     };
     this.#cursor = event.cursor;
     this.#state = next;
-    this.#modelContext = applyModelContextEvent(this.#modelContext, event, next);
+    this.#modelContext.applyEvent(event, next);
     for (const subscription of this.#eventSubscribers) {
       if (event.cursor <= subscription.cursor) continue;
       subscription.cursor = event.cursor;
       notifyObserver(subscription.listener, structuredClone(event));
     }
     for (const listener of this.#subscribers) notifyObserver(listener, structuredClone(next));
-    return this.state;
+    // Return this commit's cursor with its detached state. Another queued
+    // dispatch may finish before the caller resumes from awaiting the receipt.
+    return includeState ? { state: this.state, cursor: event.cursor } : { cursor: event.cursor };
   }
 }
 

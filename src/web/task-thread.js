@@ -948,6 +948,7 @@ function toolLabel(name) {
     apply_patch: "应用多文件 Patch",
     list_files: "查看文件",
     search_files: "搜索文件",
+    read_tool_history: "回查工具记录",
     memory_save: "保存长期记忆",
     memory_search: "搜索长期记忆",
     remember: "保存会话记忆",

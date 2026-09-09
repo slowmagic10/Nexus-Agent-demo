@@ -1,10 +1,13 @@
 import { setTimeout as delay } from "node:timers/promises";
 import { contextOverflowInfo, providerRequestFailureInfo } from "../providers/errors.js";
+import { assertContextBudget } from "../providers/request-policy.js";
 import { redactSensitiveText } from "../security/redact.js";
 import { RecoverableTaskError } from "./completion-guard.js";
+import { noModelUsage, normalizeModelUsage } from "./model-usage.js";
 import {
   createModelContextSummarizer,
   normalizeSemanticSummary,
+  prepareContextSummaryRequest,
   selectContextSummaryBatch,
 } from "./context-summary.js";
 
@@ -24,6 +27,7 @@ export class ContextLifecycle {
     retrieveMemory = async () => [],
     summarizeContext,
     maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
+    contextBudget = null,
     memorySearchTimeoutMs = DEFAULT_MEMORY_SEARCH_TIMEOUT_MS,
     contextSummaryTimeoutMs = DEFAULT_CONTEXT_SUMMARY_TIMEOUT_MS,
     modelRetryDelaysMs = DEFAULT_MODEL_RETRY_DELAYS_MS,
@@ -55,7 +59,8 @@ export class ContextLifecycle {
     if (typeof this.summarizeContext !== "function") {
       throw new Error("Context Lifecycle summarizeContext 必须是函数");
     }
-    this.maxInputTokens = maxInputTokens;
+    this.contextBudget = contextBudget === null ? null : assertContextBudget(contextBudget);
+    this.maxInputTokens = Math.min(maxInputTokens, this.contextBudget?.maxInputTokens ?? maxInputTokens);
     this.memorySearchTimeoutMs = memorySearchTimeoutMs;
     this.contextSummaryTimeoutMs = contextSummaryTimeoutMs;
     this.modelRetryDelaysMs = [...modelRetryDelaysMs];
@@ -97,24 +102,29 @@ export class ContextLifecycle {
 
   async #completeModelStep(signal, maxInputTokens, assertCanRequest) {
     let prepared = this.#prepareRequest(maxInputTokens);
-    prepared = await this.#prepareDurableSummary(prepared, signal, maxInputTokens);
+    prepared = await this.#prepareDurableSummary(prepared, signal, maxInputTokens, assertCanRequest);
     return this.#requestWithContextReplan(prepared, signal, assertCanRequest);
   }
 
   #prepareRequest(maxInputTokens) {
-    return this.session.prepareModelRequest({
+    const request = this.session.prepareModelRequest({
       systemPrompt: this.systemPrompt,
       tools: this.getTools(),
       maxInputTokens,
     });
+    if (this.contextBudget) request.contextPlan.contextBudget = { ...this.contextBudget };
+    return request;
   }
 
-  async #prepareDurableSummary(prepared, turnSignal, maxInputTokens) {
+  async #prepareDurableSummary(prepared, turnSignal, maxInputTokens, assertCanRequest) {
     let current = prepared;
+    const usesModel = this.summarizeContext.usesModel !== false;
     for (let attempt = 0; attempt < 2 && current.contextPlan.compacted; attempt += 1) {
       const plan = current.contextPlan.summary;
       const throughMessage = this.session.state.contextSummary?.throughMessage || 0;
       if (!plan || plan.included || plan.requiredThroughMessage <= throughMessage) break;
+      turnSignal.throwIfAborted();
+      if (usesModel) assertCanRequest();
       const batch = selectContextSummaryBatch(this.session.state.messages, {
         fromMessage: throughMessage,
         throughMessage: plan.requiredThroughMessage,
@@ -125,25 +135,36 @@ export class ContextLifecycle {
         fromMessage: batch.fromMessage,
         throughMessage: batch.throughMessage,
         sourceCursor,
-        modelCall: this.summarizeContext.usesModel !== false,
+        modelCall: usesModel,
       });
       const summarySignal = AbortSignal.any([
         turnSignal,
         AbortSignal.timeout(this.contextSummaryTimeoutMs),
       ]);
       const started = performance.now();
+      const summaryInput = {
+        previousSummary: this.session.state.contextSummary,
+        messages: batch.messages,
+        fromMessage: batch.fromMessage,
+        throughMessage: batch.throughMessage,
+        objective: this.session.state.objective,
+        plan: this.session.state.plan,
+        signal: summarySignal,
+      };
+      const summaryRequest = usesModel ? prepareContextSummaryRequest(summaryInput) : null;
+      let admitted = false;
+      let response;
       try {
-        const response = await raceWithSignal(Promise.resolve().then(() => this.summarizeContext({
-          previousSummary: this.session.state.contextSummary,
-          messages: batch.messages,
-          fromMessage: batch.fromMessage,
-          throughMessage: batch.throughMessage,
-          objective: this.session.state.objective,
-          plan: this.session.state.plan,
-          signal: summarySignal,
-        })), summarySignal);
+        response = await raceWithSignal(Promise.resolve().then(() => {
+          summarySignal.throwIfAborted();
+          if (usesModel) assertCanRequest();
+          admitted = true;
+          return this.summarizeContext(summaryInput);
+        }), summarySignal);
         const summary = normalizeSemanticSummary(response?.summary || response);
-        const usage = normalizeUsage(response?.usage, batch.messages, JSON.stringify(summary));
+        const accounting = usesModel
+          ? normalizeModelUsage(response?.usage, summaryRequest, response?.usageOutput || { text: JSON.stringify(summary) })
+          : noModelUsage();
         await this.session.dispatch({
           type: "CONTEXT_SUMMARY_COMPLETED",
           summary,
@@ -152,20 +173,34 @@ export class ContextLifecycle {
           sourceCursor,
           sourceComplete: batch.sourceComplete,
           model: response?.model || this.provider.name || "unknown",
-          usage,
+          modelCall: usesModel,
+          ...accounting,
           durationMs: Math.round(performance.now() - started),
         });
       } catch (error) {
-        if (turnSignal.aborted) throw error;
+        // Denied admission is a turn boundary, never a recoverable summary error.
+        if (!admitted) throw error;
+        let accounting = noModelUsage();
+        if (usesModel) {
+          const output = error?.usageOutput || response?.usageOutput || (response ? { text: JSON.stringify(response.summary || response) } : {});
+          try {
+            accounting = normalizeModelUsage(error?.usage ?? response?.usage, summaryRequest, output);
+          } catch {
+            // Malformed usage cannot turn an attempted model call into free work.
+            accounting = normalizeModelUsage(null, summaryRequest, output);
+          }
+        }
         await this.session.dispatch({
           type: "CONTEXT_SUMMARY_DEGRADED",
           fromMessage: batch.fromMessage,
           throughMessage: batch.throughMessage,
           sourceCursor,
-          usage: normalizeUsage(error?.usage || { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, batch.messages, ""),
+          modelCall: usesModel,
+          ...accounting,
           durationMs: Math.round(performance.now() - started),
           error: redactSensitiveText(error?.message || "Context summary 失败"),
         });
+        if (turnSignal.aborted) throw error;
         break;
       }
       current = this.#prepareRequest(maxInputTokens);
@@ -186,13 +221,14 @@ export class ContextLifecycle {
       await this.session.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
       await this.session.dispatch({ type: "MODEL_REQUESTED" });
       signal.throwIfAborted();
+      assertCanRequest();
       const started = performance.now();
       try {
         const response = await this.requestModel({ ...request, signal });
-        const usage = normalizeUsage(response.usage, request.messages, response.text);
+        const accounting = normalizeModelUsage(response.usage, request, response);
         await this.session.dispatch({
           type: "MODEL_COMPLETED",
-          usage,
+          ...accounting,
           durationMs: Math.round(performance.now() - started),
           finishReason: response.finishReason || null,
         });
@@ -244,7 +280,9 @@ export class ContextLifecycle {
           await this.session.dispatch({ type: "MODEL_STREAM_DISCARDED", reason: "context_replan" });
         }
         const durationMs = Math.round(performance.now() - started);
-        if (replanAttempts > 0) {
+        const outputCannotFit = Number.isSafeInteger(overflow.contextLimit)
+          && (this.contextBudget?.reservedOutputTokens || 0) >= overflow.contextLimit;
+        if (replanAttempts > 0 || outputCannotFit) {
           await this.session.dispatch({
             type: "MODEL_CONTEXT_REPLAN_EXHAUSTED",
             contextHash: contextPlan.contextHash,
@@ -252,11 +290,13 @@ export class ContextLifecycle {
             durationMs,
             overflow,
           });
-          throw new RecoverableTaskError("模型上下文在自动缩减并重试一次后仍然超限；请缩短当前消息或提高模型 Context Window", "context_replan_exhausted");
+          throw new RecoverableTaskError(outputCannotFit
+            ? "配置的模型输出额度已占满服务端声明的上下文容量；请调整输出上限或模型窗口后继续。"
+            : "模型上下文在自动缩减并重试一次后仍然超限；请缩短当前消息或提高模型 Context Window", "context_replan_exhausted");
         }
 
         replanAttempts += 1;
-        const nextMaxInputTokens = nextOverflowBudget(contextPlan, overflow);
+        const nextMaxInputTokens = nextOverflowBudget(contextPlan, overflow, this.contextBudget?.reservedOutputTokens || 0);
         await this.session.dispatch({
           type: "MODEL_CONTEXT_REPLAN_REQUESTED",
           contextHash: contextPlan.contextHash,
@@ -317,7 +357,7 @@ function failedRequestUsage(error, contextPlan, state, estimateInput) {
   }
   if (supplied && (supplied.inputTokens !== undefined || supplied.prompt_tokens !== undefined
     || supplied.outputTokens !== undefined || supplied.completion_tokens !== undefined)) {
-    const usage = normalizeUsage(supplied, [], partialText);
+    const usage = normalizeFailedPartialUsage(supplied, [], partialText);
     const hasInput = supplied.inputTokens !== undefined || supplied.prompt_tokens !== undefined;
     const hasOutput = supplied.outputTokens !== undefined || supplied.completion_tokens !== undefined;
     if (!hasInput) usage.inputTokens = estimateInput ? contextPlan.estimatedInputTokens : 0;
@@ -355,7 +395,9 @@ function raceWithSignal(operation, signal) {
   });
 }
 
-function normalizeUsage(usage, messages, text) {
+// Retain the existing failure policy: a known rejected request may have zero
+// input cost, while retryable requests account for possibly consumed input.
+function normalizeFailedPartialUsage(usage, messages, text) {
   const estimatedInputTokens = Math.ceil(JSON.stringify(messages).length / 4);
   const estimatedOutputTokens = Math.ceil(String(text || "").length / 4);
   if (usage) {
@@ -384,8 +426,10 @@ function assertTokenCount(value, field) {
   }
 }
 
-function nextOverflowBudget(contextPlan, overflow) {
-  const candidates = [contextPlan.maxInputTokens, contextPlan.estimatedInputTokens, overflow.contextLimit]
+function nextOverflowBudget(contextPlan, overflow, reservedOutputTokens = 0) {
+  const providerInputLimit = Number.isSafeInteger(overflow.contextLimit)
+    ? overflow.contextLimit - reservedOutputTokens : null;
+  const candidates = [contextPlan.maxInputTokens, contextPlan.estimatedInputTokens, providerInputLimit]
     .filter((value) => Number.isSafeInteger(value) && value > 0);
   const baseline = Math.min(...candidates);
   const next = Math.min(

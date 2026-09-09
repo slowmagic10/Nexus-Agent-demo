@@ -1,3 +1,5 @@
+import { redactSensitiveText } from "../security/redact.js";
+
 export const MEMORY_CONTEXT_ESTIMATOR_VERSION = "utf8-bytes-div3-v1";
 export const DEFAULT_PINNED_MEMORY_TOKENS = 1_200;
 export const DEFAULT_RELEVANT_MEMORY_TOKENS = 2_000;
@@ -14,13 +16,30 @@ export async function retrieveContextMemories(memory, query, {
   validateBudget(pinnedTokenBudget, "pinnedTokenBudget");
   validateBudget(relevantTokenBudget, "relevantTokenBudget");
   const access = { scope, signal };
+  const preparedQuery = fitSearchQuery(query, memory.capabilities?.maxSearchQueryChars);
   const pinned = await memory.search("", access, { limit: pinnedLimit, statuses: ["active"], pinned: true });
-  const relevant = await memory.search(query, access, { limit: relevantLimit, statuses: ["active"], pinned: false });
+  const relevant = await memory.search(preparedQuery.query, access, { limit: relevantLimit, statuses: ["active"], pinned: false });
   const pinnedIds = new Set(pinned.map((item) => item.id));
   return [
     ...selectWithinBudget(pinned, "pinned", pinnedTokenBudget),
-    ...selectWithinBudget(relevant.filter((item) => !pinnedIds.has(item.id)), "relevant", relevantTokenBudget),
+    ...selectWithinBudget(relevant.filter((item) => !pinnedIds.has(item.id)).map((item) => preparedQuery.truncated
+      ? { ...item, contextQueryTruncated: true } : item), "relevant", relevantTokenBudget),
   ];
+}
+
+// Long user tasks remain intact in the Session. Only automatic memory retrieval
+// samples their head and tail to fit an Adapter's explicitly declared query cap.
+function fitSearchQuery(value, limit) {
+  const safeQuery = redactSensitiveText(String(value || ""));
+  if (!Number.isSafeInteger(limit) || limit < 32) return { query: safeQuery, truncated: false };
+  const query = safeQuery.trim();
+  if (query.length <= limit) return { query: safeQuery, truncated: false };
+  const headLength = Math.floor((limit - 1) / 2);
+  let head = query.slice(0, headLength);
+  let tail = query.slice(-(limit - headLength - 1));
+  if (/[\uD800-\uDBFF]$/.test(head)) head = head.slice(0, -1);
+  if (/^[\uDC00-\uDFFF]/.test(tail)) tail = tail.slice(1);
+  return { query: `${head}\n${tail}`, truncated: true };
 }
 
 function selectWithinBudget(records, retrievalClass, maxTokens) {

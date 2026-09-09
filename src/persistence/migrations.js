@@ -213,6 +213,50 @@ const migrations = [
       `);
     },
   },
+  {
+    version: 10,
+    up(db) {
+      // Derived content only: authority and lifecycle remain on memories. Business
+      // IDs, unlike implicit rowids, also remain stable across VACUUM/table copies.
+      db.exec(`
+        CREATE VIRTUAL TABLE memory_search_fts USING fts5(
+          memory_id UNINDEXED, content, tags_json, tokenize = 'trigram'
+        );
+        CREATE TRIGGER memories_search_insert AFTER INSERT ON memories BEGIN
+          INSERT INTO memory_search_fts(memory_id, content, tags_json)
+          VALUES (NEW.id, NEW.content, NEW.tags_json);
+        END;
+        CREATE TRIGGER memories_search_update AFTER UPDATE OF id, content, tags_json ON memories BEGIN
+          DELETE FROM memory_search_fts WHERE memory_id = OLD.id;
+          INSERT INTO memory_search_fts(memory_id, content, tags_json)
+          VALUES (NEW.id, NEW.content, NEW.tags_json);
+        END;
+        CREATE TRIGGER memories_search_delete AFTER DELETE ON memories BEGIN
+          DELETE FROM memory_search_fts WHERE memory_id = OLD.id;
+        END;
+        INSERT INTO memory_search_fts(memory_id, content, tags_json)
+        SELECT id, content, tags_json FROM memories;
+      `);
+    },
+  },
+  {
+    version: 11,
+    up(db) {
+      // Existing snapshots have no proven Journal cursor. Refresh them on the
+      // first new commit instead of treating a legacy cache as authoritative.
+      addColumn(db, "sessions", "cache_cursor", "INTEGER");
+      addColumn(db, "sessions", "display_title", "TEXT");
+      addColumn(db, "sessions", "cache_generation", "INTEGER NOT NULL DEFAULT 0");
+      db.exec(`
+        CREATE TRIGGER IF NOT EXISTS sessions_invalidate_legacy_cache
+        AFTER UPDATE OF state_json ON sessions
+        WHEN NEW.cache_generation IS OLD.cache_generation
+        BEGIN
+          UPDATE sessions SET cache_cursor = NULL, display_title = NULL WHERE id = NEW.id;
+        END;
+      `);
+    },
+  },
 ];
 
 export function migrateDatabase(db) {

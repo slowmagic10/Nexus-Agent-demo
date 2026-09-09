@@ -1,4 +1,6 @@
 // FOUNDATION — routes the Tool Host interface by the durable Session permission profile.
+import { refreshVerification } from "../core/verification.js";
+import { runToolBatch } from "./batch.js";
 export class PermissionToolHostRouter {
   constructor({ hosts, defaultProfile = "workspace-auto" } = {}) {
     const entries = hosts instanceof Map ? [...hosts.entries()] : Object.entries(hosts || {});
@@ -36,6 +38,18 @@ export class PermissionToolHostRouter {
 
   execute(call, context = {}) {
     return this.#resolve(context.session?.state?.permissionProfile).execute(call, context);
+  }
+
+  executeBatch(calls, context = {}) {
+    return runToolBatch(calls, context, {
+      prepareRead: (call) => this.#resolve(context.session?.state?.permissionProfile).prepareParallelRead?.(call, context) || null,
+      executeSerial: (call) => this.execute(call, context),
+    });
+  }
+
+  refreshVerification(context = {}) {
+    const host = this.#resolve(context.session?.state?.permissionProfile);
+    return typeof host.refreshVerification === "function" ? host.refreshVerification(context) : refreshVerification(context);
   }
 
   #resolve(profile) {

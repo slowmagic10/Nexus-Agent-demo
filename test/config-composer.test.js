@@ -538,3 +538,143 @@ test("最终生效配置输出会脱敏 Key 并序列化无限步骤与 Token �
   assert.equal(JSON.stringify(inspected).includes("secret-key"), false);
   assert.equal(createConfiguredProvider(config).name, "openai-compatible/gpt-4.1-mini");
 });
+
+test("Provider 请求契约按配置层覆盖，真实容量与有效输入预算分别保留", async (t) => {
+  const workspace = await requestPolicyWorkspace(t);
+  await fs.writeFile(path.join(workspace, "nexus.config.json"), JSON.stringify({ provider: {
+    contextWindowTokens: 100_000, contextTargetTokens: 20_000,
+    maxOutputTokens: 2_000, outputTokenParameter: "max_tokens", streamUsage: true,
+  } }));
+  const localFile = path.join(workspace, ".nexus", "config.local.json");
+  await fs.writeFile(localFile, JSON.stringify({ provider: {
+    type: "openai-compatible", apiKey: "request-policy-secret", contextTargetTokens: 30_000,
+    maxOutputTokens: 3_000, outputTokenParameter: "max_completion_tokens", streamUsage: false,
+  } }));
+  const local = await composeRuntimeConfig({ root: workspace, env: {} });
+  assert.equal(local.provider.contextTargetTokens, 30_000);
+  assert.equal(local.provider.maxOutputTokens, 3_000);
+  assert.equal(local.provider.outputTokenParameter, "max_completion_tokens");
+  assert.equal(local.provider.streamUsage, false);
+  assert.equal(local.sources["provider.contextTargetTokens"], "local_private");
+  const env = { NEXUS_CONTEXT_TARGET_TOKENS: "40000", NEXUS_MAX_OUTPUT_TOKENS: "4000",
+    NEXUS_OUTPUT_TOKEN_PARAMETER: "max_tokens", NEXUS_STREAM_USAGE: "true" };
+  const environmental = await composeRuntimeConfig({ root: workspace, env });
+  assert.equal(environmental.provider.contextTargetTokens, 40_000);
+  assert.equal(environmental.provider.maxOutputTokens, 4_000);
+  assert.equal(environmental.provider.outputTokenParameter, "max_tokens");
+  assert.equal(environmental.provider.streamUsage, true);
+  assert.equal(environmental.sources["provider.streamUsage"], "environment");
+  const cli = await composeRuntimeConfig({ root: workspace, env, args: [
+    "--context-target-tokens=95000", "--max-output-tokens=10000",
+    "--output-token-parameter=max_completion_tokens", "--stream-usage=false",
+  ] });
+  assert.equal(cli.provider.contextWindowTokens, 100_000);
+  assert.equal(cli.provider.contextTargetTokens, 95_000);
+  assert.equal(cli.runtime.maxInputTokens, 90_000);
+  assert.equal(cli.sources["provider.maxOutputTokens"], "cli");
+  const binding = createConfiguredAgentProviders(cli).get("default");
+  assert.equal(binding.descriptor.contextWindowTokens, 100_000);
+  assert.equal(binding.descriptor.contextTargetTokens, 95_000);
+  assert.equal(binding.descriptor.maxOutputTokens, 10_000);
+  assert.equal(binding.descriptor.outputTokenParameter, "max_completion_tokens");
+  assert.equal("streamUsage" in binding.descriptor, false);
+  const inspected = inspectRuntimeConfig(cli);
+  assert.equal(inspected.runtime.maxInputTokens, 90_000);
+  assert.equal(inspected.provider.contextTargetTokens, 95_000);
+  assert.doesNotMatch(JSON.stringify(inspected), /request-policy-secret/);
+  await fs.rm(localFile);
+  const shared = await composeRuntimeConfig({ root: workspace, env: { OPENAI_API_KEY: "test" } });
+  assert.equal(shared.provider.contextTargetTokens, 20_000);
+  assert.equal(shared.sources["provider.contextTargetTokens"], "workspace_profile");
+});
+
+test("Provider 请求契约允许显式 reset，默认 inspection 与 descriptor 不新增字段", async (t) => {
+  const workspace = await requestPolicyWorkspace(t);
+  const file = path.join(workspace, ".nexus", "config.local.json");
+  await fs.writeFile(file, JSON.stringify({ provider: {
+    type: "openai-compatible", apiKey: "test", contextTargetTokens: 10_000,
+    maxOutputTokens: 1_000, outputTokenParameter: "max_tokens", streamUsage: true,
+  } }));
+  const reset = await composeRuntimeConfig({ root: workspace, env: {
+    NEXUS_CONTEXT_TARGET_TOKENS: "provider-default", NEXUS_MAX_OUTPUT_TOKENS: "provider-default",
+    NEXUS_OUTPUT_TOKEN_PARAMETER: "provider-default", NEXUS_STREAM_USAGE: "false",
+  } });
+  for (const field of ["contextTargetTokens", "maxOutputTokens", "outputTokenParameter"]) {
+    assert.equal(reset.provider[field], null);
+    assert.equal(field in inspectRuntimeConfig(reset).provider, false);
+    assert.equal(field in createConfiguredAgentProviders(reset).get("default").descriptor, false);
+  }
+  assert.equal(reset.provider.streamUsage, false);
+  assert.equal("streamUsage" in inspectRuntimeConfig(reset).provider, false);
+  assert.equal(reset.runtime.maxInputTokens, 32_000);
+  const resetCli = await composeRuntimeConfig({ root: workspace, env: {}, args: [
+    "--context-target-tokens=provider-default", "--max-output-tokens=provider-default",
+    "--output-token-parameter=provider-default", "--stream-usage=false",
+  ] });
+  assert.deepEqual(resetCli.provider, reset.provider);
+  await fs.writeFile(file, JSON.stringify({ provider: {
+    type: "openai-compatible", apiKey: "test", contextTargetTokens: null,
+    maxOutputTokens: null, outputTokenParameter: null, streamUsage: false,
+  } }));
+  assert.deepEqual((await composeRuntimeConfig({ root: workspace, env: {} })).provider, reset.provider);
+});
+
+test("请求契约拒绝错误类型、不完整兼容契约和跨 Adapter 功能", async (t) => {
+  const workspace = await requestPolicyWorkspace(t);
+  const env = { OPENAI_API_KEY: "test" };
+  for (const args of [
+    ["--context-target-tokens=0"], ["--max-output-tokens=1.5"],
+    ["--context-target-tokens=9007199254740992"], ["--stream-usage=1"], ["--stream-usage=TRUE"],
+    ["--output-token-parameter=max_output_tokens"], ["--max-output-tokens=1000"],
+    ["--context-target-tokens=32001"], ["--max-output-tokens=32000", "--output-token-parameter=max_tokens"],
+    ["--provider=openai-responses", "--output-token-parameter=max_tokens"],
+    ["--provider=openai-responses", "--stream-usage=true"],
+  ]) await assert.rejects(composeRuntimeConfig({ root: workspace, env, args }));
+  const file = path.join(workspace, ".nexus", "config.local.json");
+  for (const provider of [
+    { contextTargetTokens: "1000" }, { maxOutputTokens: "1000", outputTokenParameter: "max_tokens" },
+    { streamUsage: "false" }, { streamUsage: null },
+  ]) {
+    await fs.writeFile(file, JSON.stringify({ provider }));
+    await assert.rejects(composeRuntimeConfig({ root: workspace, env }));
+  }
+  await fs.writeFile(file, "{}");
+  const parameterOnly = await composeRuntimeConfig({ root: workspace, env, args: ["--output-token-parameter=max_tokens"] });
+  assert.equal(parameterOnly.provider.maxOutputTokens, null);
+  assert.equal(parameterOnly.provider.outputTokenParameter, "max_tokens");
+  const responses = await composeRuntimeConfig({ root: workspace, env, args: [
+    "--provider=openai-responses", "--max-output-tokens=1000",
+  ] });
+  assert.equal(responses.provider.maxOutputTokens, 1_000);
+  assert.equal(responses.runtime.maxInputTokens, 31_000);
+});
+
+test("--demo 清除输出 wire 契约并保留默认和具名 Profile 的规划目标", async (t) => {
+  const workspace = await requestPolicyWorkspace(t);
+  await fs.writeFile(path.join(workspace, ".nexus", "config.local.json"), JSON.stringify({
+    provider: { type: "openai-compatible", apiKey: "test", contextTargetTokens: 8_000,
+      maxOutputTokens: 1_000, outputTokenParameter: "max_tokens", streamUsage: true },
+    agents: { profiles: { review: { provider: { contextWindowTokens: 80_000,
+      contextTargetTokens: 12_000, maxOutputTokens: 2_000, outputTokenParameter: "max_completion_tokens", streamUsage: true } } } },
+  }));
+  const config = await composeRuntimeConfig({ root: workspace, env: {}, args: ["--demo"] });
+  assert.equal(config.provider.contextTargetTokens, 8_000);
+  assert.equal(config.runtime.maxInputTokens, 8_000);
+  assert.equal(config.provider.maxOutputTokens, null);
+  assert.equal(config.provider.outputTokenParameter, null);
+  assert.equal(config.provider.streamUsage, false);
+  const review = config.agents.profiles.find((profile) => profile.id === "review");
+  assert.equal(review.provider.type, "demo");
+  assert.equal(review.provider.contextWindowTokens, 80_000);
+  assert.equal(review.provider.contextTargetTokens, 12_000);
+  assert.equal(review.provider.maxOutputTokens, null);
+  assert.equal(review.provider.outputTokenParameter, null);
+  assert.equal(review.provider.streamUsage, false);
+});
+
+async function requestPolicyWorkspace(t) {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-config-request-policy-"));
+  await fs.mkdir(path.join(workspace, ".nexus"), { recursive: true });
+  t.after(() => fs.rm(workspace, { recursive: true, force: true }));
+  return workspace;
+}

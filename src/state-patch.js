@@ -1,4 +1,6 @@
 // FOUNDATION — shared top-level projection protocol for durable session events.
+import { sameJsonValue } from "./json-value-equality.js";
+
 export function createStatePatch(previous, next) {
   const patch = { set: {}, append: {}, remove: [] };
   const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
@@ -39,5 +41,5 @@ function isPrefix(previous, next) {
 }
 
 function sameValue(left, right) {
-  return JSON.stringify(left) === JSON.stringify(right);
+  return sameJsonValue(left, right);
 }

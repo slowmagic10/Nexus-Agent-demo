@@ -3,6 +3,9 @@ import { ToolHost } from "../tools/host.js";
 import { ContextLifecycle } from "./context-lifecycle.js";
 import { completionIssues, completionFeedback, MAX_COMPLETION_CORRECTIONS, RecoverableTaskError } from "./completion-guard.js";
 import { resolveObjectiveMode, isObjectiveStatusQuestion } from "./objective-continuation.js";
+import { refreshVerification } from "./verification.js";
+import { ProgressMonitor } from "./progress-monitor.js";
+import { ToolBatchError } from "../tools/batch.js";
 
 export class AgentRuntime {
   constructor({
@@ -19,6 +22,7 @@ export class AgentRuntime {
     maxSteps = Infinity,
     maxTokensPerTurn = Infinity,
     maxInputTokens = 32_000,
+    contextBudget = null,
     memorySearchTimeoutMs = 2_000,
     memoryReconcileTimeoutMs = 2_000,
     contextSummaryTimeoutMs = 15_000,
@@ -41,6 +45,11 @@ export class AgentRuntime {
       registry: {
         schemas: () => tools.schemas(),
         get: (name) => tools.get?.(name) || null,
+        ...(typeof tools.resolve === "function" ? { resolve: (name) => tools.resolve(name) } : {}),
+        ...(typeof tools.acquire === "function" ? { acquire: (name, id) => tools.acquire(name, id) } : {}),
+        ...(typeof tools.refreshVerification === "function" ? { refreshVerification: (context) => tools.refreshVerification(context) } : {}),
+        ...(tools.accessPolicy ? { accessPolicy: tools.accessPolicy } : {}),
+        ...(tools.accessPolicies ? { accessPolicies: tools.accessPolicies } : {}),
       },
     });
     if (typeof this.toolHost.schemas !== "function" || typeof this.toolHost.execute !== "function") {
@@ -61,6 +70,7 @@ export class AgentRuntime {
       retrieveMemory,
       summarizeContext,
       maxInputTokens,
+      contextBudget,
       memorySearchTimeoutMs,
       contextSummaryTimeoutMs,
       modelRetryDelaysMs,
@@ -110,6 +120,10 @@ export class AgentRuntime {
     });
     const turnSourceCursor = this.session.cursor;
     let completionCorrections = 0;
+    const progressMonitor = new ProgressMonitor();
+    const stopObservingProgress = this.session.subscribeEvents((event) => {
+      for (const projected of event.patch?.append?.events || []) progressMonitor.observe(projected);
+    }, { after: turnSourceCursor });
 
     try {
       const contextTurn = await this.contextLifecycle.startTurn({
@@ -147,6 +161,12 @@ export class AgentRuntime {
           throwIfAborted(abortController.signal);
           if (this.state.plan?.blockedReason) {
             throw new RecoverableTaskError(`任务存在阻塞：${this.state.plan.blockedReason}`, "objective_blocked");
+          }
+          if (this.state.plan?.acceptance?.length) {
+            const context = { session: this.session, signal: abortController.signal };
+            if (typeof this.toolHost.refreshVerification === "function") await this.toolHost.refreshVerification(context);
+            else await refreshVerification(context);
+            throwIfAborted(abortController.signal);
           }
           const reasons = completionIssues(this.state, response.text);
           if (reasons.length) {
@@ -190,27 +210,31 @@ export class AgentRuntime {
           throw new Error(`本轮累计 Token 用量超过预算 ${this.maxTokensPerTurn}；尚未执行最新工具调用。可通过 NEXUS_MAX_TOKENS_PER_TURN 或 --max-tokens-per-turn 调整`);
         }
 
-        for (const call of response.toolCalls) {
-          await this.toolHost.execute(call, {
-            session: this.session,
-            signal: abortController.signal,
-            requestApproval,
-          });
-        }
+        const toolContext = { session: this.session, signal: abortController.signal, requestApproval };
+        if (typeof this.toolHost.executeBatch === "function") await this.toolHost.executeBatch(response.toolCalls, toolContext);
+        else for (const call of response.toolCalls) await this.toolHost.execute(call, toolContext);
+        throwIfAborted(abortController.signal);
+        // Finish the entire assistant tool batch before adding any feedback;
+        // never split the Provider's assistant/tool protocol with a system message.
+        const intervention = progressMonitor.takeIntervention();
+        if (intervention) await this.dispatch(intervention);
       }
       throw new Error(`达到最大步骤数 ${this.maxSteps}，已停止本轮任务。`);
     } catch (error) {
       if (abortController.signal.aborted) {
-        await this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务" });
+        await this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务",
+          ...(error instanceof ToolBatchError ? { toolBatchFailure: true } : {}) });
       } else {
         await this.dispatch({
           type: "FAILED",
           error: redactSensitiveText(error.message),
           ...(error instanceof RecoverableTaskError ? { recoverable: true, reason: error.reason } : {}),
+          ...(error instanceof ToolBatchError ? { recoverable: true, reason: "tool_batch_failed", toolBatchFailure: true } : {}),
         });
       }
       return this.state;
     } finally {
+      stopObservingProgress();
       if (this.abortController === abortController) this.abortController = null;
     }
   }

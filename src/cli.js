@@ -5,9 +5,10 @@ import { fileURLToPath } from "node:url";
 import { promises as fs } from "node:fs";
 import { createSession, reduceSession } from "./core/state.js";
 import { createAgentProfileSnapshot } from "./core/agent-profile.js";
+import { configuredContextBudget, resolveContextBudget } from "./providers/request-policy.js";
 import { appendAgentInstructions } from "./core/named-agent-profiles.js";
 import { AgentSession } from "./core/session.js";
-import { composeRuntimeConfig, inspectRuntimeConfig } from "./config/composer.js";
+import { composeRuntimeConfig, inspectRuntimeConfig, createConfiguredAgentProviders } from "./config/composer.js";
 import { TerminalUI, helpText } from "./ui.js";
 import { loadLocalEnvironment } from "./local-environment.js";
 import { createMemoryScope } from "./memory/scope.js";
@@ -16,6 +17,9 @@ import { compareReplayEvaluations, evaluateJournalArchive } from "./evaluation/r
 import { runScenarioEvaluation } from "./evaluation/scenario-harness.js";
 import { loadScenarioSuiteDirectory, runScenarioSuite } from "./evaluation/scenario-suite.js";
 import { compareScenarioSuiteReports } from "./evaluation/scenario-suite-comparison.js";
+import { runWorkspaceTaskSuite } from "./evaluation/workspace-task-suite.js";
+import { runMemoryRetrievalSuite } from "./evaluation/memory-retrieval-suite.js";
+import { createWorkspaceExecution } from "./execution/factory.js";
 import { createRuntimeAssembly } from "./runtime/assembly.js";
 import {
   discardMemoryMutation,
@@ -35,6 +39,10 @@ const evaluationSuiteDirectory = args.find((arg) => arg.startsWith("--evaluate-s
 const suiteTags = args.find((arg) => arg.startsWith("--suite-tags="))?.slice("--suite-tags=".length);
 const suiteBaselineFile = args.find((arg) => arg.startsWith("--suite-baseline="))?.slice("--suite-baseline=".length);
 const suiteTokenTolerance = args.find((arg) => arg.startsWith("--suite-token-tolerance="))?.slice("--suite-token-tolerance=".length);
+const suiteMode = args.find((arg) => arg.startsWith("--suite-mode="))?.slice("--suite-mode=".length);
+const evaluationTasksFile = args.find((arg) => arg.startsWith("--evaluate-tasks="))?.slice("--evaluate-tasks=".length);
+const evaluationMemoryFile = args.find((arg) => arg.startsWith("--evaluate-memory="))?.slice("--evaluate-memory=".length);
+const taskShell = args.includes("--task-eval-shell");
 for (const [flag, value] of Object.entries({
   "--evaluate-archive": evaluationArchiveFile,
   "--compare-archive": comparisonArchiveFile,
@@ -42,24 +50,84 @@ for (const [flag, value] of Object.entries({
   "--evaluate-suite": evaluationSuiteDirectory,
   "--suite-baseline": suiteBaselineFile,
   "--suite-token-tolerance": suiteTokenTolerance,
+  "--suite-mode": suiteMode,
+  "--evaluate-tasks": evaluationTasksFile,
+  "--evaluate-memory": evaluationMemoryFile,
 })) {
   if (value === "") {
     console.error(`${flag} 不能为空`);
     process.exit(1);
   }
 }
-const evaluationModes = [evaluationArchiveFile || comparisonArchiveFile, evaluationScenarioFile, evaluationSuiteDirectory].filter(Boolean);
+const evaluationModes = [evaluationArchiveFile || comparisonArchiveFile, evaluationScenarioFile, evaluationSuiteDirectory, evaluationTasksFile, evaluationMemoryFile].filter(Boolean);
 if (evaluationModes.length > 1) {
-  console.error("Archive、Scenario 和 Scenario Suite 评测参数不能同时使用");
+  console.error("Archive、Scenario、Scenario Suite、任务效果和记忆检索评测参数不能同时使用");
   process.exit(1);
 }
-if ((suiteTags !== undefined || suiteBaselineFile !== undefined || suiteTokenTolerance !== undefined) && !evaluationSuiteDirectory) {
-  console.error("--suite-tags、--suite-baseline 和 --suite-token-tolerance 必须与 --evaluate-suite 一起使用");
+if ((suiteTags !== undefined || suiteBaselineFile !== undefined || suiteTokenTolerance !== undefined || suiteMode !== undefined) && !evaluationSuiteDirectory) {
+  console.error("--suite-tags、--suite-baseline、--suite-mode 和 --suite-token-tolerance 必须与 --evaluate-suite 一起使用");
   process.exit(1);
 }
-if (suiteTokenTolerance !== undefined && suiteBaselineFile === undefined) {
-  console.error("--suite-token-tolerance 必须与 --suite-baseline 一起使用");
+if ((suiteTokenTolerance !== undefined || suiteMode !== undefined) && suiteBaselineFile === undefined) {
+  console.error("--suite-token-tolerance 和 --suite-mode 必须与 --suite-baseline 一起使用");
   process.exit(1);
+}
+if (taskShell && !evaluationTasksFile) {
+  console.error("--task-eval-shell 必须与 --evaluate-tasks 一起使用");
+  process.exit(1);
+}
+if (evaluationMemoryFile) {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new Error("用户停止记忆检索评测"));
+  process.once("SIGINT", cancel);
+  process.once("SIGTERM", cancel);
+  try {
+    const input = await fs.readFile(path.resolve(evaluationMemoryFile), "utf8");
+    if (Buffer.byteLength(input) > 4_000_000) throw new Error("Memory fixture 文件过大");
+    const report = await runMemoryRetrievalSuite(JSON.parse(input), { signal: controller.signal });
+    console.log(JSON.stringify(report, null, 2));
+    process.exitCode = report.passed ? 0 : 2;
+  } catch {
+    console.error(controller.signal.aborted ? "Memory 检索评测已取消。"
+      : "Memory 检索评测失败：请检查 fixture 格式、标注与本机SQLite支持。");
+    process.exitCode = controller.signal.aborted ? 2 : 1;
+  } finally {
+    process.removeListener("SIGINT", cancel);
+    process.removeListener("SIGTERM", cancel);
+  }
+  process.exit(process.exitCode || 0);
+}
+if (evaluationTasksFile) {
+  try {
+    const input = await fs.readFile(path.resolve(evaluationTasksFile), "utf8");
+    if (Buffer.byteLength(input) > 12_000_000) throw new Error("任务评测 fixture 过大");
+    const localEnvironment = loadLocalEnvironment(root);
+    const config = await composeRuntimeConfig({
+      args: args.filter((arg) => !arg.startsWith("--evaluate-tasks=") && arg !== "--task-eval-shell"),
+      env: process.env, root, localEnvironment, useProjectsDefault: true,
+    });
+    const controller = new AbortController();
+    const cancel = () => controller.abort(new Error("用户停止评测"));
+    process.once("SIGINT", cancel);
+    process.once("SIGTERM", cancel);
+    try {
+      const report = await runWorkspaceTaskSuite(JSON.parse(input), {
+        providerFactory: () => createConfiguredAgentProviders(config).get(config.agents.defaultProfile),
+        executionFactory: ({ workspace }) => createWorkspaceExecution({ ...config, workspace }),
+        allowShell: taskShell,
+        signal: controller.signal,
+      });
+      console.log(JSON.stringify(report, null, 2));
+      process.exitCode = report.passed ? 0 : 2;
+    } finally {
+      process.removeListener("SIGINT", cancel);
+      process.removeListener("SIGTERM", cancel);
+    }
+  } catch (error) {
+    console.error(`任务效果评测失败：${error.message}`);
+    process.exitCode = 1;
+  }
+  process.exit(process.exitCode || 0);
 }
 if (evaluationSuiteDirectory) {
   try {
@@ -71,7 +139,7 @@ if (evaluationSuiteDirectory) {
           comparison: compareScenarioSuiteReports(
             JSON.parse(await fs.readFile(path.resolve(suiteBaselineFile), "utf8")),
             report,
-            { maxTokenIncreasePercent: suiteTokenTolerance === undefined ? 0 : Number(suiteTokenTolerance) },
+            { maxTokenIncreasePercent: suiteTokenTolerance === undefined ? 0 : Number(suiteTokenTolerance), mode: suiteMode || "regression" },
           ),
         }
       : report;
@@ -190,10 +258,8 @@ const memoryScope = selectedAgentProfile.id === "default"
   : createMemoryScope({ ...baseMemoryScope, agentId: selectedAgentProfile.id });
 const selectedProviderBinding = agentProviders.get(selectedAgentProfile.id);
 const provider = selectedProviderBinding.provider;
-const maxInputTokens = selectedAgentProfile.provider.contextWindowTokens
-  ?? config.runtime.maxInputTokens
-  ?? config.provider.contextWindowTokens
-  ?? 32_000;
+const maxInputTokens = resolveContextBudget(selectedAgentProfile.provider).maxInputTokens;
+const contextBudget = configuredContextBudget(selectedAgentProfile.provider);
 const activated = await assembly.activate({
   defaultPermissionProfile: selectedAgentProfile.permissionProfile,
   permissionProfileNames: [selectedAgentProfile.permissionProfile],
@@ -202,10 +268,7 @@ const { tools, toolHost, permissionProfile, workspaceExecution } = activated;
 const systemPrompt = appendAgentInstructions(activated.systemPrompt, selectedAgentProfile.instructions);
 const agentProfile = createAgentProfileSnapshot({
   id: selectedAgentProfile.id,
-  provider: {
-    ...selectedProviderBinding.descriptor,
-    contextWindowTokens: maxInputTokens,
-  },
+  provider: selectedProviderBinding.descriptor,
   workspace,
   systemPrompt,
   toolSchemas: tools.schemas(),
@@ -243,6 +306,7 @@ const runtime = assembly.createAgentRuntime({
   maxSteps: selectedAgentProfile.maxSteps,
   maxTokensPerTurn: selectedAgentProfile.maxTokensPerTurn,
   maxInputTokens,
+  contextBudget,
 });
 
 ui.render(runtime.state);

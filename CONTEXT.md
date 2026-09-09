@@ -28,9 +28,22 @@ _Avoid_: Auto router, model fallback, mid-turn switch, provider hidden behind gl
 Config Composition 与 Named Agent Profile 共同拥有的显式三态 Provider 行为：`provider-default` 不发送开关，`enabled/disabled` 只允许由声明支持它的 OpenAI-compatible Adapter 翻译成线协议。它进入 Agent Profile Snapshot、Profile Drift、配置 inspection 和 Web 标识，但不根据模型名或 Endpoint 推断，也不允许 active turn 热切换。思考模式工具轮所需的 `reasoning_content` 仍作为 opaque `provider_items` durable 保存并原样续传；关闭开关不会授权 Context Lifecycle 猜测或改写既有 Provider 状态。
 _Avoid_: Vendor heuristics, arbitrary extra request body, silently ignoring unsupported options, UI-only toggle, mid-turn thinking switch
 
+**Provider Request Policy**:
+显式配置的 Provider 请求参数及工作上下文规划契约。`contextWindowTokens` 是声明的真实总容量，`contextTargetTokens` 是可选主任务输入目标，`maxOutputTokens` 同时作为明确 wire 输出上限和容量预留；有效输入目标取目标与容量减预留的较小值。Compatible 必须显式选择 `max_tokens/max_completion_tokens`，流式 usage 只在明确启用后请求；Responses 使用固定 `max_output_tokens` 并拒绝 Compatible 专用字段。默认不发送新字段、不新增预留；配置不按模型名猜测能力，也不自动换参数重试。非默认策略进入 Agent Profile schema2 和 Drift，旧默认 schema1/hash 保持；请求配置并不证明远端已支持，服务端模型 revision/tokenizer 等未探测信息仍未知。
+_Avoid_: Context target as model capacity, hidden output cap, model-name heuristics, silently accepting unsupported parameters, contextHash as complete generation identity
+
 **Durable Session Event**:
 已经原子写入 session journal、可用于恢复和审计的事实；只有 durable event 才能推进投影或对外发布。
 _Avoid_: Log line, transient callback
+
+**Session State Patch**:
+跨Journal、SSE和Client Projection共用的顶层set/append/remove协议，新增值保持独立副本。Node具备原生Proxy检测时，对稳定普通JSON数据按值和原键序比较，避免未变化长文本反复序列化；特殊值、accessor/toJSON/Proxy/rawJSON或探测预算超限回到原JSON.stringify语义，包括异常。浏览器及不支持原生检测的环境保持原路径。优化减少临时文本生成，不免除状态/历史遍历，也不允许按动作猜测而省略字段。
+_Avoid_: Key-order normalization changing existing patches, swallowed serializer errors, patch payload sharing mutable state, serialized text bytes as peak memory
+
+**Dispatch Receipt**:
+AgentSession 同一次durable提交直接返回的 `{state,cursor}`；并发调用通过dispatchWithReceipt获取自身来源位置，而不是await后读取可能已前进的Session.cursor。原dispatch仍返回独立state，队列、observer隔离、提交失败和close语义保留。Tool Host据此为新Tool Result绑定实际TOOL_REQUESTED cursor，旧日志缺字段时不补造。
+仅需要来源位置时可显式includeState:false省去回执中的整份state副本，默认与订阅者快照保持。SQLite初始化通过同次事务的state/cursor/events receipt保证基态与游标一致，提交在事务内检查expectedCursor，冲突拒绝且不发布。
+_Avoid_: Reading the latest cursor as the current operation identity, display event seq as a receipt, observers as commit authority
 
 **Artifact**:
 不适合直接放进 Model Context 或 Journal event 主体的大型结果对象。首版只保存不超过 4 MB 的脱敏 UTF-8 文本，以 Session ID 作为读取边界，并记录 media type、byte size 和 SHA-256；成功、失败、取消、超时等 Tool 终态共享同一 Artifact policy，Adapter 不得在 Tool Host 前提前截断。Tool Result 只携带预览与引用，模型通过 `read_artifact` 分段读取。Portable Journal 可携带完整内容并在 Import 时重绑定目标 Session；Branch 只复制指定 cursor 已引用的内容到自己的 scope。Child 不隐式继承 Parent Artifact。
@@ -44,8 +57,13 @@ _Avoid_: Full workspace snapshot in Journal, implicit Git staging, secret file d
 一次 Tool Call 中由 `add/update/delete` 结构化操作组成的有界文件批次。同一字面路径可以声明多个按顺序作用于内存快照的 `update`，但不同路径或符号链接别名指向同一 canonical 文件时仍作为歧义拒绝。所有目标先经过 schema、canonical workspace boundary、Access Policy、现有内容、精确匹配和大小预检，之后才开始写入；提交中失败会按预检快照回滚所有已经尝试的文件。Capability 与 Grant 绑定批次内每一个去重后的精确路径，Tool Host 统一生成 File Change Manifest 和 Diff Artifact。它提供进程内的文件级预检与补偿回滚，不宣称跨崩溃事务，也不接受模糊匹配或任意 unified diff。
 _Avoid_: Hidden patch paths, partial preflight writes, fuzzy replacement, claiming filesystem crash atomicity
 
+**Context Diff**:
+已授权File Change Capture文本的有界审阅表示。完整前后正文及路径先脱敏，再按行生成保留三行上下文的unified hunk；包含EOF无换行和CRLF差异，路径控制字符转义。匹配使用有工作预算的唯一行锚点，无锚点或预算耗尽时忠实显示较大替换区段，不承诺全局最短。输出上限只保留完整hunk并计入提示，diffTruncated与采集complete分别描述渲染和覆盖；脱敏后相同或空文件有明确说明。Artifact存储不再对混合正负行二次脱敏，避免吞掉行标记；manifest version1及历史Artifact不改写。
+_Avoid_: Whole-file replacement for every edit, partial hunk as a valid patch, redacting after context slicing, smaller diff as missing changes, audit diff as an executable multi-file patch
+
 **Model Context**:
 由 durable session event 投影得到、允许模型看到的消息、短期记忆、相关长期记忆和已加载 Skills。
+AgentSession通过私有ModelContextProjection维护messages、memory、contextMemory、contextSummary、loadedSkills、objective、plan、delegations八个字段。无关事件不复制旧历史，增量先完整检查/克隆再写内部数组；引用不对外暴露，请求继续保留systemPrompt参数、消息和tools的独立快照。恢复缺patch采用最终fallback，空patch保持无变化；公开纯函数仍返回独立值。此优化不改变上下文选择策略或请求Hash。
 _Avoid_: Full state, UI state, prompt state
 
 **Context Window Plan**:
@@ -79,6 +97,35 @@ _Avoid_: Assistant prose checklist, workflow DAG, UI-only todo list
 **Completion Guard**:
 AgentRuntime 在接受无 Tool Call 的最终响应前，检查空回答、未完成 Plan、运行中 Child 和将历史工具档案当作新操作的异常正文。检查不通过时通过 `COMPLETION_REJECTED` 写入本轮系统纠正与审计，在同一用户轮最多纠正两次；额外请求仍受累计 Token 和 maxSteps 边界约束。耗尽纠正或遇到显式阻塞时写可恢复 `FAILED`，保持原目标/计划为 paused，不伪造完成。请求投影将当前轮可信纠正按顺序放入首部 systemPrompt，原位置换为固定只读占位；旧轮纠正降为失效历史说明。预算估算、压缩选择和 Hash 使用前置后的真实请求，Durable Messages 与消息游标不变。用户、工具或 assistant 的角色伪装不能提升到系统指令。它不解析执行普通正文中的命令，也不能证明模型声称完成的工作已经通过所有业务验收。
 _Avoid_: No tool calls means task success, unlimited automatic continuation, executing truncated prose commands, rewriting historical completion events
+
+**Acceptance Evidence**:
+执行型 Objective 的可选验收契约。`update_plan.acceptance` 声明 id、说明、固定 command 与明确输入文件，同一目标只允许追加，普通 Plan 更新和继续保留已有声明；新目标重新开始。Session schema v17 与新 `PLAN_ACCEPTANCE_UPDATED` action 让旧二进制拒绝未知验收语义，v16 无损迁移且历史 action 不改写。`run_shell.verification_id` 仍经 Tool Host 原授权与取消执行，实际 Tool Result 将成功状态、durable occurrence cursor、命令、输入 SHA-256/文件版本绑定到证据，模型不能自行填写 passed。完成前复查输入，变化、权限收紧、缺少成功执行或验证失败使旧证据失效；无验收契约的问答不增加读文件或测试要求。证据覆盖范围由声明输入决定，不等同于自动证明全部业务需求；文件变更后必须重新验证。
+_Avoid_: Plan checkbox as proof, model-authored passed flags, replacing failed criteria, reusing evidence after source changes, bypassing read policy for hashes
+
+**Progress Intervention**:
+当前用户 turn 内连续三个已闭合工具 occurrence 的同参同失败观察。参数使用 Tool Host 的规范化 argsHash，结果使用截断前完整脱敏输出的 resultHash；不同/成功结果、已观察变化或不完整审计打断计数，超时、取消、拒绝、执行未知及私密工具不进入判定。Runtime 以增量 committed event 驱动有界 Monitor，在整个模型工具批次结束后最多两次写 schema v18 的 `PROGRESS_INTERVENTION`；reducer 复核本轮最后三个真实配对并生成固定反馈，记录的是展示 eventSeq，不是 Journal cursor。它不按时长判定、不自动暂停或重放工具，也不替代 Completion Guard 或用户预算；新用户轮重新计数，旧反馈失效。
+待完成调用按callId有界配对；串行证据保持v1，重叠请求使用v2并分别检查请求/结果顺序，原单次失败指纹不变。成功或无效结果清空连续失败计数时保留其它在途请求，批次未闭合不生成反馈。
+_Avoid_: Long duration as a stalled task, display preview as complete failure identity, automatic tool replay, arbitrary tool text as system guidance, intervention count as task success
+
+**Model Usage Accounting**:
+Context Window 与成功请求/摘要共用最终 systemPrompt、messages、tools 的 UTF-8 估算口径。真实 usage 优先；缺失、部分或仅总量按明确规则保留已报告值并标记估算来源，矛盾用量不能污染指标。摘要每批模型调用前检查取消和本轮预算，失败或超时未知用量保守记账；非模型 extractive summary 不计模型调用或 Token。原失败主请求的有界重试和成本语义继续保留，已付费最终答复不因事后超预算丢弃。
+_Avoid_: Counting messages only, a second free summary after budget exhaustion, treating missing usage as zero, estimating an extractive summary as a model call
+
+**Workspace Task Evaluation**:
+在独立临时工作区和 Session 中运行真实 Runtime/文件工具，再读取实际磁盘产物验收的任务效果评测。Provider 由调用者显式注入，每个 trial 独立初始化；默认 Shell 不可见且不可执行，启用必须显式提供执行 Adapter。报告将 completed 与产物通过区分，记录 falseCompletion、用量、耗时、模型与任务身份 Hash，不输出任务/文件正文；取消只中断 Provider 等待并保留 Tool Host 回收顺序，结束后清理临时资源。Scripted Scenario 保持确定性回归职责；其新增 experiment 比较模式允许 Context Hash 作为变更记录，仍阻止质量与成本退化。
+_Avoid_: Assistant self-report as grade, scripted tests presented as real-model benchmarks, shared trial directories, deleting workspace before tool cleanup, hidden live model calls
+
+**Workspace Retrieval**:
+工作区文件读取、目录发现与字面搜索的有界工具原语。小文件旧读取保留正文，显式读取提供原始行/字节坐标、文件版本和继续位置；目录/搜索按已观察对象建立短期游标，明确扫描范围、跳过原因与未完成状态。读取共用别名/真实路径的当前权限和稳定文件描述符检查，搜索不跟随目录符号链接；glob 使用有界匹配。分页 JSON 在按值脱敏后安全编码，保持重复持久化脱敏后的结构，不能因响应截断丢失继续信息。
+_Avoid_: Silent first-300-files absence claims, whole-file reads for a page, mixing file versions, regex backtracking glob, cutting pagination metadata
+
+**Turn Diagnostics**:
+从 Session 展示事件纯派生的用户轮次运行诊断。按 `message.user` 分轮并借助 Objective 事件关联后续继续，分类模型重试、完成/进展纠正、暂停原因和终态；可恢复暂停与 `session.failed` 终态事件分别统计，不从自由文本猜分类。Session Evaluation、Workspace Task Evaluation 和 Web 健康报告共用 `turn-diagnostics-v1`，旧字段不足明确 unknown。观察到继续不等于需要人工救援，无谓继续率在缺少标注时为 null；报告不包含用户、工具、Memory 或错误正文。
+_Avoid_: Every continued objective as unnecessary intervention, text-based error classification, paused objective as unrecoverable failure, self-reported completion as product quality
+
+**Tool History Retrieval**:
+从当前 Agent Session 的 durable TOOL_REQUESTED cursor 定位原工具 occurrence 的只读回查。先按可复用 callId 发现记录，再按 source cursor 和固定 snapshot 精读脱敏参数、结果及 Artifact 引用；字符页绑定记录 SHA，不执行原工具，不读取其他 Session 或 baseline 内的私密上下文。无法可靠配对的重叠调用明确 ambiguous，无 Journal/分支仅继承消息时不伪造记录；过大的单条正文只返回省略原因与可用引用。发现查询不递归收录回查工具自身输出。
+_Avoid_: Projection seq as durable cursor, taking the last reused callId, replaying tools to recover text, returning an entire session baseline, unbounded nested history output
 
 **Model Request Retry**:
 Context Lifecycle 在同一个模型步骤内恢复暂态传输错误，最多两次、默认退避 250ms/1000ms，复用原请求且不重放已经执行的工具。未完整返回的模型文本和工具参数在重试前丢弃；用户取消中止退避与请求，失败用量（未知时明确估算）计入本轮预算。网络重试与 Context overflow replan 分别计数且互不重置，同一步总请求最多四次。`model.request_failed/retry_requested/retry_exhausted` 记录安全固定分类、状态码、用量和耗时；永久格式/鉴权/配额错误不重试，耗尽或预算不足保留 paused 目标和计划。
@@ -130,7 +177,12 @@ _Avoid_: Per-step resets, counting time since page load, using last-updated time
 
 **Session Checkpoint**:
 从某个 durable event cursor 派生并带校验和的恢复加速投影；它可以丢弃或重建，不能替代 session journal 的事实地位。
-_Avoid_: New baseline, source of truth
+恢复按Session和目标cursor降序逐个读取，仅物化到首个通过checksum、Journal cursor存在性、schema和Session ID校验的状态。坏检查点继续向旧条目回退而没有数量截断，全部无效时回到原Journal；iterator在成功、失败和next抛错时释放，旧Node使用同索引逐条get兼容路径。恢复不删除或重写旧检查点；减少的是无需同时读入的历史payload，不等同于降低单个state大小或整个恢复过程的RSS。
+_Avoid_: New baseline, source of truth, loading all checkpoints before choosing one, fixed fallback depth, claiming payload bytes are peak memory
+
+**Session State Cache**:
+sessions.state_json中的完整兼容投影，Journal仍是恢复事实来源。SQLite schema11的cache_cursor标记已知写入基态；只有带expectedCursor、缓存身份/schema/cursor合格的提交可用受限SQL patch更新。旧direct commit、显式save、坏缓存与不支持的patch完整保存；到期checkpoint与cache复用序列化。cache_generation变化区分新writer，旧writer直接改正文会作废cursor/安全小标题。列表优先小标题，缺失时完整解析旧缓存；Journal恢复不预读冗余cache正文。降低的是JS完整快照处理和参数绑定量，SQLite仍处理完整JSON。
+_Avoid_: Cache as Journal authority, incomplete snapshot for legacy readers, inferring cursor from unverified cache, bound bytes as WAL savings
 
 **Session Deletion**:
 用户明确删除一个任务及其委派后代的生命周期操作。Gateway 先阻止目标的新操作，取消 Runtime、审批与子任务，并等待执行、在途 API 与 dispatch 队列收束；SessionStore 在单一事务中删除 Session、Journal、Checkpoint 和 Artifact，仅保留 ID 与删除时间的 tombstone，阻止旧写入及原 ID 恢复。独立 Branch、项目文件、长期记忆和 Project Grant 不属于删除范围；仍由 Parent 等待的 Child 单独删除返回冲突。删除通知是提交后的控制消息，不伪装成已被删除的 Journal Event。
@@ -155,6 +207,11 @@ _Avoid_: JSON restore, snapshot upload
 **Memory Scope**:
 由 workspace、agentId、userId 组成并保存在 Agent Session 中的长期记忆授权边界；caller scope 必须参与每一次检索、读取、审计和 mutation，Memory ID 本身不是权限。
 _Avoid_: Default global memory, ID-only access
+
+**Memory Keyword Retrieval**:
+同一 Memory Scope 内的词法召回策略，默认将有界中英文查询拆为标识符及CJK字片段，保留完整query的exact/substring优先级；非字面候选需要组合词项证据并使用当前查询覆盖率排序，不采用跨scope语料统计。SQLite v10的contentful trigram FTS只作派生候选索引，权限、状态、有效期及pinned在原记录SQL过滤后再LIMIT，provenance准入与mutation事务不改。4096字符/24词边界明确，自动Context检索按Adapter声明取长任务查询首尾、保留固定记忆；直接工具查询超限拒绝。关键词重合不是语义证明，原literal策略及标注评测保留用于对照。
+完整查询先按现有规则脱敏，再进行分词和首尾裁剪，避免派生词项失去凭据前缀后绕过后续持久化脱敏。
+_Avoid_: Whole-sentence-only recall, global FTS top-N before scope filtering, BM25 as cross-scope ranking, substring grams as independent semantic evidence, recall gains as perfect precision
 
 **Memory Provenance**:
 长期记忆的来源身份。工具写入必须引用真实存在且 callId 匹配的 Durable Session Event cursor，并且来源 Agent Session 的 Memory Scope 必须与 caller scope 完全一致；外部来源使用 externalRef，不能冒充本地 cursor。
@@ -181,8 +238,12 @@ _Avoid_: Model extraction inside storage Adapter, auto-write active memory
 _Avoid_: Injecting unreviewed candidate into model context
 
 **Tool Host**:
-工具安全执行的 deep Module。AgentRuntime 只通过 schemas 与 execute Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、工具定义或规范化参数产生的可选 deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。`null` deadline 表示不自动超时，但不能绕过 Session cancel 或 Adapter 清理。参数 schema 只允许 Host 明确实现的 JSON Schema 关键字，约束递归执行；遇到 `$ref/$defs` 等未实现语义必须 fail closed，不能把部分校验伪装成完整校验。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
+工具安全执行的 deep Module。AgentRuntime 通过 schemas 与 execute/可选executeBatch Interface 使用它；参数校验、effects/idempotency 元数据、Policy decision、Approval、工具定义或规范化参数产生的可选 deadline、取消、结果脱敏和 durable audit 都集中在其 Implementation 内，Native 与 MCP 是两个真实 Adapter。`null` deadline 表示不自动超时，但不能绕过 Session cancel 或 Adapter 清理。参数 schema 只允许 Host 明确实现的 JSON Schema 关键字，约束递归执行；遇到 `$ref/$defs` 等未实现语义必须 fail closed，不能把部分校验伪装成完整校验。兼容 Provider 偶尔会把函数参数再次包进唯一的字符串 `arguments` 字段；Host 只在外层 schema 明确失败、内层 JSON 是对象且完整通过目标工具 schema 时恢复一层，之后的 argsHash、资源授权、执行与审计全部绑定恢复后的参数，并记录 `argumentsRecovered`。
 _Avoid_: AgentRuntime reading tool approval or execute implementation
+
+**Native Read Batch**:
+同一assistant工具批次内的有界原生read_file组，每组最多3个不同callId，后组与串行操作等待前组收束。仅当前可用、明确声明清理契约、直接allow且无Grant的纯原生读可准入，自定义Artifact写入不隐式并行；启动前复查登记/实现/可用性/权限/资源。最终结果按原顺序durable提交，取消等待原生操作settle与lease释放，工具上下文无state写入口。内部或记录失败保留tool_batch_failed和保守未记录说明，不重放已开始调用；原生读取不等于跨文件事务快照或项目写入隔离。
+_Avoid_: Promise.all for every readOnly tool, granting concurrent approval callbacks, releasing a lane before native cleanup, latest Session cursor as occurrence, reordering past writes
 
 **Tool Authorization Decision**:
 Tool Host 在执行前根据 Capability Scope、Permission Profile、Workspace Policy 和 Session Grant 产生的可审计决定，绑定 callId、argsHash、toolVersion、policyVersion、capabilityHash、resources、Adapter、risk、profile、explanation 与命中规则。风险等级、沙箱边界和自动审批是独立维度；旧 never/always 字段不再决定权限。

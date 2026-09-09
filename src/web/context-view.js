@@ -19,6 +19,11 @@ export function contextObservabilityViewModel(session = {}) {
   const activeToolProjection = activeToolProjectionView(plan?.activeToolProjection);
 
   return {
+    ...(plan?.contextBudget?.version === "context-budget-v1" ? { budget: {
+      contextWindowTokens: nullableNumber(plan.contextBudget.contextWindowTokens),
+      contextTargetTokens: nullableNumber(plan.contextBudget.contextTargetTokens),
+      reservedOutputTokens: nullableNumber(plan.contextBudget.reservedOutputTokens),
+    } } : {}),
     plan: plan ? {
       compacted: plan.compacted === true,
       statusLabel: estimatedOverTarget

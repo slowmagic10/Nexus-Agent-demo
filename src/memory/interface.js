@@ -136,6 +136,9 @@ export function normalizeProvenance(provenance = {}) {
 }
 
 export function normalizeSearchOptions(options = {}) {
+  if (!options || typeof options !== "object" || Array.isArray(options)) {
+    throw new Error("Memory search options 必须是对象");
+  }
   const limit = options.limit ?? 5;
   if (!Number.isSafeInteger(limit) || limit < 1 || limit > 500) {
     throw new Error("Memory search limit 必须是 1 到 500 的整数");
@@ -146,7 +149,9 @@ export function normalizeSearchOptions(options = {}) {
   }
   const pinned = options.pinned ?? null;
   if (pinned !== null && typeof pinned !== "boolean") throw new Error("Memory search pinned 必须是布尔值或 null");
-  return { limit, statuses: [...new Set(statuses)], pinned };
+  const strategy = options.strategy ?? "keywords";
+  if (!["keywords", "literal"].includes(strategy)) throw new Error("Memory search strategy 必须是 keywords 或 literal");
+  return { limit, statuses: [...new Set(statuses)], pinned, strategy };
 }
 
 export function normalizeTags(tags = []) {

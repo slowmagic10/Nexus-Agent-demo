@@ -23,33 +23,39 @@ export function createModelContextSummarizer(provider) {
     summarize.usesModel = false;
     return summarize;
   }
-  const summarize = async ({ previousSummary, messages, signal }) => {
-    const response = await provider.complete({
-      systemPrompt: SUMMARY_PROMPT,
-      messages: [{
-        role: "user",
-        content: JSON.stringify({
-          previousSummary: previousSummary ? summaryContent(previousSummary) : null,
-          newHistory: redactSensitiveValue(messages),
-        }),
-      }],
-      tools: [],
-      signal,
-    });
+  const summarize = async (input) => {
+    const response = await provider.complete(prepareContextSummaryRequest(input));
     try {
       return {
         summary: parseSummaryResponse(response?.text),
-        usage: response?.usage || null,
+        usage: response?.usage ?? null,
+        usageOutput: response,
         finishReason: response?.finishReason || null,
         model: provider.name || "unknown",
       };
     } catch (error) {
-      error.usage = response?.usage || null;
+      error.usage = response?.usage ?? null;
+      error.usageOutput = response;
       throw error;
     }
   };
   summarize.usesModel = true;
   return summarize;
+}
+
+export function prepareContextSummaryRequest({ previousSummary, messages, signal }) {
+  return {
+    systemPrompt: SUMMARY_PROMPT,
+    messages: [{
+      role: "user",
+      content: JSON.stringify({
+        previousSummary: previousSummary ? summaryContent(previousSummary) : null,
+        newHistory: redactSensitiveValue(messages),
+      }),
+    }],
+    tools: [],
+    signal,
+  };
 }
 
 export function selectContextSummaryBatch(messages, {

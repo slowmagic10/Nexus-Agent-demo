@@ -6,3 +6,4 @@
 .nexus/exports/
 .env.local
 .env.deepseek.local
+docs

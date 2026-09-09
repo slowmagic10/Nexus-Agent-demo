@@ -2,9 +2,11 @@
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { createMemoryScope } from "../memory/scope.js";
+import { providerRequestOverrides } from "../providers/request-policy.js";
 
-export const AGENT_PROFILE_SCHEMA_VERSION = 1;
+export const AGENT_PROFILE_SCHEMA_VERSION = 2;
 const DEFAULT_CONTEXT_WINDOW_TOKENS = 32_000;
+const REQUEST_POLICY_KEYS = ["contextTargetTokens", "maxOutputTokens", "outputTokenParameter", "streamUsage"];
 
 export function createAgentProfileSnapshot({
   id = "default",
@@ -19,10 +21,11 @@ export function createAgentProfileSnapshot({
 } = {}) {
   const normalizedWorkspace = normalizeWorkspace(workspace);
   const schemas = normalizeToolSchemas(toolSchemas);
+  const normalizedProvider = normalizeProvider(provider);
   const core = {
-    schemaVersion: AGENT_PROFILE_SCHEMA_VERSION,
+    schemaVersion: providerSchemaVersion(normalizedProvider),
     id: normalizeText(id, "Agent Profile id"),
-    provider: normalizeProvider(provider),
+    provider: normalizedProvider,
     workspace: normalizedWorkspace,
     systemPromptHash: hashValue(renderPrompt(systemPrompt)),
     toolset: {
@@ -62,9 +65,13 @@ export function deriveAgentProfileSnapshot(profile, {
 } = {}) {
   const current = assertAgentProfileSnapshot(profile);
   const normalizedWorkspace = workspace === undefined ? current.workspace : normalizeWorkspace(workspace);
+  const normalizedProvider = provider === undefined ? null : normalizeProvider(provider);
   const core = {
     ...withoutVersion(current),
-    ...(provider === undefined ? {} : { provider: normalizeProvider(provider) }),
+    ...(normalizedProvider === null ? {} : {
+      provider: normalizedProvider,
+      schemaVersion: providerSchemaVersion(normalizedProvider),
+    }),
     workspace: normalizedWorkspace,
     memoryScope: createMemoryScope(memoryScope || {
       ...current.memoryScope,
@@ -79,11 +86,20 @@ export function assertAgentProfileSnapshot(profile) {
   if (!profile || typeof profile !== "object" || Array.isArray(profile)) {
     throw new Error("Session 缺少 Agent Profile snapshot");
   }
-  if (profile.schemaVersion !== AGENT_PROFILE_SCHEMA_VERSION) {
+  if (profile.schemaVersion !== 1 && profile.schemaVersion !== AGENT_PROFILE_SCHEMA_VERSION) {
     throw new Error(`不支持的 Agent Profile schema version：${profile.schemaVersion}`);
   }
   const expected = hashValue(withoutVersion(profile));
   if (profile.version !== expected) throw new Error("Agent Profile snapshot version 与内容不匹配");
+  if (profile.schemaVersion === 1 && REQUEST_POLICY_KEYS.some((key) => Object.hasOwn(profile.provider || {}, key))) {
+    throw new Error("Agent Profile Provider request policy 需要 schema version 2");
+  }
+  if (profile.schemaVersion === 2) {
+    const normalized = normalizeProvider(profile.provider);
+    if (providerSchemaVersion(normalized) !== 2 || stableStringify(normalized) !== stableStringify(profile.provider)) {
+      throw new Error("Agent Profile schema version 2 provider 必须使用规范化的非默认 request policy");
+    }
+  }
   return structuredClone(profile);
 }
 
@@ -112,6 +128,11 @@ export function compareAgentProfileSnapshots(previousProfile, currentProfile) {
     current.provider.thinking || "provider-default",
   );
   compareScalar(changes, "provider.endpoint", "provider", "high", previous.provider.endpointHash, current.provider.endpointHash);
+  for (const key of REQUEST_POLICY_KEYS) {
+    const fallback = key === "streamUsage" ? false : null;
+    compareScalar(changes, `provider.${key}`, "provider", key === "contextTargetTokens" ? "medium" : "high",
+      previous.provider[key] ?? fallback, current.provider[key] ?? fallback);
+  }
   compareScalar(changes, "workspace", "scope", "high", previous.workspace, current.workspace);
   compareScalar(changes, "systemPrompt", "context", "medium", previous.systemPromptHash, current.systemPromptHash);
   if (previous.toolset.schemaHash !== current.toolset.schemaHash) {
@@ -138,16 +159,23 @@ export function compareAgentProfileSnapshots(previousProfile, currentProfile) {
 function normalizeProvider(provider) {
   const source = typeof provider === "string" ? { name: provider } : provider || {};
   const name = normalizeText(source.name || source.model || source.id, "Agent Profile provider.name");
+  const adapter = normalizeText(source.adapter || source.type || "unknown", "Agent Profile provider.adapter");
+  const contextWindowTokens = normalizeContextWindowTokens(source.contextWindowTokens);
   return {
     name,
-    adapter: normalizeText(source.adapter || source.type || "unknown", "Agent Profile provider.adapter"),
+    adapter,
     model: normalizeText(source.model || name, "Agent Profile provider.model"),
-    contextWindowTokens: normalizeContextWindowTokens(source.contextWindowTokens),
+    contextWindowTokens,
     thinking: normalizeProviderThinking(source.thinking),
     endpointHash: source.endpointHash == null && source.baseUrl == null
       ? null
       : normalizeEndpointHash(source.endpointHash || hashValue(String(source.baseUrl))),
+    ...providerRequestOverrides({ ...source, contextWindowTokens }, { adapter }),
   };
+}
+
+function providerSchemaVersion(provider) {
+  return REQUEST_POLICY_KEYS.some((key) => Object.hasOwn(provider, key)) ? AGENT_PROFILE_SCHEMA_VERSION : 1;
 }
 
 function normalizeContextWindowTokens(value) {

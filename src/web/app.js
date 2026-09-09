@@ -232,7 +232,9 @@ $("#new-session").addEventListener("click", () => {
   void createSession().catch((error) => toast(error.message || "无法创建任务"));
 });
 let evaluationTimer = null;
-elements.export.addEventListener("click", exportSession);
+elements.export.addEventListener("click", () => {
+  void exportSession().catch((error) => toast(error.message || "导出失败"));
+});
 elements.themeToggle.addEventListener("click", toggleTheme);
 elements.reviewToggle.addEventListener("click", () => openReview());
 elements.permissionTrigger.addEventListener("click", togglePermissionMenu);
@@ -796,6 +798,26 @@ function renderObjectivePlan(objective, plan, delegations) {
 
   const body = document.createElement("div");
   body.className = "plan-body";
+  if (view.acceptance?.length) {
+    const section = document.createElement("section");
+    section.className = "acceptance-panel";
+    section.setAttribute("aria-label", "任务验收");
+    const heading = document.createElement("strong");
+    heading.textContent = `任务验收 · ${view.acceptance.filter((item) => item.status === "passed").length}/${view.acceptance.length} 已验证`;
+    const list = document.createElement("ul");
+    for (const item of view.acceptance) {
+      const row = document.createElement("li");
+      row.className = `acceptance-item ${["passed", "failed", "stale"].includes(item.status) ? item.status : "pending"}`;
+      const description = document.createElement("span");
+      description.textContent = `${item.label} · ${item.description}`;
+      const detail = document.createElement("small");
+      detail.textContent = item.reason || `验证命令：${item.command} · 关联 ${item.paths.length} 个文件`;
+      row.append(description, detail);
+      list.append(row);
+    }
+    section.append(heading, list);
+    body.append(section);
+  }
   if (view.explanation) {
     const explanation = document.createElement("p");
     explanation.className = "plan-explanation";
@@ -882,6 +904,13 @@ function renderContextObservability(session) {
   tokenDetail.className = "context-card-detail";
   tokenDetail.textContent = `固定 ${formatTokens(view.usage.fixedTokens)} · 消息 ${formatTokens(view.usage.messageTokens)} · ${view.plan?.strategyLabel || "尚无策略"}`;
   overview.append(head, tokenLine, meter, tokenDetail);
+  if (view.budget) {
+    const budgetDetail = document.createElement("p");
+    budgetDetail.className = "context-card-detail";
+    const tokens = (value) => value === null ? "未知" : formatTokens(value);
+    budgetDetail.textContent = `模型容量 ${tokens(view.budget.contextWindowTokens)} · 输入目标 ${tokens(view.budget.contextTargetTokens)} · 输出预留 ${tokens(view.budget.reservedOutputTokens)}。上方比例按本次有效输入预算计算。`;
+    overview.append(budgetDetail);
+  }
 
   const history = document.createElement("section");
   history.className = "context-card";
@@ -1140,6 +1169,12 @@ function renderEvaluation(report) {
       ["审批", `请求 ${report.approvals.requested} · 通过 ${report.approvals.granted} · 拒绝 ${report.approvals.denied}`],
       ["Context", `最高占用 ${report.context.maxUtilizationPercent}% · 重规划 ${report.context.replanned} · 耗尽 ${report.context.replanExhausted}`],
       ["委派", `完成 ${report.delegations.completed}/${report.delegations.total} · 异常 ${report.delegations.failed}`],
+      ...(report.reliability ? [
+        ["模型重试", `自动重试 ${report.reliability.model.retryRequested} · 重试耗尽 ${report.reliability.model.retryExhausted}`],
+        ["运行纠正", `提前结束 ${report.reliability.interventions.completionRejected} · 重复失败 ${report.reliability.interventions.progressIntervened}`],
+        ["任务延续", `用户追加 ${report.reliability.observedUserContinuations} 轮 · 是否必要未判定`],
+        ["轮次结果", `完成 ${report.reliability.outcomes.completed} · 暂停 ${report.reliability.outcomes.paused} · 失败 ${report.reliability.outcomes.failed} · 取消 ${report.reliability.outcomes.cancelled}`],
+      ] : []),
     ]),
   );
 
@@ -1372,11 +1407,13 @@ function isOverlayOpen() {
 }
 
 async function exportSession() {
-  const payload = await api(`/sessions/${encodeURIComponent(sessionProjection.sessionId)}/export`);
+  const sessionId = sessionProjection.sessionId;
+  if (!sessionId) return;
+  const payload = await api(`/sessions/${encodeURIComponent(sessionId)}/export`, {}, { silent: true });
   const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
   const link = document.createElement("a");
   link.href = URL.createObjectURL(blob);
-  link.download = `${sessionProjection.sessionId}.journal.json`;
+  link.download = `${sessionId}.journal.json`;
   link.click();
   URL.revokeObjectURL(link.href);
 }
@@ -1743,6 +1780,10 @@ function eventLabel(type) {
     "permission.profile_downgraded": "安全降级权限档位",
     "session.display_title_changed": "更新任务名称",
     "session.turn_completed": "任务完成",
+    "session.progress_intervened": "重复失败纠正",
+    "session.completion_rejected": "完成检查纠正",
+    "model.retry_requested": "模型请求重试",
+    "model.retry_exhausted": "模型重试耗尽",
     "session.failed": "任务失败",
     "session.cancelled": "任务取消",
     "session.resumed": "恢复任务",

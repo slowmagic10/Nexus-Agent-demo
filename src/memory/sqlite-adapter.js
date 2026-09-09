@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
 import { MEMORY_EVENT_SCHEMA_VERSION } from "../persistence/migrations.js";
+import { MEMORY_QUERY_MAX_CHARS, prepareMemoryQuery } from "./lexical-query.js";
 import {
   MemoryInterface,
   MemoryMutationError,
@@ -21,12 +22,17 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     this.clock = clock;
     this.idFactory = idFactory;
     this.id = "sqlite-lexical";
-    this.capabilities = Object.freeze({ mutationIdempotency: "mutation-key" });
+    this.capabilities = Object.freeze({ mutationIdempotency: "mutation-key", maxSearchQueryChars: MEMORY_QUERY_MAX_CHARS });
   }
 
   async search(query = "", accessInput, options = {}) {
     const access = normalizeMemoryAccess(accessInput, this.defaultScope);
-    const needle = String(query || "").trim();
+    const rawQuery = String(query || "").trim();
+    if (rawQuery.length > MEMORY_QUERY_MAX_CHARS) throw new Error(`Memory 检索 query 不能超过 ${MEMORY_QUERY_MAX_CHARS} 个 UTF-16 字符`);
+    // Redact while credential prefixes and full values are still together.
+    // Splitting first would turn a secret into standalone, unrecognizable terms.
+    const prepared = prepareMemoryQuery(redactSensitiveText(rawQuery));
+    const needle = prepared.query;
     const normalized = normalizeSearchOptions(options);
     const statusPlaceholders = normalized.statuses.map(() => "?").join(", ");
     const where = [
@@ -46,6 +52,9 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     if (normalized.pinned !== null) {
       where.push("pinned = ?");
       params.push(normalized.pinned ? 1 : 0);
+    }
+    if (needle && normalized.strategy === "keywords") {
+      return this.#searchKeywords(prepared, access, normalized, where, params);
     }
     let ranking = "updated_at DESC";
     if (needle) {
@@ -77,19 +86,93 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     }));
   }
 
+  // Explicit local maintenance, not a model tool or part of the read path.
+  async rebuildSearchIndex() {
+    return this.#transaction(() => {
+      this.db.exec(`
+        DELETE FROM memory_search_fts;
+        INSERT INTO memory_search_fts(memory_id, content, tags_json)
+        SELECT id, content, tags_json FROM memories;
+      `);
+      return { indexedRecords: this.db.prepare("SELECT COUNT(*) AS count FROM memory_search_fts").get().count };
+    });
+  }
+
+  #searchKeywords(prepared, access, options, where, scopeParams) {
+    const { query, terms, matchExpression } = prepared;
+    const selectParams = [query, query, query];
+    const coverageParts = terms.map((term) => {
+      selectParams.push(term.text, term.weight, term.text, term.weight * 0.75);
+      return "CASE WHEN instr(lower(content), lower(?)) > 0 THEN ? WHEN instr(lower(tags_json), lower(?)) > 0 THEN ? ELSE 0 END";
+    });
+    const totalWeight = terms.reduce((sum, term) => sum + term.weight, 0);
+    const coverage = coverageParts.length ? `((${coverageParts.join(" + ")}) * 1.0 / ?)` : "0";
+    if (coverageParts.length) selectParams.push(totalWeight);
+    const matchCount = (selected) => selected.length ? selected.map((term) => {
+      selectParams.push(term.text, term.text);
+      return "CASE WHEN instr(lower(content), lower(?)) > 0 OR instr(lower(tags_json), lower(?)) > 0 THEN 1 ELSE 0 END";
+    }).join(" + ") : "0";
+    const matchedTerms = matchCount(terms);
+    const specificTerms = matchCount(terms.filter((term) => term.weight > 0.25));
+    const candidates = ["instr(lower(content), lower(?)) > 0", "instr(lower(tags_json), lower(?)) > 0"];
+    const candidateParams = [query, query];
+    if (matchExpression) {
+      // No global top-N: the business table supplies all authority/lifecycle
+      // predicates before the final ranking and LIMIT. Never expose FTS rows.
+      candidates.push("id IN (SELECT memory_id FROM memory_search_fts WHERE memory_search_fts MATCH ?)");
+      candidateParams.push(matchExpression);
+    }
+    for (const term of terms) {
+      if ([...term.text].length >= 3) continue;
+      candidates.push("instr(lower(content), lower(?)) > 0", "instr(lower(tags_json), lower(?)) > 0");
+      candidateParams.push(term.text, term.text);
+    }
+    const rows = this.db.prepare(`
+      WITH scored AS (
+        SELECT *,
+          CASE
+            WHEN lower(content) = lower(?) THEN 3
+            WHEN instr(lower(content), lower(?)) > 0 THEN 2
+            WHEN instr(lower(tags_json), lower(?)) > 0 THEN 1
+            ELSE 0
+          END AS literal_rank,
+          ${coverage} AS keyword_coverage,
+          (${matchedTerms}) AS matched_terms,
+          (${specificTerms}) AS specific_terms
+        FROM memories
+        WHERE ${where.join(" AND ")} AND (${candidates.join(" OR ")})
+      )
+      SELECT * FROM scored
+      WHERE literal_rank > 0 OR (keyword_coverage > 0 AND matched_terms >= ? AND specific_terms > 0)
+      ORDER BY literal_rank DESC, keyword_coverage DESC, updated_at DESC, id ASC
+      LIMIT ?
+    `).all(...selectParams, ...scopeParams, ...candidateParams, Math.min(2, terms.length), options.limit);
+    throwIfMemoryAborted(access.signal);
+    return rows.map((row) => ({
+      ...this.#parseRecord(row),
+      adapter: this.id,
+      retrievalQuery: query,
+      retrievalVersion: prepared.version,
+      queryTerms: terms.map((term) => term.text),
+      termsTruncated: prepared.termsTruncated,
+      score: row.literal_rank === 3 ? 1 : row.literal_rank === 2 ? 0.8 : row.literal_rank === 1 ? 0.6
+        : 0.59 * Math.max(0, Math.min(1, Number(row.keyword_coverage))),
+    }));
+  }
+
   async add(candidate, accessInput) {
-    const access = normalizeMemoryAccess(accessInput, this.defaultScope, { requireProvenance: true });
-    if (Object.hasOwn(candidate || {}, "scope")) throw new Error("MemoryCandidate.scope 由 MemoryAccessContext 决定，调用方不能直接指定");
-    const safeCandidate = normalizeMemoryCandidate({
+    const access = normalizeMutationAccess(accessInput, this.defaultScope);
+    if (Object.hasOwn(candidate || {}, "scope")) throw new MemoryMutationError("MemoryCandidate.scope 由 MemoryAccessContext 决定，调用方不能直接指定");
+    const safeCandidate = validateMutationInput(() => normalizeMemoryCandidate({
       ...candidate,
       content: redactSensitiveText(candidate?.content),
       scope: access.scope,
-    }, this.defaultScope);
+    }, this.defaultScope));
     if (["superseded", "expired", "deleted"].includes(safeCandidate.status)) {
-      throw new Error("新增长期记忆只能是 active 或 candidate 状态");
+      throw new MemoryMutationError("新增长期记忆只能是 active 或 candidate 状态");
     }
     if (safeCandidate.status !== "active" && safeCandidate.pinned) {
-      throw new Error("只有 active 长期记忆可以固定");
+      throw new MemoryMutationError("只有 active 长期记忆可以固定");
     }
     const safeProvenance = redactSensitiveValue(access.provenance);
     const requestHash = mutationRequestHash("add", { candidate: safeCandidate }, access, safeProvenance);
@@ -165,12 +248,12 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
   }
 
   async update(id, patch, accessInput) {
-    const access = normalizeMemoryAccess(accessInput, this.defaultScope, { requireProvenance: true });
+    const access = normalizeMutationAccess(accessInput, this.defaultScope);
     const memoryId = validateId(id);
-    if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new Error("MemoryPatch 必须是对象");
+    if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw new MemoryMutationError("MemoryPatch 必须是对象");
     const allowedFields = new Set(["content", "kind", "status", "confidence", "tags", "observedAt", "expiresAt", "pinned"]);
     const unsupported = Object.keys(patch).filter((field) => !allowedFields.has(field));
-    if (unsupported.length) throw new Error(`MemoryPatch 包含不可修改字段：${unsupported.join(", ")}`);
+    if (unsupported.length) throw new MemoryMutationError(`MemoryPatch 包含不可修改字段：${unsupported.join(", ")}`);
     const safePatch = redactSensitiveValue({
       ...patch,
       ...(typeof patch.content === "string" ? { content: redactSensitiveText(patch.content) } : {}),
@@ -180,18 +263,18 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     const replay = this.#readMutation(access, "update", requestHash);
     if (replay !== null) return replay;
     const current = this.#getRecord(memoryId, access.scope, { includeInactive: true });
-    if (!current || current.status === "deleted") throw new Error(`未找到可更新的长期记忆：${memoryId}`);
-    const candidate = normalizeMemoryCandidate({
+    if (!current || current.status === "deleted") throw new MemoryMutationError(`未找到可更新的长期记忆：${memoryId}`);
+    const candidate = validateMutationInput(() => normalizeMemoryCandidate({
       ...current,
       ...safePatch,
       content: safePatch.content ?? current.content,
       scope: current.scope,
       tags: safePatch.tags ?? current.tags,
-    }, this.defaultScope);
+    }, this.defaultScope));
     if (["superseded", "deleted"].includes(candidate.status)) {
-      throw new Error("请使用 supersede/delete 修改长期记忆终态");
+      throw new MemoryMutationError("请使用 supersede/delete 修改长期记忆终态");
     }
-    if (candidate.status !== "active" && candidate.pinned) throw new Error("只有 active 长期记忆可以固定");
+    if (candidate.status !== "active" && candidate.pinned) throw new MemoryMutationError("只有 active 长期记忆可以固定");
     const record = {
       ...current,
       ...candidate,
@@ -212,7 +295,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
   }
 
   async supersede(id, replacementId, accessInput) {
-    const access = normalizeMemoryAccess(accessInput, this.defaultScope, { requireProvenance: true });
+    const access = normalizeMutationAccess(accessInput, this.defaultScope);
     const memoryId = validateId(id);
     const safeReplacementId = validateId(replacementId);
     const safeProvenance = redactSensitiveValue(access.provenance);
@@ -222,11 +305,11 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
     }, access, safeProvenance);
     const replay = this.#readMutation(access, "supersede", requestHash);
     if (replay !== null) return replay;
-    if (memoryId === safeReplacementId) throw new Error("长期记忆不能 supersede 自身");
+    if (memoryId === safeReplacementId) throw new MemoryMutationError("长期记忆不能 supersede 自身");
     const current = this.#getRecord(memoryId, access.scope, { includeInactive: true });
     const replacement = this.#getRecord(safeReplacementId, access.scope, { includeInactive: true });
-    if (!current || current.status === "deleted") throw new Error(`未找到可替代的长期记忆：${memoryId}`);
-    if (!replacement || replacement.status !== "active") throw new Error(`替代记忆必须处于 active：${safeReplacementId}`);
+    if (!current || current.status === "deleted") throw new MemoryMutationError(`未找到可替代的长期记忆：${memoryId}`);
+    if (!replacement || replacement.status !== "active") throw new MemoryMutationError(`替代记忆必须处于 active：${safeReplacementId}`);
     const record = {
       ...current,
       status: "superseded",
@@ -249,14 +332,15 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
   }
 
   async delete(id, reason, accessInput) {
-    const access = normalizeMemoryAccess(accessInput, this.defaultScope, { requireProvenance: true });
+    const access = normalizeMutationAccess(accessInput, this.defaultScope);
     const memoryId = validateId(id);
-    if (typeof reason !== "string" || !reason.trim()) throw new Error("删除长期记忆必须提供原因");
+    if (typeof reason !== "string" || !reason.trim()) throw new MemoryMutationError("删除长期记忆必须提供原因");
     const safeReason = redactSensitiveText(reason.trim());
     const safeProvenance = redactSensitiveValue(access.provenance);
     const requestHash = mutationRequestHash("delete", { memoryId, reason: safeReason }, access, safeProvenance);
     const replay = this.#readMutation(access, "delete", requestHash);
     if (replay !== null) return replay;
+    const provenanceValidated = this.#validateProvenance(safeProvenance, access.scope);
     const current = this.#getRecord(memoryId, access.scope, { includeInactive: true });
     if (!current || current.status === "deleted") {
       this.#transaction(() => this.#recordMutation(access, "delete", current?.id || null, false, requestHash));
@@ -268,7 +352,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       pinned: false,
       deletedReason: safeReason,
       provenance: safeProvenance,
-      provenanceValidated: this.#validateProvenance(safeProvenance, access.scope),
+      provenanceValidated,
       sourceSession: safeProvenance.sessionId || current.sourceSession,
       sourceCursor: safeProvenance.sourceCursor ?? current.sourceCursor,
       sourceToolCall: safeProvenance.toolCallId ?? current.sourceToolCall,
@@ -330,14 +414,14 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
   #validateProvenance(provenance, accessScope) {
     const hasLocalSource = provenance.sessionId || provenance.sourceCursor || provenance.toolCallId;
     if (!hasLocalSource) {
-      if (provenance.origin === "tool") throw new Error("tool provenance 必须包含 sessionId、sourceCursor 和 toolCallId");
+      if (provenance.origin === "tool") throw new MemoryMutationError("tool provenance 必须包含 sessionId、sourceCursor 和 toolCallId");
       return provenance.origin !== "legacy";
     }
     if (!provenance.sessionId || !provenance.sourceCursor) {
-      throw new Error("本地 provenance 必须同时包含 sessionId 和 sourceCursor");
+      throw new MemoryMutationError("本地 provenance 必须同时包含 sessionId 和 sourceCursor");
     }
     if (provenance.origin === "tool" && !provenance.toolCallId) {
-      throw new Error("tool provenance 必须包含 toolCallId");
+      throw new MemoryMutationError("tool provenance 必须包含 toolCallId");
     }
     const sourceEvents = this.db.prepare(`
       SELECT seq, type, event_json AS eventJson
@@ -347,9 +431,9 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       ORDER BY seq
     `).all(provenance.sessionId, provenance.sourceCursor, provenance.sourceCursor);
     const event = sourceEvents.find((item) => item.seq === provenance.sourceCursor);
-    if (!event) throw new Error(`provenance 来源不存在：${provenance.sessionId}#${provenance.sourceCursor}`);
+    if (!event) throw new MemoryMutationError(`provenance 来源不存在：${provenance.sessionId}#${provenance.sourceCursor}`);
     const baseline = sourceEvents.find((item) => item.seq === 1 && item.type === "SESSION_BASELINE");
-    if (!baseline) throw new Error(`provenance 来源 Session 缺少 Durable baseline：${provenance.sessionId}`);
+    if (!baseline) throw new MemoryMutationError(`provenance 来源 Session 缺少 Durable baseline：${provenance.sessionId}`);
     const baselineState = parseJson(baseline.eventJson, {}).state;
     let sourceScope = normalizeMemoryScope(baselineState?.memoryScope || { workspace: baselineState?.workspace });
     for (const sourceEvent of sourceEvents) {
@@ -358,12 +442,12 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       if (action?.workspace) sourceScope = normalizeMemoryScope({ ...sourceScope, workspace: action.workspace });
     }
     if (!sameScope(sourceScope, accessScope)) {
-      throw new Error("provenance 来源 Session 不属于当前 Memory scope");
+      throw new MemoryMutationError("provenance 来源 Session 不属于当前 Memory scope");
     }
     if (provenance.toolCallId) {
       const payload = parseJson(event.eventJson, {});
       if (event.type !== "TOOL_REQUESTED" || payload.action?.call?.id !== provenance.toolCallId) {
-        throw new Error("provenance.toolCallId 与 Durable Session Event 不匹配");
+        throw new MemoryMutationError("provenance.toolCallId 与 Durable Session Event 不匹配");
       }
     }
     return true;
@@ -376,7 +460,7 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       FROM memory_mutations WHERE mutation_id = ?
     `).get(access.mutationId);
     if (!row) return null;
-    if (row.operation !== operation) throw new Error(`mutationId 已用于其他操作：${access.mutationId}`);
+    if (row.operation !== operation) throw new MemoryMutationError(`mutationId 已用于其他操作：${access.mutationId}`);
     if (!row.requestHash) {
       throw new MemoryMutationError(
         `legacy mutationId 无法验证请求内容，需要人工处理：${access.mutationId}`,
@@ -388,11 +472,11 @@ export class SQLiteMemoryAdapter extends MemoryInterface {
       );
     }
     if (row.requestHash && row.requestHash !== requestHash) {
-      throw new Error(`mutationId 请求内容冲突：${access.mutationId}`);
+      throw new MemoryMutationError(`mutationId 请求内容冲突：${access.mutationId}`);
     }
     const envelope = parseJson(row.resultJson, null);
     if (!envelope || !sameScope(envelope.scope, access.scope)) {
-      throw new Error("mutationId 不属于当前 Memory scope");
+      throw new MemoryMutationError("mutationId 不属于当前 Memory scope");
     }
     return structuredClone(envelope.value);
   }
@@ -579,10 +663,29 @@ function canonicalize(value) {
 }
 
 function validateId(value) {
-  if (typeof value !== "string" || !value.trim()) throw new Error("memoryId 必须是非空字符串");
+  if (typeof value !== "string" || !value.trim()) throw new MemoryMutationError("memoryId 必须是非空字符串");
   return value.trim();
 }
 
 function parseJson(value, fallback) {
   try { return JSON.parse(value); } catch { return structuredClone(fallback); }
+}
+
+function validateMutationInput(read) {
+  try {
+    return read();
+  } catch (error) {
+    if (error instanceof MemoryMutationError) throw error;
+    throw new MemoryMutationError(error.message, { code: "MEMORY_INVALID_REQUEST" });
+  }
+}
+
+function normalizeMutationAccess(accessInput, defaultScope) {
+  if (accessInput?.signal?.aborted) {
+    throw new MemoryMutationError("Memory 操作在写入前已取消", {
+      code: "MEMORY_MUTATION_ABORTED_BEFORE_APPLY",
+      outcome: "safe_to_retry",
+    });
+  }
+  return validateMutationInput(() => normalizeMemoryAccess(accessInput, defaultScope, { requireProvenance: true }));
 }

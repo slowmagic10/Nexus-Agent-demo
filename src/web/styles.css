@@ -195,6 +195,13 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .icon-button.danger:hover:not(:disabled) { color: var(--danger); }
 
 .conversation { min-height: 0; flex: 1; display: flex; flex-direction: column; }
+.acceptance-panel { margin-top: 8px; padding-top: 10px; border-top: 1px solid var(--line); }
+.acceptance-panel > strong { font-size: 12px; color: var(--text-soft); }
+.acceptance-panel ul { margin: 7px 0 0; padding: 0; list-style: none; }
+.acceptance-item { margin: 6px 0; font-size: 12px; line-height: 1.5; }
+.acceptance-item small { display: block; color: var(--muted); overflow-wrap: anywhere; }
+.acceptance-item.passed > span { color: var(--success); }
+.acceptance-item.failed > span, .acceptance-item.stale > span { color: var(--warning); }
 .plan-panel {
   width: min(820px, calc(100% - 56px));
   margin: 18px auto 0;

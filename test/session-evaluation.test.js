@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { evaluateSession, SESSION_EVALUATION_VERSION } from "../src/evaluation/session-evaluation.js";
+import { diagnoseTurns } from "../src/evaluation/turn-diagnostics.js";
 
 test("Session Evaluation 从 durable 状态生成确定性健康报告", () => {
   const state = fixtureState({
@@ -119,6 +120,24 @@ test("Gateway 恢复到 idle 后仍按 durable Objective 保留任务终态", ()
     count: 1,
     eventSeq: 1,
   }]);
+});
+
+test("Session Evaluation 追加同源轮次诊断但保持已有版本和 metrics 合约", () => {
+  const state = fixtureState({ events: [
+    { seq: 1, type: "objective.created", objectiveId: "o1" },
+    { seq: 2, type: "message.user", preview: "private prompt" },
+    { seq: 3, type: "session.progress_intervened", version: "progress-monitor-v1", attempt: 1,
+      reason: "repeated_tool_failure", message: "private feedback", args: { file: "private path" } },
+    { seq: 4, type: "session.turn_completed" },
+  ] });
+  const report = evaluateSession(state);
+  const diagnostic = diagnoseTurns(state.events);
+  assert.equal(report.version, "session-evaluation-v1");
+  assert.equal(report.diagnosticsVersion, diagnostic.version);
+  assert.deepEqual(report.reliability, diagnostic.reliability);
+  assert.deepEqual(report.turns, diagnostic.turns);
+  assert.equal(report.reliability.interventions.repeatedToolFailure, 1);
+  assert.doesNotMatch(JSON.stringify(report), /private/);
 });
 
 function fixtureState(overrides = {}) {

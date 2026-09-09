@@ -2,6 +2,18 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { contextObservabilityViewModel } from "../src/web/context-view.js";
 
+test("上下文视图分开显示模型容量、输入目标和预留，比例使用实际收紧后的输入预算", () => {
+  const view = contextObservabilityViewModel({ events: [{ type: "model.context_prepared", seq: 1,
+    maxInputTokens: 8000, estimatedInputTokens: 4000,
+    contextBudget: { version: "context-budget-v1", contextWindowTokens: 1000000, contextTargetTokens: 64000,
+      reservedOutputTokens: 16000, maxInputTokens: 64000, privateDetail: "不应显示的正文" },
+  }] });
+  assert.equal(view.usage.percent, 50);
+  assert.equal(view.usage.maxTokens, 8000);
+  assert.deepEqual(view.budget, { contextWindowTokens: 1000000, contextTargetTokens: 64000, reservedOutputTokens: 16000 });
+  assert.doesNotMatch(JSON.stringify(view), /不应显示/);
+});
+
 test("Context 可观测性投影只返回预算、来源数量和摘要元数据", () => {
   const view = contextObservabilityViewModel({
     contextSummary: { revision: 3, throughMessage: 12, sourceComplete: true, objective: "不应进入 ViewModel" },

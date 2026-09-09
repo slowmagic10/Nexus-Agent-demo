@@ -1,0 +1,40 @@
+{
+  "id": "local-coding-v1",
+  "tasks": [
+    {
+      "id": "readme-edit",
+      "prompt": "修改 README.md，把 TODO 那一行替换为 This project converts CSV data into JSON.，保留原有标题和换行。只做这个文件修改，不启动服务。",
+      "files": [{ "path": "README.md", "content": "# Data App\n\nTODO\n" }],
+      "checks": [{ "id": "readme-content", "type": "file_equals", "path": "README.md", "expected": "# Data App\n\nThis project converts CSV data into JSON.\n" }],
+      "maxSteps": 12,
+      "maxTokensPerTurn": 60000
+    },
+    {
+      "id": "json-config",
+      "prompt": "修改 settings.json：enabled 改为 true，retries 改为 5；保留 theme 的原值。保证输出为有效 JSON，不启动服务。",
+      "files": [{ "path": "settings.json", "content": "{\"enabled\":false,\"retries\":2,\"theme\":\"dark\"}\n" }],
+      "checks": [{ "id": "config-values", "type": "json_equals", "path": "settings.json", "expected": { "enabled": true, "retries": 5, "theme": "dark" } }],
+      "maxSteps": 12,
+      "maxTokensPerTurn": 60000
+    },
+    {
+      "id": "small-code-fix",
+      "prompt": "修复 src/add.js 的 add 函数：它应该返回两个参数的和，保持其他代码和格式，目标 return 语句为 return a + b;。不启动服务。",
+      "files": [{ "path": "src/add.js", "content": "export function add(a, b) {\n  return a - b;\n}\n" }],
+      "checks": [{ "id": "code-result", "type": "file_equals", "path": "src/add.js", "expected": "export function add(a, b) {\n  return a + b;\n}\n" }],
+      "maxSteps": 12,
+      "maxTokensPerTurn": 60000
+    },
+    {
+      "id": "csv-sort",
+      "prompt": "读取 scores.csv，按 score 数字降序排列数据，写入 sorted.csv。保留 name,score 表头，使用 LF 换行并在结尾保留换行。不能改 scores.csv，不启动服务。",
+      "files": [{ "path": "scores.csv", "content": "name,score\nAlice,7\nBob,12\nChen,9\n" }],
+      "checks": [
+        { "id": "sorted-output", "type": "file_equals", "path": "sorted.csv", "expected": "name,score\nBob,12\nChen,9\nAlice,7\n" },
+        { "id": "input-preserved", "type": "file_equals", "path": "scores.csv", "expected": "name,score\nAlice,7\nBob,12\nChen,9\n" }
+      ],
+      "maxSteps": 16,
+      "maxTokensPerTurn": 60000
+    }
+  ]
+}

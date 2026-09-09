@@ -1,8 +1,9 @@
 import { createProviderHttpError } from "./errors.js";
+import { normalizeProviderRequestPolicy } from "./request-policy.js";
 import { readSseData } from "./sse.js";
 
 export class OpenAICompatibleProvider {
-  constructor({ apiKey, baseUrl, model, thinking = "provider-default", fetchImpl = globalThis.fetch }) {
+  constructor({ apiKey, baseUrl, model, thinking = "provider-default", maxOutputTokens = null, outputTokenParameter = null, streamUsage = false, fetchImpl = globalThis.fetch }) {
     if (!apiKey || apiKey.startsWith("REPLACE_WITH_")) {
       throw new Error("模型 API Key 尚未配置；请先填写本地环境文件中的 OPENAI_API_KEY");
     }
@@ -12,6 +13,10 @@ export class OpenAICompatibleProvider {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.model = model;
     this.thinking = normalizeThinkingMode(thinking);
+    const requestPolicy = normalizeProviderRequestPolicy({ maxOutputTokens, outputTokenParameter, streamUsage }, { adapter: "openai-compatible" });
+    this.maxOutputTokens = requestPolicy.maxOutputTokens;
+    this.outputTokenParameter = requestPolicy.outputTokenParameter;
+    this.streamUsage = requestPolicy.streamUsage;
     this.fetch = fetchImpl;
   }
 
@@ -99,6 +104,8 @@ export class OpenAICompatibleProvider {
         ...(hasTools ? { tools, tool_choice: "auto" } : {}),
         ...(this.thinking === "provider-default" ? {} : { thinking: { type: this.thinking } }),
         ...(stream ? { stream: true } : {}),
+        ...(this.maxOutputTokens === null ? {} : { [this.outputTokenParameter]: this.maxOutputTokens }),
+        ...(stream && this.streamUsage ? { stream_options: { include_usage: true } } : {}),
       }),
       signal,
     });

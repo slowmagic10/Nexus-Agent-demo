@@ -9,6 +9,7 @@ import {
 } from "../core/agent-profile.js";
 import { appendAgentInstructions } from "../core/named-agent-profiles.js";
 import { AgentRuntime } from "../core/agent.js";
+import { configuredContextBudget, normalizeProviderRequestPolicy, resolveContextBudget } from "../providers/request-policy.js";
 import { AgentSession } from "../core/session.js";
 import { assertMemoryInspection, assertMemoryInterface } from "../memory/interface.js";
 import { assertArtifactStore } from "../artifacts/interface.js";
@@ -26,6 +27,7 @@ import { ToolHost } from "../tools/host.js";
 import { PermissionToolHostRouter } from "../tools/permission-router.js";
 import { revokeSessionGrant } from "../tools/authorization.js";
 import { evaluateSession } from "../evaluation/session-evaluation.js";
+import { ArchiveExportError } from "../persistence/archive-limits.js";
 
 const PERMISSION_MODE_INFO = Object.freeze([
   Object.freeze({
@@ -233,6 +235,9 @@ export class GatewaySessionManager {
         maxSteps: this.maxSteps === Infinity ? "unlimited" : this.maxSteps,
         maxTokensPerTurn: this.maxTokensPerTurn === Infinity ? "unlimited" : this.maxTokensPerTurn,
         maxInputTokens: this.agentProfiles.get(this.defaultAgentProfileId)?.maxInputTokens ?? this.maxInputTokens,
+        ...(this.agentProfiles.get(this.defaultAgentProfileId)?.contextBudget ? {
+          contextBudget: structuredClone(this.agentProfiles.get(this.defaultAgentProfileId).contextBudget),
+        } : {}),
       },
       agentProfile: {
         id: profile.id,
@@ -252,6 +257,7 @@ export class GatewaySessionManager {
             maxSteps: durableLimit(item.maxSteps),
             maxTokensPerTurn: durableLimit(item.maxTokensPerTurn),
             maxInputTokens: item.maxInputTokens,
+            ...(item.contextBudget ? { contextBudget: structuredClone(item.contextBudget) } : {}),
             provider: snapshot.provider,
             version: snapshot.version,
           };
@@ -337,7 +343,12 @@ export class GatewaySessionManager {
 
   async exportSession(id) {
     await this.ensureLoaded(id);
-    return this.store.exportJournal(id);
+    try {
+      return this.store.exportJournal(id);
+    } catch (error) {
+      if (error instanceof ArchiveExportError) throw new GatewayError(error.statusCode, error.message);
+      throw error;
+    }
   }
 
   async importSession(archive, { id } = {}) {
@@ -817,6 +828,7 @@ export class GatewaySessionManager {
       maxSteps,
       maxTokensPerTurn,
       maxInputTokens: runtimeProfile.maxInputTokens,
+      contextBudget: runtimeProfile.contextBudget,
     };
     entry.runtime = this.runtimeFactory
       ? this.runtimeFactory(runtimeOptions)
@@ -1033,6 +1045,7 @@ function createRuntimeAgentProfiles({
 }) {
   if (snapshot) {
     const fixed = assertAgentProfileSnapshot(snapshot);
+    const contextBudget = configuredContextBudget(fixed.provider);
     return {
       defaultProfile: fixed.id,
       profiles: [{
@@ -1042,7 +1055,8 @@ function createRuntimeAgentProfiles({
         permissionProfile: fixed.permission.defaultProfile,
         maxSteps: runtimeLimit(fixed.budgets.maxSteps),
         maxTokensPerTurn: runtimeLimit(fixed.budgets.maxTokensPerTurn),
-        maxInputTokens: normalizeMaxInputTokens(fixed.provider.contextWindowTokens ?? maxInputTokens),
+        maxInputTokens: contextBudget?.maxInputTokens ?? normalizeMaxInputTokens(fixed.provider.contextWindowTokens ?? maxInputTokens),
+        contextBudget,
         memoryScope: fixed.memoryScope,
         systemPrompt,
         provider: providerClient,
@@ -1091,15 +1105,18 @@ function createRuntimeAgentProfiles({
       model: binding.provider.model || binding.provider.name,
       baseUrl: binding.provider.baseUrl || null,
     };
-    const profileMaxInputTokens = normalizeMaxInputTokens(
+    const contextWindowTokens = normalizeMaxInputTokens(
       definition.provider?.contextWindowTokens
       ?? baseDescriptor.contextWindowTokens
       ?? maxInputTokens,
     );
     const descriptor = {
       ...baseDescriptor,
-      contextWindowTokens: profileMaxInputTokens,
+      ...normalizeProviderRequestPolicy({ ...baseDescriptor, ...definition.provider, contextWindowTokens }),
+      contextWindowTokens,
     };
+    const contextBudget = configuredContextBudget(descriptor);
+    const profileMaxInputTokens = resolveContextBudget(descriptor).maxInputTokens;
     const snapshotFactory = () => createAgentProfileSnapshot({
       id: definition.id,
       provider: descriptor,
@@ -1122,6 +1139,7 @@ function createRuntimeAgentProfiles({
       maxSteps: profileMaxSteps,
       maxTokensPerTurn: profileMaxTokens,
       maxInputTokens: profileMaxInputTokens,
+      contextBudget,
       memoryScope: profileMemoryScope,
       systemPrompt: profileSystemPrompt,
       provider: binding.provider,

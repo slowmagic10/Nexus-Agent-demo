@@ -2,6 +2,16 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { objectivePlanViewModel } from "../src/web/plan-view.js";
 
+test("验收状态显示真实验证结果和失效原因，不从计划勾选推断通过", () => {
+  const view = objectivePlanViewModel({ text: "完成并验证", status: "active" }, {
+    steps: [{ step: "实现", status: "completed" }],
+    acceptance: [{ id: "build", description: "构建成功", command: "npm run build", paths: ["src/main.js"], status: "stale", reason: "输入文件已改变" }],
+  });
+  assert.equal(view.acceptance[0].label, "需要重新验证");
+  assert.equal(view.acceptance[0].reason, "输入文件已改变");
+  assert.deepEqual(view.acceptance[0].paths, ["src/main.js"]);
+});
+
 test("Objective 计划投影为紧凑 Web ViewModel", () => {
   assert.equal(objectivePlanViewModel(null, null), null);
   assert.deepEqual(objectivePlanViewModel({ text: "完成 M7", status: "active" }, {

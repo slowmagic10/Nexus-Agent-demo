@@ -26,6 +26,10 @@ export class TerminalUI {
     console.log(`${bold}模型${reset}      ${state.provider}`);
     console.log(`${bold}工作区${reset}    ${state.workspace}`);
     console.log(`${bold}进度${reset}      step ${state.step} · 模型 ${state.metrics.modelCalls} · 工具 ${state.metrics.toolCalls} · 审批 ${state.metrics.approvals}`);
+    if (state.plan?.acceptance?.length) {
+      const checks = state.plan.acceptance;
+      console.log(`${bold}验收${reset}      ${checks.filter((item) => item.status === "passed").length}/${checks.length} 已验证 · ${checks.filter((item) => item.status === "stale").length} 项需要重新验证`);
+    }
     console.log(`${bold}用量${reset}      ${state.metrics.totalTokens || 0} tokens · 模型 ${state.metrics.modelDurationMs || 0}ms · 工具 ${state.metrics.toolDurationMs || 0}ms`);
     console.log(`${bold}记忆/技能${reset} ${state.memory.length} / ${state.loadedSkills.length}`);
     console.log(`${bold}最新事件${reset}  ${event ? `${event.seq} ${event.type}` : "（无）"}`);

@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { DatabaseSync } from "node:sqlite";
 import { AgentSession } from "../src/core/session.js";
-import { createSession, migrateSessionState, reduceSession } from "../src/core/state.js";
+import { createSession, migrateSessionState, reduceSession, SESSION_SCHEMA_VERSION } from "../src/core/state.js";
 import { SessionStore } from "../src/persistence/session-store.js";
 
 test("会话状态可保存、列出并按 ID 恢复", () => {
@@ -297,7 +297,7 @@ test("旧数据库会按顺序执行显式 schema migration", async () => {
     assert.ok(eventColumns.includes("schema_version"));
     assert.ok(memoryEventColumns.includes("schema_version"));
     assert.ok(mutationColumns.includes("request_hash"));
-    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert.deepEqual(migrationVersions, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
     assert.ok(store.db.prepare("PRAGMA table_info(memories)").all().some((column) => column.name === "pinned"));
     assert.ok(store.db.prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'session_checkpoints'",
@@ -333,7 +333,7 @@ test("schema v2 会话状态加载时迁移到当前版本", () => {
     fixture.store.save(legacy);
 
     const restored = fixture.store.load(state.id);
-    assert.equal(restored.schemaVersion, 16);
+    assert.equal(restored.schemaVersion, SESSION_SCHEMA_VERSION);
     assert.equal(restored.agentProfile.id, "legacy-default");
     assert.equal(restored.lineage, null);
     assert.deepEqual(restored.toolGrants, []);
@@ -367,7 +367,7 @@ test("schema v7 的 call-bound Grant 迁移后默认视为已消费", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 16);
+  assert.equal(migrated.schemaVersion, SESSION_SCHEMA_VERSION);
   assert.equal(migrated.agentProfile.id, "legacy-default");
   assert.equal(migrated.toolGrants[0].usage, "single_use");
   assert.equal(migrated.toolGrants[0].consumedAt, "2026-08-24T00:00:00.000Z");
@@ -382,7 +382,7 @@ test("schema v12 升级时保留 Agent Profile 并初始化 durable summary", ()
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 16);
+  assert.equal(migrated.schemaVersion, SESSION_SCHEMA_VERSION);
   assert.equal(migrated.agentProfile.version, profileVersion);
   assert.equal(migrated.contextSummary, null);
   assert.equal(migrated.modelStream, null);
@@ -397,7 +397,7 @@ test("schema v14 升级时初始化 Tool Output Stream 投影", () => {
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 16);
+  assert.equal(migrated.schemaVersion, SESSION_SCHEMA_VERSION);
   assert.deepEqual(migrated.toolStreams, {});
 });
 
@@ -409,8 +409,19 @@ test("schema v15 升级时从首条用户消息建立安全 Display Title", () =
 
   const migrated = migrateSessionState(state);
 
-  assert.equal(migrated.schemaVersion, 16);
+  assert.equal(migrated.schemaVersion, SESSION_SCHEMA_VERSION);
   assert.equal(migrated.displayTitle, "受保护任务");
+});
+
+test("schema v16 无损迁移到当前 schema 且不添加验收声明", () => {
+  let state = createSession({ provider: "demo", workspace: "/tmp" });
+  state = reduceSession(state, { type: "USER_MESSAGE", content: "保留已有目标和计划" });
+  state = reduceSession(state, { type: "PLAN_UPDATED", steps: [{ step: "保留未完成工作", status: "in_progress" }] });
+  state = reduceSession(state, { type: "SESSION_DISPLAY_TITLE_CHANGED", title: "手动任务名" });
+  const legacy = { ...state, schemaVersion: 16 };
+  const migrated = migrateSessionState(legacy);
+  assert.deepEqual(migrated, { ...legacy, schemaVersion: SESSION_SCHEMA_VERSION });
+  assert.equal(Object.hasOwn(migrated.plan, "acceptance"), false);
 });
 
 test("当前 schema 的外部 Display Title 仍会在恢复边界重新安全化", () => {

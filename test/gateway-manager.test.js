@@ -13,6 +13,26 @@ import {
 } from "../src/tools/authorization.js";
 import { ProjectGrantStore } from "../src/tools/project-grant-store.js";
 
+test("导出超限通过 Gateway 返回明确413和备份建议，保留原任务", async (t) => {
+  const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-export-http-contract-"));
+  const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });
+  const manager = new GatewaySessionManager({ workspace, store,
+    provider: { name: "offline", complete: async () => ({ text: "完成", toolCalls: [] }) },
+    tools: { schemas: () => [], get: () => null }, systemPrompt: "test",
+  });
+  t.after(async () => { await manager.close(); store.close(); await fs.rm(workspace, { recursive: true, force: true }); });
+  const state = await manager.create();
+  for (let index = 0; index < 257; index += 1) {
+    await store.artifacts.put({ sessionId: state.id, callId: `call-${index}`, kind: "tool_output", content: `fixture ${index}` });
+  }
+  await assert.rejects(manager.exportSession(state.id), (error) => {
+    assert.equal(error.status, 413);
+    assert.match(error.message, /256.*SQLite/s);
+    return true;
+  });
+  assert.equal((await manager.get(state.id)).id, state.id);
+});
+
 test("Gateway runtimeInfo 暴露当前 Model Context 预算", async (t) => {
   const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "nexus-gateway-context-window-"));
   const store = new SessionStore(path.join(workspace, ".nexus", "nexus.db"), { workspace });

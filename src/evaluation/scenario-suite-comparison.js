@@ -12,7 +12,8 @@ const STATUS_RANK = new Map([
   ["failed", 5],
 ]);
 
-export function compareScenarioSuiteReports(baselineInput, candidateInput, { maxTokenIncreasePercent = 0 } = {}) {
+export function compareScenarioSuiteReports(baselineInput, candidateInput, { maxTokenIncreasePercent = 0, mode = "regression" } = {}) {
+  if (!["regression", "experiment"].includes(mode)) throw new Error("Suite comparison mode 必须是 regression 或 experiment");
   const baseline = normalizeReport(baselineInput, "Baseline");
   const candidate = normalizeReport(candidateInput, "Candidate");
   if (!Number.isFinite(maxTokenIncreasePercent) || maxTokenIncreasePercent < 0 || maxTokenIncreasePercent > 10_000) {
@@ -51,7 +52,7 @@ export function compareScenarioSuiteReports(baselineInput, candidateInput, { max
       });
       continue;
     }
-    scenarios.push(compareScenario(baselineScenario, current, maxTokenIncreasePercent));
+    scenarios.push(compareScenario(baselineScenario, current, maxTokenIncreasePercent, mode));
   }
   for (const current of candidate.results) {
     if (baselineById.has(current.id)) continue;
@@ -76,7 +77,7 @@ export function compareScenarioSuiteReports(baselineInput, candidateInput, { max
   return {
     version: SCENARIO_SUITE_COMPARISON_VERSION,
     passed: regressionCount === 0,
-    policy: { maxTokenIncreasePercent, requireContextHashMatch: true },
+    policy: { maxTokenIncreasePercent, requireContextHashMatch: mode === "regression", mode },
     summary: {
       baseline: baseline.results.length,
       candidate: candidate.results.length,
@@ -95,7 +96,7 @@ export function compareScenarioSuiteReports(baselineInput, candidateInput, { max
   };
 }
 
-function compareScenario(baseline, candidate, tolerance) {
+function compareScenario(baseline, candidate, tolerance, mode) {
   const regressions = [];
   const changes = [];
   if (baseline.passed && !candidate.passed) {
@@ -116,7 +117,9 @@ function compareScenario(baseline, candidate, tolerance) {
     regressions.push(regression("scenario_issues_added", "issueCodes", baseline.issueCodes, candidate.issueCodes));
   }
   if (!sameValue(baseline.contextHashes, candidate.contextHashes)) {
-    regressions.push(regression("scenario_context_changed", "contextHashes", baseline.contextHashes, candidate.contextHashes));
+    (mode === "experiment" ? changes : regressions).push(
+      (mode === "experiment" ? change : regression)("scenario_context_changed", "contextHashes", baseline.contextHashes, candidate.contextHashes),
+    );
   }
   const allowedTokens = baseline.totalTokens === 0
     ? 0

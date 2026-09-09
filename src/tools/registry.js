@@ -10,6 +10,12 @@ import { executeMemoryMutation } from "../memory/outbox.js";
 import { applyWorkspacePatch } from "./apply-patch.js";
 import { createPermissionProfile } from "./permission-profile.js";
 import { readContainedTextFile, resolveContainedDirectory } from "../security/contained-text-file.js";
+import { executeVerification, refreshVerification } from "../core/verification.js";
+import { createWorkspaceSearch } from "./workspace-search.js";
+import { toolHistoryDefinition } from "./journal-read.js";
+import { readWorkspaceFile } from "./workspace-read.js";
+import { redactSensitiveValue } from "../security/redact.js";
+import { serializeRedactedToolJson } from "../security/tool-json.js";
 
 const NATIVE_TOOL_OWNER = "nexus:native-tools";
 const SAFE_READ_PATH = "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
@@ -44,6 +50,7 @@ export function createToolRegistry({
   });
   const permissionProfiles = normalizeAccessPolicies(accessPolicies, permissionProfile);
   const policyFor = (context) => permissionProfiles.get(context?.state?.permissionProfile) || permissionProfile;
+  const workspaceSearch = createWorkspaceSearch({ workspace: root, policyFor });
   const configuredMemory = memory || memoryStore?.memory || memoryStore || null;
   const memoryAdapter = configuredMemory ? assertMemoryInterface(configuredMemory) : null;
   const artifactAdapter = artifactStore ? assertArtifactStore(artifactStore) : null;
@@ -62,25 +69,22 @@ export function createToolRegistry({
     });
   };
 
+  define(toolHistoryDefinition());
+
   define({
     name: "list_files",
-    description: "列出工作区内某个目录的文件。只读，自动执行。",
+    description: "按名称排序分页列出工作区目录。返回 JSON：entries、complete、has_more、next_cursor 与跳过计数；有 next_cursor 时用相同参数续查。符号链接和受限路径排除；目录快照最多 20000 项，游标最多保留 15 分钟且目录/权限变化时失效。",
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
     capability: workspacePathCapability("path", "read", "R0", true, "."),
-    parameters: objectSchema({ path: { type: "string", description: "相对工作区路径" } }),
-    execute: async ({ path: requested = "." }, context) => {
-      const currentPolicy = policyFor(context);
-      const target = safePath(root, requested);
-      assertWorkspaceAccess(currentPolicy, root, target, "read");
-      const entries = await fs.readdir(target, { withFileTypes: true });
-      return entries
-        .filter((entry) => currentPolicy.canAccessPath(path.relative(root, path.join(target, entry.name)) || ".", "read"))
-        .slice(0, 120)
-        .map((entry) => `${entry.isDirectory() ? "目录" : "文件"}\t${path.join(requested, entry.name)}`)
-        .join("\n") || "（空目录）";
-    },
+    parameters: objectSchema({
+      path: { type: "string", description: "相对工作区目录，默认 ." },
+      limit: { type: "integer", minimum: 1, maximum: 200, description: "返回条数，默认 120；也受响应字符预算约束" },
+      scan_limit: { type: "integer", minimum: 1, maximum: 1000, description: "本页最多检查的目录项，默认 1000" },
+      cursor: { type: "string", description: "上页 next_cursor，须保持其他参数一致" },
+    }),
+    execute: workspaceSearch.list,
   });
 
   if (memoryAdapter) {
@@ -108,7 +112,7 @@ export function createToolRegistry({
           dispatch: context.dispatch,
           signal: context.signal,
           mutation: {
-            id: `${context.state.id}:${context.callId}:memory.add`,
+            id: toolMemoryMutationId(context, "add"),
             operation: "add",
             reconcilePolicy: "automatic",
             candidate: { content, tags, kind: "fact", confidence: 1 },
@@ -121,12 +125,13 @@ export function createToolRegistry({
     });
     define({
       name: "memory_search",
-      description: "搜索跨会话长期记忆。只读，自动执行。",
+      description: "按中英文关键词搜索当前范围的跨会话长期记忆。只读，自动执行；弱匹配可能省略，未命中时可改用具体主题词查询，不支持纯语义推断。",
       approval: "never",
       effects: ["read", "memory"],
       idempotency: "safe",
       capability: scopedCapability("memory_scope", "read", "R0", true),
-      parameters: objectSchema({ query: { type: "string" } }),
+      parameters: objectSchema({ query: { type: "string", ...(Number.isSafeInteger(memoryAdapter.capabilities?.maxSearchQueryChars)
+        && memoryAdapter.capabilities.maxSearchQueryChars > 0 ? { maxLength: memoryAdapter.capabilities.maxSearchQueryChars } : {}) } }),
       execute: async ({ query = "" }, context) => formatMemories(await memoryAdapter.search(query, {
         scope: context.state.memoryScope,
         signal: context.signal,
@@ -149,7 +154,7 @@ export function createToolRegistry({
           dispatch: context.dispatch,
           signal: context.signal,
           mutation: {
-            id: `${context.state.id}:${context.callId}:memory.delete`,
+            id: toolMemoryMutationId(context, "delete"),
             operation: "delete",
             reconcilePolicy: "automatic",
             memoryId: id,
@@ -171,16 +176,26 @@ export function createToolRegistry({
 
   define({
     name: "read_file",
-    description: "读取工作区内 UTF-8 文本文件。只读，自动执行。",
+    parallelRead: true,
+    description: "读取工作区 UTF-8 文本。小文件保持完整正文；大文件或显式分页返回范围、文件 version、complete 与 next_offset。行号从 1 开始；超长行、响应或扫描预算耗尽时用 offset=next_offset 继续，传 version 防止拼接不同版本。只读，自动执行。",
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
     capability: workspacePathCapability("path", "read", "R0", true),
-    parameters: objectSchema({ path: { type: "string" } }, ["path"]),
-    execute: async ({ path: requested }, context) => {
-      const target = safePath(root, requested);
-      assertWorkspaceAccess(policyFor(context), root, target, "read");
-      return truncate(await fs.readFile(target, "utf8"), 1_000_000);
+    parameters: objectSchema({
+      path: { type: "string" },
+      start_line: { type: "integer", description: "起始行号，从 1 开始；默认 1" },
+      line_count: { type: "integer", description: "行数，默认 200，最多 2000；返回 partial_line=true 时改用 next_offset 继续" },
+      offset: { type: "integer", description: "字节位置，从 0 开始；不可与行参数混用，可使用上一页 next_offset" },
+      limit: { type: "integer", description: "字节模式读取预算，默认 16384，最多 65536；实际正文还受响应预算约束" },
+      version: { type: "string", description: "上一页返回的 version；文件变化时拒绝继续" },
+    }, ["path"]),
+    execute: async (args, context) => {
+      const result = await readWorkspaceFile({
+        ...args, workspace: root, accessPolicy: policyFor(context),
+        authorizeRead: context?.authorizeRead, signal: context?.signal,
+      });
+      return typeof result === "string" ? result : serializeRedactedToolJson(redactSensitiveValue(result));
     },
   });
 
@@ -210,30 +225,20 @@ export function createToolRegistry({
 
   define({
     name: "search_files",
-    description: "在工作区文本文件中搜索字符串。只读，自动执行。",
+    description: "分页递归搜索工作区 UTF-8 文件中的字面字符串（不区分大小写）。返回 JSON：matches、扫描文件/字节数、跳过计数、complete、has_more、next_cursor；本页无匹配且 has_more 不代表全范围无匹配。忽略 .git/node_modules/dist/build、数据库、符号链接、受限路径、二进制和超过 1MB 文件。每页最多读取 4MB；游标按参数和快照绑定。",
     approval: "never",
     effects: ["read"],
     idempotency: "safe",
     capability: workspacePathCapability("path", "read", "R0", true, "."),
-    parameters: objectSchema({ query: { type: "string" }, path: { type: "string" } }, ["query"]),
-    execute: async ({ query, path: requested = "." }, context) => {
-      const currentPolicy = policyFor(context);
-      const base = safePath(root, requested);
-      assertWorkspaceAccess(currentPolicy, root, base, "read");
-      const files = await walk(base, 300, root, currentPolicy);
-      const hits = [];
-      for (const file of files) {
-        try {
-          const content = await fs.readFile(file, "utf8");
-          content.split("\n").forEach((line, index) => {
-            if (line.toLowerCase().includes(query.toLowerCase()) && hits.length < 80) {
-              hits.push(`${path.relative(root, file)}:${index + 1}: ${line.trim().slice(0, 240)}`);
-            }
-          });
-        } catch {}
-      }
-      return hits.join("\n") || "没有找到匹配内容。";
-    },
+    parameters: objectSchema({
+      query: { type: "string", minLength: 1, maxLength: 1024, description: "按行匹配的非空字面字符串，不支持换行" },
+      path: { type: "string", description: "搜索目录，相对工作区，默认 ." },
+      file_pattern: { type: "string", description: "相对搜索目录的文件名模式，默认 **/*；仅支持单段 *、? 和独占目录段的 **/，不支持集合、花括号、取反和转义" },
+      limit: { type: "integer", minimum: 1, maximum: 80, description: "最多返回匹配行数，默认 80；也受响应字符预算约束" },
+      scan_limit: { type: "integer", minimum: 1, maximum: 1000, description: "最多检查的文件或目录项数，默认 300" },
+      cursor: { type: "string", description: "上页 next_cursor，须保持 query/path/file_pattern/limit/scan_limit 一致" },
+    }, ["query"]),
+    execute: workspaceSearch.search,
   });
 
   define({
@@ -376,6 +381,7 @@ export function createToolRegistry({
     },
     parameters: objectSchema({
       command: { type: "string" },
+      verification_id: { type: "string", description: "可选：当前 Plan 已声明的验收项 id；command 必须与该项完全一致，结果由运行时绑定文件版本记录。" },
       timeout_ms: {
         type: "integer",
         minimum: 1,
@@ -383,14 +389,12 @@ export function createToolRegistry({
         description: "可选的执行期限（毫秒）；省略表示不设置自动 deadline，命令会以前台方式等待直至退出或被用户停止。",
       },
     }, ["command"]),
-    execute: async ({ command }, context) => executeShell(
-      execution,
-      policyFor(context),
-      command,
-      context.signal,
-      context.onOutput,
-      context.effectiveTimeoutMs,
-    ),
+    execute: async ({ command, verification_id }, context) => {
+      const execute = () => executeShell(execution, policyFor(context), command,
+        context.signal, context.onOutput, context.effectiveTimeoutMs);
+      return verification_id === undefined ? execute()
+        : executeVerification({ id: verification_id, command, context, workspace: root, execute });
+    },
   });
 
   define({
@@ -417,6 +421,16 @@ export function createToolRegistry({
     parameters: objectSchema({
       explanation: { type: "string", description: "可选的计划调整原因" },
       blocked_reason: { type: "string", description: "仅当存在无法自行解决的真实阻塞或必须由用户提供的信息时填写具体原因（1–1000 字符）；保留未完成步骤，最终说明阻塞。后续正常更新不填写此字段会清除阻塞。" },
+      acceptance: {
+        type: "array", maxItems: 20,
+        description: "可选：执行型任务的必要验收项。同一目标内已声明项不能删除或修改，可追加。省略会保留原项。paths 必须列出命令依赖的源码、测试和配置文件（最多 50 个不同文件）；运行时只验证所声明范围。",
+        items: objectSchema({
+          id: { type: "string", minLength: 1, maxLength: 64 },
+          description: { type: "string", minLength: 1, maxLength: 500 },
+          command: { type: "string", minLength: 1, maxLength: 8000 },
+          paths: { type: "array", minItems: 1, maxItems: 50, items: { type: "string", minLength: 1, maxLength: 512 } },
+        }, ["id", "description", "command", "paths"]),
+      },
       plan: {
         type: "array",
         items: {
@@ -430,8 +444,10 @@ export function createToolRegistry({
         },
       },
     }, ["plan"]),
-    execute: async ({ explanation = "", plan, blocked_reason }, context) => {
-      await context.dispatch({ type: "PLAN_UPDATED", explanation, steps: plan, ...(blocked_reason !== undefined ? { blockedReason: blocked_reason } : {}) });
+    execute: async ({ explanation = "", plan, blocked_reason, acceptance }, context) => {
+      await context.dispatch({ type: acceptance !== undefined ? "PLAN_ACCEPTANCE_UPDATED" : "PLAN_UPDATED", explanation, steps: plan,
+        ...(acceptance !== undefined ? { acceptance } : {}),
+        ...(blocked_reason !== undefined ? { blockedReason: blocked_reason } : {}) });
       const active = plan.find((item) => item.status === "in_progress");
       if (blocked_reason) return `计划已保留，已记录阻塞：${blocked_reason}。请在最终答复说明阻塞与需要的输入，不要把未完成步骤标为 completed。`;
       return `计划已更新（${plan.length} 步）${active ? `，当前：${active.step}` : ""}`;
@@ -529,6 +545,7 @@ export function createToolRegistry({
     workspaceExecution: execution,
     accessPolicy: permissionProfile,
     accessPolicies: permissionProfiles,
+    refreshVerification: (context) => refreshVerification({ ...context, workspace: root }),
   };
 }
 
@@ -596,24 +613,6 @@ function safePath(root, requested) {
   return path.join(realExisting, path.relative(existing, target));
 }
 
-async function walk(root, limit, workspace, accessPolicy) {
-  const results = [];
-  const queue = [root];
-  while (queue.length && results.length < limit) {
-    const current = queue.shift();
-    for (const entry of await fs.readdir(current, { withFileTypes: true })) {
-      if ([".git", "node_modules", "dist", "build"].includes(entry.name)) continue;
-      const target = path.join(current, entry.name);
-      const relative = path.relative(workspace, target) || ".";
-      if (!accessPolicy.canAccessPath(relative, "read")) continue;
-      if (entry.isDirectory()) queue.push(target);
-      else if (entry.isFile() && !/^nexus\.db(?:-(?:wal|shm))?$/.test(entry.name) && (await fs.stat(target)).size < 1_000_000) results.push(target);
-      if (results.length >= limit) break;
-    }
-  }
-  return results;
-}
-
 async function discoverSkills(roots) {
   const found = [];
   for (const source of roots) {
@@ -679,4 +678,13 @@ function countOccurrences(source, target) {
 
 function formatMemories(memories) {
   return memories.map((item) => `${item.id}\t${item.tags.join(",")}\t${item.content}`).join("\n") || "没有匹配的长期记忆。";
+}
+
+function toolMemoryMutationId(context, operation) {
+  if (!Number.isSafeInteger(context.sourceCursor) || context.sourceCursor < 1) {
+    throw new Error("Memory 工具写入需要 TOOL_REQUESTED durable cursor");
+  }
+  // Provider callId 可能被后续调用复用；游标才标识本次实际执行。
+  // 只在首次请求构造 key，outbox retry/reconcile 原样使用已持久化的 ID。
+  return `${context.state.id}:tool:${context.sourceCursor}:memory.${operation}`;
 }

@@ -1,4 +1,5 @@
 // A model response ending is not evidence that the user's objective is complete.
+import { verificationIssues } from "./verification.js";
 export const MAX_COMPLETION_CORRECTIONS = 2;
 
 export function completionIssues(state, text) {
@@ -16,7 +17,7 @@ export function completionIssues(state, text) {
     && /^\s*-\s*[\w.-]+\s*:\s*\{/m.test(prose);
   const archive = /^\s*\{\s*"archiveType"\s*:\s*"nexus-tool-history"/m.test(prose);
   if (legacyArchive || archive) issues.push("tool_archive_instead_of_call");
-  return issues;
+  return [...issues, ...verificationIssues(state)];
 }
 
 export function completionFeedback(reasons, attempt) {
@@ -24,6 +25,7 @@ export function completionFeedback(reasons, attempt) {
     empty_response: "没有提供有效的最终答复或工具调用",
     plan_incomplete: "当前 Plan 仍有 pending/in_progress 步骤",
     delegation_incomplete: "还有未结束的 Child 委派",
+    verification_incomplete: "当前 Plan 已声明的验收项缺少与现有文件版本匹配的真实成功结果；请按原 command 运行 run_shell 并提供 verification_id，修正失败后重新验证；不得删改验收项或自报 passed",
     tool_archive_instead_of_call: "正文输出了历史工具档案，但没有发出可执行的工具调用",
   };
   return `[Nexus 运行时完成检查：第 ${attempt}/${MAX_COMPLETION_CORRECTIONS} 次纠正；仅适用于本条检查所在的用户轮次，后续用户消息开始新轮次后失效；不是新的用户任务]\n`

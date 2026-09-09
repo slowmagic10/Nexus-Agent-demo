@@ -9,15 +9,21 @@ import { deriveAgentProfileSnapshot } from "../core/agent-profile.js";
 import { redactSensitiveValue } from "../security/redact.js";
 import { createStatePatch } from "../state-patch.js";
 import { EVENT_SCHEMA_VERSION, migrateDatabase } from "./migrations.js";
+import { compileStateCachePatch } from "./state-cache-patch.js";
 import { SQLiteMemoryAdapter } from "../memory/sqlite-adapter.js";
 import { createMemoryScope } from "../memory/scope.js";
 import { SQLiteArtifactAdapter } from "../artifacts/sqlite-adapter.js";
 import { artifactMetadata, MAX_ARTIFACT_BYTES } from "../artifacts/interface.js";
+import {
+  ArchiveExportError,
+  assertJournalImportBytes,
+  assertJournalImportEnvelope,
+  assertPortableArtifactBudget,
+} from "./archive-limits.js";
 
 const JOURNAL_FORMAT = "nexus.session-journal";
 const JOURNAL_FORMAT_VERSION = 1;
-const MAX_PORTABLE_ARTIFACTS = 256;
-const MAX_PORTABLE_ARTIFACT_BYTES = 64_000_000;
+export const MAX_TOOL_HISTORY_RECORD_BYTES = 4_000_000;
 
 export function validateAndReplayJournalArchive(archive) {
   const validated = validateJournalArchive(archive);
@@ -58,20 +64,28 @@ export class SessionStore {
     this.artifacts = new SQLiteArtifactAdapter({ db: this.db });
     this.upsert = this.db.prepare(`
       INSERT INTO sessions (
-        id, created_at, updated_at, provider, workspace, phase, message_count, state_json
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        id, created_at, updated_at, provider, workspace, phase, message_count, state_json,
+        cache_cursor, display_title, cache_generation
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
       ON CONFLICT(id) DO UPDATE SET
         updated_at = excluded.updated_at,
         provider = excluded.provider,
         workspace = excluded.workspace,
         phase = excluded.phase,
         message_count = excluded.message_count,
-        state_json = excluded.state_json
+        state_json = excluded.state_json,
+        cache_cursor = excluded.cache_cursor,
+        display_title = excluded.display_title,
+        cache_generation = sessions.cache_generation + 1
     `);
   }
 
   save(state) {
-    const durableState = redactSensitiveValue(state);
+    // Explicit legacy saves do not prove agreement with the current Journal.
+    this.#saveDurable(redactSensitiveValue(state));
+  }
+
+  #saveDurable(durableState, cacheCursor = null, stateJson = JSON.stringify(durableState)) {
     this.upsert.run(
       durableState.id,
       durableState.createdAt,
@@ -80,66 +94,125 @@ export class SessionStore {
       durableState.workspace,
       durableState.phase,
       durableState.messages.length,
-      JSON.stringify(durableState),
+      stateJson,
+      cacheCursor,
+      resolveSessionDisplayTitle(durableState),
     );
   }
 
   ensureJournal(state) {
-    const existing = this.db.prepare(
-      "SELECT COUNT(*) AS count FROM session_events WHERE session_id = ?",
-    ).get(state.id);
-    if (existing.count > 0) return this.load(state.id);
+    return this.ensureJournalWithReceipt(state).state;
+  }
 
-    const durableState = redactSensitiveValue(state);
+  ensureJournalWithReceipt(state) {
+    // The state, model projection and cursor must belong to the same database
+    // snapshot. Reading a newer head after replay would make a stale state
+    // appear current and defeat the expectedCursor check on its first commit.
     this.db.exec("BEGIN IMMEDIATE");
     try {
-      this.#insertJournalBaseline(durableState);
+      const existing = this.db.prepare("SELECT 1 FROM session_events WHERE session_id = ? LIMIT 1").get(state.id);
+      let durableState;
+      let events;
+      if (existing) {
+        events = this.readProjectionEvents(state.id);
+        durableState = replayProjection(events, state.id);
+      } else {
+        const cache = this.db.prepare("SELECT cache_cursor FROM sessions WHERE id = ?").get(state.id);
+        if (cache?.cache_cursor > 0) throw new Error(`会话 ${state.id} 的事件日志缺少基线`);
+        durableState = redactSensitiveValue(state);
+        this.#insertJournalBaseline(durableState);
+        events = [{ cursor: 1, sessionId: durableState.id, type: "SESSION_BASELINE",
+          at: durableState.createdAt, baseline: durableState }];
+      }
+      const cursor = this.latestSessionCursor(durableState.id);
       this.db.exec("COMMIT");
-      return durableState;
+      return { state: durableState, cursor, events };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
   }
 
-  commitSessionEvent(nextState, action, patch) {
-    const durableState = redactSensitiveValue(nextState);
+  commitSessionEvent(nextState, action, patch, { expectedCursor } = {}) {
+    const trustedPatch = expectedCursor !== undefined;
+    if (trustedPatch && (!Number.isSafeInteger(expectedCursor) || expectedCursor < 1)) {
+      throw new Error("提交 expectedCursor 必须是正安全整数");
+    }
+    const metadata = redactSensitiveValue({ id: nextState.id, schemaVersion: nextState.schemaVersion,
+      updatedAt: nextState.updatedAt, provider: nextState.provider, workspace: nextState.workspace,
+      phase: nextState.phase, messageCount: nextState.messages.length, displayTitle: nextState.displayTitle ?? null });
     const durableAction = redactSensitiveValue(action);
+    const durablePatch = redactSensitiveValue(patch);
     this.db.exec("BEGIN IMMEDIATE");
     try {
       const row = this.db.prepare(
         "SELECT COALESCE(MAX(seq), 0) AS seq FROM session_events WHERE session_id = ?",
-      ).get(durableState.id);
-      if (row.seq === 0) throw new Error(`会话 ${durableState.id} 尚未建立事件基线`);
+      ).get(metadata.id);
+      if (row.seq === 0) throw new Error(`会话 ${metadata.id} 尚未建立事件基线`);
+      if (trustedPatch && row.seq !== expectedCursor) {
+        throw new Error(`会话 ${metadata.id} 提交游标冲突：expectedCursor ${expectedCursor}，实际 ${row.seq}；请重新加载会话`);
+      }
       const cursor = row.seq + 1;
       this.db.prepare(`
         INSERT INTO session_events (session_id, seq, at, type, event_json, schema_version)
         VALUES (?, ?, ?, ?, ?, ?)
       `).run(
-        durableState.id,
+        metadata.id,
         cursor,
         durableAction.at,
         durableAction.type,
-        JSON.stringify({ action: durableAction, patch: redactSensitiveValue(patch) }),
+        JSON.stringify({ action: durableAction, patch: durablePatch }),
         EVENT_SCHEMA_VERSION,
       );
-      this.save(durableState);
-      if (cursor % this.checkpointInterval === 0) {
-        this.#writeCheckpoint(durableState, cursor, durableAction.at);
+      const checkpointDue = cursor % this.checkpointInterval === 0;
+      // Checkpoints already require a full durable snapshot. Other trusted
+      // commits bind only their delta; unsupported or stale caches fall back.
+      if (checkpointDue || !trustedPatch || !this.#updateStateCache(metadata, nextState, durablePatch, expectedCursor, cursor)) {
+        const durableState = redactSensitiveValue(nextState);
+        const stateJson = JSON.stringify(durableState);
+        this.#saveDurable(durableState, trustedPatch ? cursor : null, stateJson);
+        if (checkpointDue) this.#writeCheckpoint(durableState, cursor, durableAction.at, stateJson);
       }
       this.db.exec("COMMIT");
       return {
         cursor,
-        sessionId: durableState.id,
+        sessionId: metadata.id,
         type: durableAction.type,
         at: durableAction.at,
         action: durableAction,
-        patch: redactSensitiveValue(patch),
+        patch: durablePatch,
       };
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  #updateStateCache(metadata, nextState, patch, expectedCursor, cursor) {
+    const compiled = compileStateCachePatch(patch);
+    if (!compiled) return false;
+    // CASE guards malformed JSON before SQLite evaluates any JSON path. The
+    // materialized candidate computes the patch once and keeps a NULL result
+    // (e.g. append to a non-array) out of the NOT NULL compatibility snapshot.
+    // state_json remains complete and current for legacy readers/deletion.
+    const result = this.db.prepare(`
+      WITH candidate AS MATERIALIZED (
+        SELECT CASE WHEN json_valid(state_json) THEN
+          CASE WHEN json_type(state_json) = 'object'
+            AND json_extract(state_json, '$.id') = ?
+            AND json_extract(state_json, '$.schemaVersion') = ?
+          THEN json_set(${compiled.expression}, '$.displayTitle', json(?)) END
+        END AS patched
+        FROM sessions WHERE id = ? AND cache_cursor = ?
+      )
+      UPDATE sessions SET state_json = (SELECT patched FROM candidate),
+        updated_at = ?, provider = ?, workspace = ?, phase = ?, message_count = ?,
+        display_title = ?, cache_cursor = ?, cache_generation = cache_generation + 1
+      WHERE id = ? AND (SELECT patched FROM candidate) IS NOT NULL
+    `).run(metadata.id, metadata.schemaVersion, ...compiled.params, JSON.stringify(metadata.displayTitle),
+      metadata.id, expectedCursor, metadata.updatedAt, metadata.provider, metadata.workspace, metadata.phase,
+      metadata.messageCount, resolveSessionDisplayTitle(nextState), cursor, metadata.id);
+    return result.changes === 1;
   }
 
   listSessionEvents(id) {
@@ -183,18 +256,116 @@ export class SessionStore {
     ).get(id).cursor;
   }
 
+  toolHistorySnapshot(id) {
+    if (!this.db.prepare("SELECT 1 FROM sessions WHERE id = ? AND workspace = ?").get(id, this.workspace)) {
+      throw new Error("工具历史所属 Session 不存在、已删除或不在当前工作区");
+    }
+    return this.latestSessionCursor(id);
+  }
+
+  readToolHistoryOccurrences(id, { after = 0, until, callId, limit = 11 } = {}) {
+    this.#validateToolHistoryRange(id, until);
+    if (!Number.isSafeInteger(after) || after < 0 || after > until
+        || !Number.isSafeInteger(limit) || limit < 1 || limit > 21) throw new Error("工具历史发现范围无效");
+    const action = toolActionSql();
+    const rows = this.db.prepare(`
+      SELECT seq AS sourceCursor, substr(at, 1, 257) AS at,
+        substr(json_extract(${action}, '$.call.id'), 1, 1001) AS callId,
+        substr(json_extract(${action}, '$.call.name'), 1, 257) AS toolName
+      FROM session_events
+      WHERE session_id = ? AND type = 'TOOL_REQUESTED' AND seq > ? AND seq <= ?
+        AND json_extract(${action}, '$.call.name') != 'read_tool_history'
+        ${callId === undefined ? "" : `AND json_extract(${action}, '$.call.id') = ?`}
+      ORDER BY seq LIMIT ?
+    `).all(id, after, until, ...(callId === undefined ? [] : [callId]), limit);
+    return rows.map((row) => ({ ...row, ...this.#toolHistoryResult(id, row, until, false) }));
+  }
+
+  readToolHistoryRecord(id, { sourceCursor, until } = {}) {
+    this.#validateToolHistoryRange(id, until);
+    if (!Number.isSafeInteger(sourceCursor) || sourceCursor < 1 || sourceCursor > until) throw new Error("工具历史 source cursor 无效");
+    const action = toolActionSql();
+    // Preflight in SQLite before moving a potentially huge action into JS.
+    // These queries still scan JSON/index ranges; this is a materialization and
+    // response budget, not a promise of constant query CPU for long journals.
+    const row = this.db.prepare(`
+      SELECT seq AS sourceCursor, substr(at, 1, 257) AS at, length(CAST(${action} AS BLOB)) AS requestBytes,
+        substr(json_extract(${action}, '$.call.id'), 1, 1001) AS callId,
+        substr(json_extract(${action}, '$.call.name'), 1, 257) AS toolName,
+        EXISTS(SELECT 1 FROM json_each(${action}, '$.effects') WHERE value IN ('memory', 'credential')) AS privateTool
+      FROM session_events WHERE session_id = ? AND seq = ? AND type = 'TOOL_REQUESTED'
+    `).get(id, sourceCursor);
+    if (!row) return null;
+    const result = this.#toolHistoryResult(id, row, until, true);
+    const metadata = { ...row, ...result };
+    const recordBytes = row.requestBytes + (result.resultBytes ?? 0);
+    if (recordBytes > MAX_TOOL_HISTORY_RECORD_BYTES) {
+      return { ...metadata, contentOmitted: "record_too_large", recordBytes, maxRecordBytes: MAX_TOOL_HISTORY_RECORD_BYTES };
+    }
+    // Select at most this bounded request and its paired result, never patches,
+    // baseline system/user messages, private state, or an entire journal.
+    const readBody = (cursor, byteLimit) => this.db.prepare(`SELECT ${action} AS action_json
+      FROM session_events WHERE session_id = ? AND seq = ?
+        AND length(CAST(${action} AS BLOB)) <= ?`).get(id, cursor, byteLimit)?.action_json;
+    const requestJson = readBody(sourceCursor, MAX_TOOL_HISTORY_RECORD_BYTES);
+    const resultJson = result.resultCursor && readBody(result.resultCursor, MAX_TOOL_HISTORY_RECORD_BYTES - Buffer.byteLength(requestJson ?? "", "utf8"));
+    if (!requestJson || (result.resultCursor && !resultJson)) throw new Error("工具历史记录在读取期间已删除或超出正文预算");
+    return { ...metadata, request: JSON.parse(requestJson), result: resultJson ? JSON.parse(resultJson) : null };
+  }
+
+  #validateToolHistoryRange(id, until) {
+    const latest = this.toolHistorySnapshot(id);
+    if (!Number.isSafeInteger(until) || until < 1 || until > latest) throw new Error("工具历史 snapshot cursor 无效");
+  }
+
+  #toolHistoryResult(id, request, until, includeSize) {
+    const action = toolActionSql();
+    const match = `session_id = ? AND json_extract(${action}, '$.call.id') =
+      (SELECT json_extract(${action}, '$.call.id') FROM session_events WHERE session_id = ? AND seq = ?)`;
+    const parameters = [id, id, request.sourceCursor];
+    const next = this.db.prepare(`SELECT seq FROM session_events WHERE ${match}
+      AND type = 'TOOL_REQUESTED' AND seq > ? AND seq <= ? ORDER BY seq LIMIT 1`)
+      .get(...parameters, request.sourceCursor, until);
+    const priorBalance = this.db.prepare(`SELECT COALESCE(SUM(CASE type
+      WHEN 'TOOL_REQUESTED' THEN 1 WHEN 'TOOL_RESULT' THEN -1 ELSE 0 END), 0) AS balance
+      FROM session_events WHERE ${match} AND seq < ? AND type IN ('TOOL_REQUESTED', 'TOOL_RESULT')`)
+      .get(...parameters, request.sourceCursor).balance;
+    const row = this.db.prepare(`
+      SELECT seq AS resultCursor,
+        substr(json_extract(${action}, '$.status'), 1, 257) AS status,
+        json_extract(${action}, '$.ok') AS ok,
+        json_extract(${action}, '$.sourceCursor') AS explicitSourceCursor
+        ${includeSize ? `, length(CAST(${action} AS BLOB)) AS resultBytes,
+          ${toolArtifactMetadataSql(action, "$.artifact")} AS artifact_json,
+          ${toolArtifactMetadataSql(action, "$.fileChanges.diffArtifact")} AS diff_artifact_json` : ""}
+      FROM session_events WHERE ${match} AND type = 'TOOL_RESULT' AND seq > ? AND seq <= ?
+        AND json_extract(${action}, '$.call.name') =
+          (SELECT json_extract(${action}, '$.call.name') FROM session_events WHERE session_id = ? AND seq = ?)
+        AND (json_extract(${action}, '$.sourceCursor') = ?
+          OR (json_extract(${action}, '$.sourceCursor') IS NULL AND seq < ?))
+      ORDER BY seq LIMIT 1
+    `).get(...parameters, request.sourceCursor, until, id, request.sourceCursor, request.sourceCursor, next?.seq ?? until + 1);
+    // Old records do not carry sourceCursor on every result. A reused call ID
+    // with overlapping requests cannot be reliably paired; never guess which
+    // occurrence a result belongs to. Explicit durable linkage remains usable.
+    if (priorBalance !== 0 && row?.explicitSourceCursor !== request.sourceCursor) {
+      return { resultCursor: null, status: "ambiguous", association: "ambiguous" };
+    }
+    return { resultCursor: row?.resultCursor ?? null,
+      status: row ? row.status ?? (row.ok ? "completed" : "failed") : "pending",
+      ...(includeSize ? { resultBytes: row?.resultBytes ?? 0,
+        artifacts: [row?.artifact_json, row?.diff_artifact_json].filter(Boolean).map((value) => JSON.parse(value)) } : {}) };
+  }
+
   load(id) {
-    const row = this.db.prepare("SELECT state_json FROM sessions WHERE id = ?").get(id);
+    const row = this.db.prepare("SELECT cache_cursor FROM sessions WHERE id = ?").get(id);
     if (!row) return null;
     const events = this.readProjectionEvents(id);
-    if (!events.length) return parseState(row.state_json, id);
-    if (!events[0].baseline) {
-      throw new Error(`会话 ${id} 的事件日志缺少基线`);
+    if (!events.length) {
+      if (row.cache_cursor > 0) throw new Error(`会话 ${id} 的事件日志缺少基线`);
+      return parseState(this.db.prepare("SELECT state_json FROM sessions WHERE id = ?").get(id).state_json, id);
     }
-    return events.slice(1).reduce((state, event) => reduceSession(state, event.action), parseState(
-      JSON.stringify(events[0].baseline),
-      `${id} 基线`,
-    ));
+    return replayProjection(events, id);
   }
 
   sessionDeletionIds(id) {
@@ -292,12 +463,23 @@ export class SessionStore {
   }
 
   exportJournal(id, { exportedAt = new Date().toISOString() } = {}) {
+    try {
+      return this.#exportRecoverableJournal(id, exportedAt);
+    } catch (error) {
+      if (error instanceof ArchiveExportError) throw error;
+      throw new ArchiveExportError(`无法生成可恢复归档：${error.message}`, { statusCode: 422 });
+    }
+  }
+
+  #exportRecoverableJournal(id, exportedAt) {
+    preflightJournalExport(this.db, id);
     let state = this.load(id);
     if (!state) throw new Error(`未找到会话：${id}`);
     if (this.latestSessionCursor(id) === 0) {
       state = this.ensureJournal(state);
     }
     const artifacts = exportSessionArtifacts(this.db, id);
+    const events = this.readSessionEvents(id);
     const core = {
       format: "nexus.session-journal",
       formatVersion: 1,
@@ -308,17 +490,25 @@ export class SessionStore {
         provider: state.provider,
         workspace: state.workspace,
         cursor: this.latestSessionCursor(id),
-        stateSchemaVersion: state.schemaVersion,
+        // Header describes the source journal, whose baseline is immutable even
+        // after load/resume migrates its current projection to a newer schema.
+        stateSchemaVersion: events[0]?.baseline?.schemaVersion,
         lineage: state.lineage || null,
       },
-      events: this.readSessionEvents(id),
+      events,
       ...(artifacts.length ? { artifacts } : {}),
     };
-    return {
+    const archive = {
       ...core,
       exportedAt,
       checksum: archiveChecksum(core),
     };
+    assertJournalImportEnvelope(archive, { exporting: true });
+    const validated = validateJournalArchive(archive);
+    // Legacy archives may omit the artifacts member. New exports must still
+    // prove every reference resolves, including when all content is missing.
+    validateArtifactReferences(validated.state, artifacts, state.id);
+    return archive;
   }
 
   importJournal(archive, { id, workspace } = {}) {
@@ -332,7 +522,7 @@ export class SessionStore {
       if (this.db.prepare("SELECT 1 AS found FROM sessions WHERE id = ?").get(targetId)) {
         throw new Error(`会话已存在：${targetId}`);
       }
-      this.save(imported.state);
+      this.#saveDurable(redactSensitiveValue(imported.state), imported.events.length);
       const insertEvent = this.db.prepare(`
         INSERT INTO session_events (session_id, seq, at, type, event_json, schema_version)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -374,14 +564,16 @@ export class SessionStore {
   list(workspace, limit = 20) {
     return this.db.prepare(`
       SELECT id, created_at AS createdAt, updated_at AS updatedAt,
-             provider, phase, message_count AS messageCount, state_json AS stateJson
+             provider, phase, message_count AS messageCount, display_title AS displayTitle
       FROM sessions
       WHERE workspace = ?
       ORDER BY updated_at DESC
       LIMIT ?
-    `).all(workspace, limit).map(({ stateJson, ...row }) => ({
+    `).all(workspace, limit).map(({ displayTitle, ...row }) => ({
       ...row,
-      title: resolveSessionDisplayTitle(parseState(stateJson, row.id)),
+      title: displayTitle === null
+        ? resolveSessionDisplayTitle(parseState(this.db.prepare("SELECT state_json FROM sessions WHERE id = ?").get(row.id).state_json, row.id))
+        : resolveSessionDisplayTitle({ displayTitle }),
     }));
   }
 
@@ -420,8 +612,7 @@ export class SessionStore {
     this.db.close();
   }
 
-  #writeCheckpoint(state, cursor, createdAt) {
-    const stateJson = JSON.stringify(state);
+  #writeCheckpoint(state, cursor, createdAt, stateJson = JSON.stringify(state)) {
     this.db.prepare(`
       INSERT INTO session_checkpoints (session_id, cursor, state_json, checksum, created_at)
       VALUES (?, ?, ?, ?, ?)
@@ -433,7 +624,7 @@ export class SessionStore {
   }
 
   #insertJournalBaseline(state) {
-    this.save(state);
+    this.#saveDurable(state, 1);
     this.db.prepare(`
       INSERT INTO session_events (session_id, seq, at, type, event_json, schema_version)
       VALUES (?, 1, ?, 'SESSION_BASELINE', ?, ?)
@@ -446,26 +637,62 @@ export class SessionStore {
   }
 
   #latestValidCheckpoint(id, until = Number.MAX_SAFE_INTEGER) {
-    const rows = this.db.prepare(`
+    const candidates = this.db.prepare(`
       SELECT cursor, state_json AS stateJson, checksum, created_at AS createdAt
       FROM session_checkpoints
       WHERE session_id = ? AND cursor <= ?
       ORDER BY cursor DESC
-    `).all(id, until);
+    `);
     const eventExists = this.db.prepare(
       "SELECT 1 AS found FROM session_events WHERE session_id = ? AND seq = ?",
     );
-    for (const row of rows) {
-      if (checkpointChecksum(id, row.cursor, row.stateJson) !== row.checksum) continue;
-      if (!eventExists.get(id, row.cursor)) continue;
-      try {
-        const state = parseState(row.stateJson, `${id} checkpoint ${row.cursor}`);
-        if (state.id !== id) continue;
-        return { ...row, state };
-      } catch {}
+    // The existing (session_id, cursor DESC) index supplies one candidate at a
+    // time. Do not materialize every historical state or cap the candidate
+    // count: a much older checkpoint can still recover a damaged journal.
+    // StatementSync.iterate arrived after the supported Node 22.5 minimum.
+    // Older runtimes can use the same index with one-row keyset reads instead.
+    const rows = typeof candidates.iterate === "function"
+      ? candidates.iterate(id, until)
+      : (function* () {
+          let ceiling = until;
+          while (true) {
+            const row = candidates.get(id, ceiling);
+            if (!row) return;
+            yield row;
+            ceiling = row.cursor - 1;
+          }
+        })();
+    let failed = false;
+    try {
+      while (true) {
+        const { done, value: row } = rows.next();
+        if (done) return null;
+        if (checkpointChecksum(id, row.cursor, row.stateJson) !== row.checksum) continue;
+        if (!eventExists.get(id, row.cursor)) continue;
+        try {
+          const state = parseState(row.stateJson, `${id} checkpoint ${row.cursor}`);
+          if (state.id !== id) continue;
+          return { ...row, state };
+        } catch {}
+      }
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      // Also release the statement when next() itself throws; a for-of loop's
+      // automatic IteratorClose only covers failures after obtaining a row.
+      try { rows.return(); } catch (error) {
+        if (!failed) throw error;
+      }
     }
-    return null;
   }
+}
+
+function replayProjection(events, id) {
+  if (!events[0]?.baseline) throw new Error(`会话 ${id} 的事件日志缺少基线`);
+  return events.slice(1).reduce((state, event) => reduceSession(state, event.action), parseState(
+    JSON.stringify(events[0].baseline), `${id} 基线`,
+  ));
 }
 
 function parseState(value, label) {
@@ -478,6 +705,24 @@ function parseState(value, label) {
   } catch (error) {
     throw new Error(`会话 ${label} 的持久化数据损坏：${error.message}`);
   }
+}
+
+function toolActionSql() {
+  // Legacy schema-v1 archives can contain a bare action instead of {action,
+  // patch}. Mirror parseEventRow without loading a projection patch.
+  return "CASE WHEN json_type(event_json, '$.action') = 'object' THEN json_extract(event_json, '$.action') ELSE event_json END";
+}
+
+function toolArtifactMetadataSql(action, jsonPath) {
+  // Only bounded reference fields are selected, never a nested content field.
+  // An abnormally long ID cannot be a useful bounded reference; omit it.
+  return `CASE WHEN json_type(${action}, '${jsonPath}.id') = 'text'
+    AND length(json_extract(${action}, '${jsonPath}.id')) <= 256
+    THEN json_object('id', json_extract(${action}, '${jsonPath}.id'),
+      'kind', substr(json_extract(${action}, '${jsonPath}.kind'), 1, 256),
+      'sha256', substr(json_extract(${action}, '${jsonPath}.sha256'), 1, 64),
+      'byteSize', CASE WHEN json_type(${action}, '${jsonPath}.byteSize') = 'integer'
+        THEN json_extract(${action}, '${jsonPath}.byteSize') ELSE NULL END) ELSE NULL END`;
 }
 
 function parseEventRow(row, label) {
@@ -768,16 +1013,36 @@ function journalCore(archive) {
   };
 }
 
+function preflightJournalExport(db, sessionId) {
+  const { count, byteSize, actualBytes, largestBytes } = db.prepare(`
+    SELECT COUNT(*) AS count, COALESCE(SUM(byte_size), 0) AS byteSize,
+      COALESCE(SUM(length(CAST(content AS BLOB))), 0) AS actualBytes,
+      COALESCE(MAX(length(CAST(content AS BLOB))), 0) AS largestBytes
+    FROM artifacts WHERE session_id = ?
+  `).get(sessionId);
+  assertPortableArtifactBudget({ count, byteSize: Math.max(byteSize, actualBytes) }, { exporting: true });
+  if (largestBytes > MAX_ARTIFACT_BYTES) throw new Error(`Artifact 超过 ${MAX_ARTIFACT_BYTES} 字节上限，无法导出`);
+  const { journalBytes } = db.prepare(`
+    SELECT COALESCE(SUM(length(CAST(event_json AS BLOB))), 0) AS journalBytes
+    FROM session_events WHERE session_id = ?
+  `).get(sessionId);
+  // A lower bound avoids loading unbounded BLOB/journal data merely to reject it.
+  assertJournalImportBytes(actualBytes + journalBytes, { exporting: true });
+}
+
 function exportSessionArtifacts(db, sessionId) {
-  return db.prepare(`
+  const artifacts = [];
+  let encodedBytes = 0;
+  const rows = db.prepare(`
     SELECT id, call_id, kind, media_type, byte_size, sha256, content, created_at
     FROM artifacts WHERE session_id = ? ORDER BY created_at, id
-  `).all(sessionId).map((row) => {
+  `).iterate(sessionId);
+  for (const row of rows) {
     const bytes = Buffer.isBuffer(row.content) ? row.content : Buffer.from(row.content);
     if (bytes.byteLength !== row.byte_size || artifactDigest(bytes) !== row.sha256) {
       throw new Error(`Artifact ${row.id} 完整性校验失败，无法导出`);
     }
-    return {
+    const artifact = {
       id: row.id,
       callId: row.call_id,
       kind: row.kind,
@@ -787,15 +1052,17 @@ function exportSessionArtifacts(db, sessionId) {
       createdAt: row.created_at,
       content: bytes.toString("utf8"),
     };
-  });
+    encodedBytes += Buffer.byteLength(JSON.stringify(artifact), "utf8");
+    assertJournalImportBytes(encodedBytes, { exporting: true });
+    artifacts.push(artifact);
+  }
+  return artifacts;
 }
 
 function validatePortableArtifacts(value) {
   if (value === undefined) return [];
   if (!Array.isArray(value)) throw new Error("portable journal artifacts 必须是数组");
-  if (value.length > MAX_PORTABLE_ARTIFACTS) {
-    throw new Error(`portable journal Artifact 数量超过 ${MAX_PORTABLE_ARTIFACTS}`);
-  }
+  assertPortableArtifactBudget({ count: value.length, byteSize: 0 });
   const ids = new Set();
   let totalBytes = 0;
   return value.map((source, index) => {
@@ -813,9 +1080,7 @@ function validatePortableArtifacts(value) {
       throw new Error(`portable journal Artifact ${index + 1} 超过 ${MAX_ARTIFACT_BYTES} 字节上限`);
     }
     totalBytes += bytes.byteLength;
-    if (totalBytes > MAX_PORTABLE_ARTIFACT_BYTES) {
-      throw new Error(`portable journal Artifact 总量超过 ${MAX_PORTABLE_ARTIFACT_BYTES} 字节上限`);
-    }
+    assertPortableArtifactBudget({ count: value.length, byteSize: totalBytes });
     const metadata = artifactMetadata({ ...source, sessionId: "portable-validation" });
     if (metadata.byteSize !== bytes.byteLength || metadata.sha256 !== artifactDigest(bytes)) {
       throw new Error(`portable journal Artifact ${metadata.id} 完整性校验失败`);

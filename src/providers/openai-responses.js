@@ -1,8 +1,9 @@
 import { createProviderHttpError } from "./errors.js";
+import { normalizeProviderRequestPolicy } from "./request-policy.js";
 import { readSseData } from "./sse.js";
 
 export class OpenAIResponsesProvider {
-  constructor({ apiKey, baseUrl = "https://api.openai.com/v1", model, fetchImpl = globalThis.fetch }) {
+  constructor({ apiKey, baseUrl = "https://api.openai.com/v1", model, maxOutputTokens = null, outputTokenParameter = null, streamUsage = false, fetchImpl = globalThis.fetch }) {
     if (!apiKey || apiKey.startsWith("REPLACE_WITH_")) {
       throw new Error("OpenAI API Key 尚未配置；请先填写本地环境文件中的 OPENAI_API_KEY");
     }
@@ -11,6 +12,8 @@ export class OpenAIResponsesProvider {
     this.apiKey = apiKey;
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.model = model;
+    const requestPolicy = normalizeProviderRequestPolicy({ maxOutputTokens, outputTokenParameter, streamUsage }, { adapter: "openai-responses" });
+    this.maxOutputTokens = requestPolicy.maxOutputTokens;
     this.fetch = fetchImpl;
   }
 
@@ -93,6 +96,7 @@ export class OpenAIResponsesProvider {
         include: ["reasoning.encrypted_content"],
         ...(responsesTools.length ? { tools: responsesTools, tool_choice: "auto" } : {}),
         ...(stream ? { stream: true } : {}),
+        ...(this.maxOutputTokens === null ? {} : { max_output_tokens: this.maxOutputTokens }),
       }),
       signal,
     });

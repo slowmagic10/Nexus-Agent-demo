@@ -33,6 +33,19 @@ test("Suite Baseline 检测场景缺失、Context 漂移和通过变失败", asy
   assert.deepEqual(comparison.scenarios.find((item) => item.id === "removed").regressions.map((item) => item.code), ["scenario_removed"]);
 });
 
+test("实验比较允许声明的 Context 改动，但仍阻止任务质量和成本退化", async () => {
+  const baseline = await suite([scenario("tuning")]);
+  const changed = await suite([scenario("tuning", { prompt: "candidate prompt" })]);
+  const experiment = compareScenarioSuiteReports(baseline, changed, { mode: "experiment" });
+  assert.equal(experiment.passed, true);
+  assert.equal(experiment.policy.requireContextHashMatch, false);
+  assert.ok(experiment.scenarios[0].changes.some((item) => item.code === "scenario_context_changed"));
+  assert.equal(compareScenarioSuiteReports(baseline, changed).passed, false);
+  const worse = await suite([scenario("tuning", { prompt: "candidate prompt", expectedStatus: "failed", totalTokens: 9 })]);
+  assert.equal(compareScenarioSuiteReports(baseline, worse, { mode: "experiment" }).passed, false);
+  assert.throws(() => compareScenarioSuiteReports(baseline, changed, { mode: "unknown" }), /mode/);
+});
+
 test("Suite Baseline 按百分比容差判断 Token 增长，并记录指纹变化", async () => {
   const baseline = await suite([scenario("tokens", { totalTokens: 10 })]);
   const candidate = await suite([scenario("tokens", { totalTokens: 11 })]);

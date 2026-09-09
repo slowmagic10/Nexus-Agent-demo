@@ -52,6 +52,21 @@ NEXUS_MAX_STEPS=unlimited
 
 `NEXUS_CONTEXT_WINDOW_TOKENS` 声明当前模型真实支持的 Context Window，默认值为 `32000`，CLI 可用 `--context-window-tokens=1000000` 临时覆盖。该值不是累计任务 Token 限制：Nexus 仍会持续精简已闭合的旧工具记录、使用 Artifact 引用，并在接近窗口时组合语义摘要与最近完整轮次。当前本地 vLLM 若在 `/v1/models` 中报告 `max_model_len=1000000`，应将这里设置为 `1000000`，避免仍按历史默认值提前规划上下文。
 
+可选的请求策略把真实容量、常用输入目标和输出上限分开，未配置时保持现有行为：
+
+| 配置字段 | 环境变量 / CLI | 行为 |
+| --- | --- | --- |
+| `provider.contextTargetTokens` | `NEXUS_CONTEXT_TARGET_TOKENS` / `--context-target-tokens` | 主任务的常用输入目标，不发送给模型接口 |
+| `provider.maxOutputTokens` | `NEXUS_MAX_OUTPUT_TOKENS` / `--max-output-tokens` | 显式发送的输出上限，也用于输入规划的容量预留 |
+| `provider.outputTokenParameter` | `NEXUS_OUTPUT_TOKEN_PARAMETER` / `--output-token-parameter` | Compatible 服务使用 `max_tokens` 或 `max_completion_tokens`，必须按实际支持显式选择 |
+| `provider.streamUsage` | `NEXUS_STREAM_USAGE` / `--stream-usage` | 仅 Compatible 流式请求发送 `stream_options.include_usage=true`；默认不发送 |
+
+例如窗口为1,000,000、输入目标64,000、输出上限16,000时，有效输入目标为64,000；窗口32,000、目标31,000、输出上限8,000时，有效输入目标为24,000。公式为 `min(contextTargetTokens ?? contextWindowTokens, contextWindowTokens - (maxOutputTokens ?? 0))`。这些是配置示例，没有作为默认值启用，也不代表已测得最佳参数。目标不能超过容量，输出上限必须小于容量。
+
+Compatible 设置输出上限时必须同时选择参数名；Responses 只使用 `max_output_tokens`，不接受 Compatible 专用字段。前面三个可选配置可通过 JSON `null` 或环境变量/CLI 的 `provider-default` 重置，`streamUsage` 使用严格的 `true/false`。具名 Profile 可独立覆盖；切换 Adapter 不继承不兼容的接口选项，`--demo` 清除真实请求选项但保留输入规划目标。
+
+输入目标仍是规划目标：完整当前轮或固定上下文超出本地估算时不会仅因此被截断或结束，真实 overflow 仍走有限重规划。主调用、摘要和记忆提取共用 Provider 的输出上限；辅助调用的输入仍使用各自已有的有界批次。上限过小可能产生不完整回答，需要按真实任务验证。Web 上下文面板显示容量、目标和预留；Profile Drift 与任务评测的独立合同 Hash 记录请求参数变化。详见 [第四轮实施记录](docs/16-Harness模型请求契约与上下文预算实施记录-2026-09-08.md)。
+
 `--demo` 是强制离线模式：它会把 Thinking 重置为 `provider-default`，并忽略所有具名 Profile 的真实 Provider 覆盖，但保留 Profile 的指令、权限和预算。`--demo` 不能与显式 `--provider` 或 `--provider-thinking` 同时使用；环境文件中的真实 Provider 配置不会妨碍 Demo 启动。
 
 如果要使用 OpenAI 原生 Responses API，需要显式选择对应 Adapter；`auto` 仍保持 OpenAI-compatible 行为，不会改变现有 DeepSeek 配置：
@@ -189,6 +204,8 @@ Native Sandbox 默认完全断网。需要连接固定服务器时，可重复�
 - 删除任务：任务列表与页头提供删除入口，确认后删除该任务及委派子任务的聊天、执行日志、Checkpoint 和附件。运行中的任务会先停止；项目文件、长期记忆和独立分支保留。删除当前任务回到欢迎页，其他打开该任务的页面同步退出；已删除 ID 无法被迟到写入或恢复操作重新创建。
 - Objective 与计划：每个新任务建立 durable Objective；复杂任务通过 `update_plan` 维护有版本的步骤状态。未完成任务收到“继续吧”“修复好了吗”等明确短句时保留原目标和计划；已取消任务需要用户明确说“继续”才能恢复，已完成任务不自动复活。一般新任务仍创建新目标。
 - 完成检查：模型无工具调用时，Runtime 会检查剩余计划、未结束委派、空回答和误输出的历史工具档案；不合格则在同一轮最多自动纠正两次，仍受 Token/步骤预算与取消控制。真实阻塞通过 `update_plan.blocked_reason` 上报；纠正耗尽或存在阻塞时明确显示停止原因，保留原目标和计划供后续继续，避免把未完成工作标成成功。
+- 重复失败纠正：连续三个工具调用具有相同工具、参数和完整脱敏错误结果时，Runtime 在整批工具结束后给出固定纠正提示，帮助模型检查输入并换一种定位/修复方式；每个用户轮最多两次，仅追加提示，不自动重放工具或结束任务。成功、不同错误、已观察文件变化会打断计数，审批拒绝、超时和结果未知不进入该检测；不会因执行耗时长而触发。
+- 验收证据：执行型任务可通过 `update_plan.acceptance` 声明验收命令与输入文件；`run_shell.verification_id` 将真实工具结果绑定到对应验收项。完成前复查输入文件的 SHA-256 与版本，变化、失败或证据缺失都会要求重新验证。Web 计划卡与 CLI 显示验收状态。验收项在同一目标内只能追加，普通问答和未声明验收项的小修改不额外要求测试；它验证已声明命令，不承诺自动证明需求覆盖完整。
 - 请求恢复：当轮完成纠正放入请求首部系统指令，兼容只允许首部 system 的模型服务；历史日志和消息游标保持不变。模型请求遇到暂态连接故障或 HTTP 408/429/500/502/503/504 时，默认等待 250ms、1000ms，最多额外重试两次；不重放已执行工具，取消立即生效，失败请求用量计入预算（未知用量明确标为估算）。鉴权、配额、协议格式等永久错误不重试；持续失败会显示安全错误码并保留目标和计划。明确状态询问如“跑完了吗”会继续原目标。
 - 工具历史档案：压缩后的工具参数和结果以带来源的 JSON 数据档案进入请求，不再充当 assistant 的调用示例。系统说明明确其为不可信历史数据，说明成本计入上下文预算；最近两个真实工具轮和 opaque Provider 状态继续保留，原始日志不变。
 - 单层委派：Gateway Agent 可用 `delegate_task` 创建独立 Child Session，只传显式上下文和受限子预算；结果回填 Parent，Child 审批显示在 Parent，取消会级联传播。Child 重启恢复时预算只能保持或继续收紧，不能被具名 Profile 默认值扩大。首版不支持 Child 再委派、并行 fan-out 或跨进程 worker。
@@ -243,13 +260,132 @@ npm run --silent demo -- --evaluate-suite=/绝对路径/scenarios > /绝对路�
 # 与基线比较；可选允许每个场景最多 10% Token 增长
 npm run demo -- --evaluate-suite=/绝对路径/scenarios --suite-baseline=/绝对路径/baseline.json
 npm run demo -- --evaluate-suite=/绝对路径/scenarios --suite-baseline=/绝对路径/baseline.json --suite-token-tolerance=10
+
+# 策略实验：允许 Context Hash 改变，仍检查通过率、问题与 Token 预算退化
+npm run demo -- --evaluate-suite=/绝对路径/scenarios --suite-baseline=/绝对路径/baseline.json --suite-mode=experiment
 ```
+
+`--suite-mode` 默认 `regression`，保留 Context Hash 强一致要求；`experiment` 把预期的上下文改变记录为 change，而非仅因 Hash 不同判退化。两种模式都保留输入身份、原有质量检查与成本容差。
 
 Scenario JSON 声明固定的 `prompt`、Provider 响应序列、无副作用工具结果、可选取消点和期望指标。Harness 会通过真实 `AgentRuntime + ToolHost` 独立运行两次，比较去除时间波动后的 State/Event 指纹、Context Hash、Token/调用计数、问题 code 与工具结果分类；断言不匹配时 CLI 以退出码 `2` 结束。脚本只接受结构化响应和 `success/failure/wait_for_cancel` 工具结果，不解释代码、不启动 Shell，也不读写业务 Session。
 
 Suite 目录只读取第一层普通 `.json` 文件，按文件名排序，忽略子目录、符号链接和非 JSON 文件；每个 Scenario 可声明 `tags`。汇总报告包含通过率、确定性计数、Token/工具总量、状态/问题/标签分布和失败断言，不返回 prompt、响应或工具参数。Suite 全部通过返回退出码 `0`，任一断言或确定性检查失败返回 `2`，目录或 fixture 无效返回 `1`。
 
-Baseline 必须是一次未带 `--suite-baseline` 的原始 `scenario-suite-evaluation-v1` JSON 报告。比较会阻止：旧场景缺失、通过变失败、确定性下降、状态恶化、新增问题代码、Context Hash 改变及超出容差的逐场景 Token 增长；新增且自身通过的场景允许加入。State/Event 指纹变化会记录为 change，但不会单独阻断，方便区分内部实现调整与模型可见上下文回归。旧报告的 score、results 和 Token 汇总不一致时会被拒绝。
+回归模式的 Baseline 必须是一次未带 `--suite-baseline` 的原始 `scenario-suite-evaluation-v1` JSON 报告。比较会阻止：旧场景缺失、通过变失败、确定性下降、状态恶化、新增问题代码、Context Hash 改变及超出容差的逐场景 Token 增长；新增且自身通过的场景允许加入。State/Event 指纹变化会记录为 change，但不会单独阻断，方便区分内部实现调整与模型可见上下文回归。旧报告的 score、results 和 Token 汇总不一致时会被拒绝。
+
+### 长期记忆关键词检索
+
+长期记忆默认使用中英文关键词召回：例如已有“项目使用 TypeScript，测试使用 Vitest”，自然提问“我们项目使用什么语言和测试框架？”可以找到该记录。完整内容精确匹配、全文片段和标签片段优先，其余结果按词项覆盖排序。仅共享一个弱片段或只有“项目/使用”等泛词时可能省略；找不到时可用具体主题词重查。这是词法基线，不具备纯语义改述能力。
+
+SQLite migration v10 自动建立 trigram FTS 派生索引并回填旧记录，后续通过事务触发器维护。检索仍按 workspace/agent/user、状态、有效期和 pinned 过滤，再排序取 limit；固定记忆继续独立检索、独立预算。来源验证、软删除和幂等写入契约不变。
+
+直接查询上限为4096个UTF-16字符，最多选24个词项，模型工具schema同步公布长度限制。自动任务Context检索遇长消息时仅取查询首尾，保留原始用户消息和固定记忆，相关命中标记 `contextQueryTruncated`。Adapter API可显式传 `{strategy:"literal"}` 使用旧整句子串策略；`rebuildSearchIndex()` 是本地维护方法，不是模型工具，也不在搜索时自动全量重建。
+
+运行纯离线的标注对照评测：
+
+```bash
+node src/cli.js --evaluate-memory=fixtures/memory-suites/retrieval-v1.json
+```
+
+评测仅创建内存数据库，不加载模型配置或业务Session。报告区分正例召回、检索精度、MRR、负例空结果率和范围/状态违规；`passed` 代表找到所有标注目标且负例为空，精度另外报告。固定25查询样本中，召回从50%提高到100%，精度由100%变为95.24%，7个负例均无返回；这些合成样本结果不代表真实模型质量。详见 [第五轮实施记录](docs/17-Harness记忆检索与FTS实施记录-2026-09-09.md)。
+
+### 运行纠正与中断诊断
+
+Web 的任务健康报告、CLI `/evaluation` 和工作区任务评测共用 `turn-diagnostics-v1`：统计模型重试、完成检查纠正、重复失败纠正、按原因暂停和用户继续。可恢复失败的 Session phase 仍是 `failed`，诊断中的该轮 outcome 为 `paused`，失败终态事件另行计数。旧日志没有结构化原因时显示 `unknown`，不通过错误正文猜原因。
+
+`observedUserContinuations` 只表示观察到同一目标后续又收到用户消息；它可能是继续命令、状态询问或追加要求，不能直接当成系统出错次数。`unnecessaryContinuationRate` 暂为 `null`，后续需标注样本才能评价“无谓继续率”。任务产物验收与运行诊断分开，纠正提示出现不代表任务已经成功。
+
+重复失败反馈来自固定运行时规则，完整错误正文不提升为系统指令。新工具结果保存截断前完整脱敏输出的 SHA-256，不用 160 字预览比较；缺少该字段的旧结果不推断相同。Session schema v18 与新 action 支持恢复审计，v17 及此前已有迁移路径保留。实施范围见 [第三轮实施记录](docs/15-Harness进展纠正与中断诊断实施记录-2026-09-08.md)。
+
+### 验收项与实际工具证据
+
+例如，为构建声明验收项（模型通过已有 `update_plan` 工具提交）：
+
+```json
+{
+  "plan": [{ "step": "实现与验证", "status": "in_progress" }],
+  "acceptance": [{
+    "id": "build",
+    "description": "生产构建成功",
+    "command": "npm run build",
+    "paths": ["package.json", "src/main.ts"]
+  }]
+}
+```
+
+之后执行 `run_shell` 时携带 `{"command":"npm run build","verification_id":"build"}`。命令必须与声明一致，仍经过相同权限、审批和取消路径。输入在命令前后及最终完成前均会受权限约束地检查；通过状态只能由真实成功 Tool Result 产生，不能在计划中填入 `passed`。同一目标不能删改已有验收声明来绕过失败；新目标重新声明。输入文件应覆盖这条验收依赖的代码和配置，未声明文件不在本次证据有效性保证范围内。
+
+### 在实际产物上做任务效果评测
+
+新增 `fixtures/task-suites/local-coding-v1.json`，包含文档编辑、JSON 配置、小代码修复与 CSV 转换四个起步任务。每次试验使用独立临时工作区和 Session，真正经过 Runtime、Tool Host 与文件工具，然后从磁盘检查产物；`phase=completed` 与验收通过分别统计。报告包含 `falseCompletions`、检查结果 Hash、模型/工具用量、耗时和试次身份，不输出任务或文件正文。
+
+以下命令只有在你明确运行时才调用当前配置模型；不会启动 Gateway，也不会改动业务项目工作区：
+
+```bash
+npm run --silent local -- --evaluate-tasks=fixtures/task-suites/local-coding-v1.json > /tmp/nexus-task-results.json
+```
+
+默认仅启用文件工具，Shell 不可发现也不可执行。需要 Shell 的自定义评测必须显式增加 `--task-eval-shell`，使用当前配置的 WorkspaceExecution Adapter，审批在已授权的临时评测内处理；该开关不是启动服务的命令。`--demo` 可验证离线路径，但 Demo 的通过率不代表真实模型能力。全部通过返回 0，产物/运行失败或取消返回 2，配置无效返回 1。
+
+Suite 使用 `{id,tasks:[{id,prompt,files:[{path,content}],checks:[{id,type,path,expected}],trials,maxSteps,maxTokensPerTurn,maxInputTokens}]}`。验收支持 `file_equals`、`file_contains`、`json_equals`；相对路径、文件大小、任务和试次数均有界，不接受任意评测脚本。默认每任务一轮、最多 20 步、100000 tokens、32000 输入窗口；可按 fixture 显式调整。四个样例只是效果基线起点，尚不是大规模模型质量结论。
+
+### 长任务归档边界
+
+恢复时按需读取最新有效检查点，不再先把全部历史快照正文装入内存。坏检查点继续按序回退，找不到有效项时从原Journal恢复，校验规则及历史数据保持不变；旧Node缺少SQLite iterator时使用逐条查询兼容路径。
+
+新导出会先检查完整重放、被引用 Artifact 与可导入大小：最多 256 个 Artifact、内容总量 64 MB，HTTP 导入外壳最多 10 MB；新导出为目标 ID/项目参数预留 64 KB。超限会明确失败并建议 SQLite 一致性备份，不会静默省略附件或生成无法恢复的新备份。旧版本大归档仍可使用直接/CLI 导入的既有恢复路径；HTTP 入口仍受 10 MB 限制。不要在服务运行时只复制数据库主文件而漏掉 WAL。
+
+### 有界原生文件读取批次
+
+同一模型回复中的原生 `read_file` 可按原顺序分组，每组最多3个、调用ID互不重复；即使尾组只有1个，也走相同的清理路径。组内可以并发读取，结果仍按原调用顺序提交；整组收束后才进入后续操作，整个模型工具批次结束后才继续请求模型。
+
+仅显式标记、当前可用、纯read/safe、无需审批或Grant的内置读取可进入该路径；默认SQLite Artifact写入或未配置Artifact时支持并发，自定义Artifact写入保持串行。写入、Shell、MCP、Memory、历史回查、目录/搜索游标和Artifact读取均保留串行边界。并行准入不扩大权限，启动前会复查登记、实现、可用性、策略和资源。
+
+取消或超时后等待已准入的原生读取真正结束并关闭资源，再释放执行引用和提交结果；底层文件系统I/O不一定可即时抢占。普通读取失败仍回填结果并继续本轮；内部执行或记录失败保留明确的可恢复原因，不自动重放已开始调用。并发读取本身不提供跨文件事务快照，也不隔离其他Session对同一项目的写入。
+
+详见 [第七轮实施记录](docs/19-Harness有界文件读取并行实施记录-2026-09-09.md)。
+
+### 文件差异与开销对照
+
+状态补丁生成现在可在Node中直接比较普通JSON值，减少未变化长文本的重复序列化；特殊值和不支持的环境沿用原算法，补丁格式与独立快照保持。`node scripts/measure-state-patch-costs.js` 的80事件合成对照中，序列化文本量减少约96.21%，完整patch和Journal JSON一致；局部时延不代表完整任务提速。详见 [第十轮实施记录](docs/22-Harness状态补丁比较优化实施记录-2026-09-09.md)。
+
+会话内部的模型上下文现在按 durable patch 更新；流式进度等未改变模型字段的事件不再复制整份历史。发送给模型的请求仍保留独立快照，历史压缩、预算和哈希规则保持。`node scripts/measure-model-projection-costs.js` 可离线对照：80次合成事件的完整模型上下文克隆80→0次；这只衡量投影模块，不代表整个任务提速。详见 [第九轮实施记录](docs/21-Harness模型上下文增量投影实施记录-2026-09-09.md)。
+
+长任务状态缓存现在可复用已提交事件的增量 patch；旧缓存或不支持的补丁自动完整保存，检查点与恢复校验保持。状态和游标在同一事务恢复，提交时检查旧游标冲突；任务列表使用安全小标题，工具请求可只取得提交游标回执。
+
+`node scripts/measure-session-commit-costs.js` 可离线复现本轮对照：40次合成提交的SQLite文本参数量约34.1 MB→6.2 MB，减少约81.72%，两路径缓存、Journal及checkpoint一致。此指标不是磁盘写入量或任务速度；SQLite仍更新完整JSON。实现、旧数据库兼容与限制见 [第八轮实施记录](docs/20-Harness增量状态缓存与提交开销实施记录-2026-09-09.md)。
+
+文件审阅的Diff现在只展示修改附近三行上下文，分离较远的修改；保留准确行号、CRLF和文件末尾换行状态。正文与路径在生成片段前完整脱敏，路径控制字符会转义；超过输出预算时仅保留完整片段并显示截断状态。高度重复区域或匹配工作预算耗尽时显示较大的替换区段，保证变化不被虚构为已省略的相同行。二进制与超限文件仍按原规则提供元数据。
+
+可运行纯离线合成对照：
+
+```bash
+node scripts/measure-harness-costs.js
+```
+
+固定样本中，检查点payload由96份降为1份（4,051,647→49,566字节）；万行文件一处/两处分散修改的Diff分别由420,062字节降为228/418字节，恢复及独立文本重建均一致。这些数字是SQLite→JavaScript状态正文和Diff输出量，未测整体恢复耗时、峰值内存或真实模型质量。详见 [第六轮实施记录](docs/18-Harness恢复与文件审计实施记录-2026-09-09.md)。
+
+### 文件分页与历史工具回查
+
+`read_file` 的旧 `{path}` 调用对不超过 64 KiB 的小文件继续返回正文；大文件或显式分页返回结构化 JSON，包含范围、文件版本、`complete`、`stop_reason` 和下一页位置。行号从 1 开始，例如 `{"path":"src/main.ts","start_line":201,"line_count":200}`；字节偏移从 0 开始，例如 `{"path":"large.log","offset":1048576,"limit":16384}`。后续页携带返回的 `version` 防止拼接不同版本；它是文件身份/元数据版本，不是完整文件内容的 SHA-256。`partial_line=true` 时使用 `next_offset`，避免反复读取长行开头。读取到 EOF 不意味着之前未请求的内容也已返回。
+
+分页会在最多 2 MiB 的完整行及邻行上下文内应用现有脱敏规则，总读取仍限制为 8 MiB；从敏感值中间读取或遇到跨行凭据时也不直接透出片段。若无法取得足够上下文，会返回 `content_omitted=true` 和 `redaction_context_limit`，需要换范围或读取已有脱敏 Artifact。偏移始终属于原文件，不能按脱敏后正文长度计算。
+
+`list_files` / `search_files` 现在返回有界 JSON 分页：`entries` 或 `matches`、`complete`、`has_more`、`next_cursor`、扫描数量和跳过原因。下一页重复原查询参数并附加 `cursor`；游标绑定当前 Session、查询和已观察目录/文件/权限，最多保留 15 分钟，重启、变化或缓存驱逐后需要重新查询。搜索仍是大小写不敏感的字面匹配，`file_pattern` 支持单目录段的 `*`、`?` 和独占目录段的 `**/`，不接受任意正则。
+
+默认每页搜索预算为 300 个目录项、最多 80 条命中和 4 MB 文件读取；单文件 1 MB 上限，符号链接、受限路径、二进制或超大文件有明确计数。目录/文件快照本身有 20,000 项和 8 MB 上限。`has_more=false` 但 `complete=false` 表示已没有继续页、仍有未覆盖部分，不能据此断言全仓库不存在匹配。每页返回前复核已观察的对象，但不宣称整个目录树处于一个文件系统事务快照。
+
+`read_tool_history` 只查询当前 Session 的 durable 工具记录：
+
+```json
+{"call_id":"某次工具调用ID"}
+```
+
+从返回的 `occurrences` 选择正确 `sourceCursor`，再用 `{"source_cursor":123,"snapshot_cursor":456}` 精读。结果字符页给出 `sha256`、`nextOffset`，后续携带 `offset`、同一 `snapshot_cursor` 和 `expected_sha256`。这些 cursor 是真实 Journal cursor，不是界面事件 seq；同一 callId 的多次调用会分别列出，不会盲取最后一次。它不执行历史工具、不读取其他 Session，也不返回 baseline、用户/系统消息或私密记忆/凭据工具正文；没有 durable journal 或分支只继承了消息时，会明确不支持或找不到记录。
+
+三类分页回复都控制在 10,000 字符以内，并使用共同安全 JSON 编码，防止后续重复脱敏破坏分页结构。工具历史单条请求与结果合计超过 4,000,000 字节时，只返回省略原因及可用 Artifact 引用；完整 Artifact 用 `read_artifact` 分段读取。SQL 查询仍可能扫描历史，不承诺查询 CPU 恒定有界。
+
+新增 `fixtures/task-suites/retrieval-v1.json`，覆盖第 320 个文件的定位和长文件尾部提取。任务效果套件现允许最多 512 个种子文件，仍受单文件和每任务总字节限制，并已接通 `read_tool_history` / `read_artifact`。这些起步场景本轮仅通过离线 Provider 验证工具链，未自动调用真实模型。
 
 CLI 中可用：
 

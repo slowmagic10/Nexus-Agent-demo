@@ -3,6 +3,7 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { composeRuntimeConfig, inspectRuntimeConfig } from "./config/composer.js";
+import { resolveContextBudget } from "./providers/request-policy.js";
 import { GatewaySessionManager } from "./gateway/session-manager.js";
 import { createGatewayServer } from "./gateway/server.js";
 import { formatMaxSteps } from "./runtime-options.js";
@@ -84,10 +85,7 @@ async function createProjectManager(project) {
   });
   const { workspace, baseMemoryScope: memoryScope, agentProviders, defaultProviderBinding, store } = assembly;
   const defaultAgentProfile = projectConfig.agents.profiles.find((profile) => profile.id === projectConfig.agents.defaultProfile);
-  const maxInputTokens = defaultAgentProfile?.provider?.contextWindowTokens
-    ?? projectConfig.runtime.maxInputTokens
-    ?? projectConfig.provider.contextWindowTokens
-    ?? 32_000;
+  const maxInputTokens = resolveContextBudget(defaultAgentProfile?.provider || projectConfig.provider).maxInputTokens;
   const enabledPermissionProfiles = ["read-only", "approval-required", "workspace-confirm", "workspace-untrusted", "workspace-auto"];
   if (projectConfig.execution.type === "local") enabledPermissionProfiles.push("danger-full-access");
   let projectManager = null;
