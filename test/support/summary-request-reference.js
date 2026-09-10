@@ -1,5 +1,4 @@
-import { redactSensitiveText, redactSensitiveValue } from "../security/redact.js";
-import { measureModelRequest } from "./model-usage.js";
+import { redactSensitiveText, redactSensitiveValue } from "../../src/security/redact.js";
 
 export const CONTEXT_SUMMARY_VERSION = "semantic-summary-v1";
 export const SUMMARY_SOURCE_EXCERPT_VERSION = "summary-source-excerpt-v1";
@@ -11,16 +10,6 @@ export class ContextSummarySourceBudgetError extends Error {
     super(`Context summary 来源预算 ${maxChars} 无法容纳非空摘录及省略说明`);
     this.name = "ContextSummarySourceBudgetError";
     this.code = "context_summary_source_budget";
-  }
-}
-
-export class ContextSummaryRequestBudgetError extends Error {
-  constructor(maxInputTokens, estimatedInputTokens) {
-    super(`Context summary 完整请求无法在估算输入预算 ${maxInputTokens} Tokens 内容纳旧摘要、提示词和非空历史来源`);
-    this.name = "ContextSummaryRequestBudgetError";
-    this.code = "context_summary_request_budget";
-    this.maxInputTokens = maxInputTokens;
-    this.estimatedInputTokens = estimatedInputTokens;
   }
 }
 
@@ -83,112 +72,26 @@ export function prepareContextSummaryRequest({ previousSummary, messages, source
   };
 }
 
-// Plan before admitting a model call. Keep the previous summary intact and only
-// reduce newly selected history; every returned request is measured in full.
-export function planContextSummaryRequest({
-  messages, previousSummary = null, fromMessage = 0, throughMessage,
-  maxInputTokens = 32_000, signal,
-}) {
-  if (!Number.isSafeInteger(maxInputTokens) || maxInputTokens < 1) {
-    throw new Error("Context summary maxInputTokens 必须是安全的正整数");
-  }
-  const select = createBatchSelector(messages);
-  validateSourceRange(messages, fromMessage, throughMessage);
-  const previous = previousSummary === null ? null : structuredClone(previousSummary);
-  // Check unavoidable input before formatting any source body. Omit a new
-  // sourceNotice here so this remains a floor for complete smaller batches.
-  const floor = measureModelRequest(prepareContextSummaryRequest({ previousSummary: previous, messages: [] })).estimatedInputTokens;
-  if (floor >= maxInputTokens) throw new ContextSummaryRequestBudgetError(maxInputTokens, floor);
-  const candidate = (maxChars, end = throughMessage) => {
-    const batch = select({ fromMessage, throughMessage: end, maxChars });
-    const input = { ...batch, previousSummary: previous,
-      sourceComplete: batch.sourceComplete && previous?.sourceComplete !== false, signal };
-    const request = prepareContextSummaryRequest(input);
-    return { batch, input, request, estimatedInputTokens: measureModelRequest(request).estimatedInputTokens,
-      maxInputTokens, sourceMaxChars: maxChars };
-  };
-  const initial = candidate(48_000);
-  if (initial.estimatedInputTokens <= maxInputTokens) return initial;
-
-  // An excerpt adds a notice, so it can cost more than the complete first
-  // turn. Test that discontinuity explicitly before searching character caps.
-  let firstTurnEnd = fromMessage + 1;
-  while (firstTurnEnd < throughMessage && messages[firstTurnEnd]?.role !== "user") firstTurnEnd += 1;
-  const first = firstTurnEnd < initial.batch.throughMessage ? candidate(48_000, firstTurnEnd) : initial;
-  let low = 1;
-  let high = 47_999;
-  let best = first.estimatedInputTokens <= maxInputTokens ? first : null;
-  for (let attempt = 0; attempt < 16 && low <= high; attempt += 1) {
-    const middle = Math.floor((low + high) / 2);
-    let planned;
-    try {
-      planned = candidate(middle);
-    } catch (error) {
-      if (!(error instanceof ContextSummarySourceBudgetError)) throw error;
-      low = middle + 1;
-      continue;
-    }
-    if (planned.estimatedInputTokens <= maxInputTokens) {
-      // Once a complete first turn fits, a smaller excerpt of that same turn
-      // must not replace it just because the notice creates another fit region.
-      if (!best || best !== first || planned.batch.throughMessage > first.batch.throughMessage) best = planned;
-      low = middle + 1;
-    } else high = middle - 1;
-  }
-  // Selection and omission notices have discontinuities. Do not claim an
-  // optimal fill; retain only a complete candidate that actually passed.
-  if (!best) throw new ContextSummaryRequestBudgetError(maxInputTokens, initial.estimatedInputTokens);
-  return best;
-}
-
-export function selectContextSummaryBatch(messages, options = {}) {
-  return createBatchSelector(messages)(options);
-}
-
-// Read-only projection over an owned source. No original message or summary
-// reference may escape; callers receive only selected data and its source cursor.
-export function prepareContextSummarySource(state, sourceCursor, {
-  fromMessage = 0, throughMessage, usesModel = true, maxInputTokens = 32_000,
+export function selectContextSummaryBatch(messages, {
+  fromMessage = 0,
+  throughMessage,
+  maxChars = 48_000,
 } = {}) {
-  if (typeof usesModel !== "boolean") throw new TypeError("Context summary usesModel 必须是布尔值");
-  if (usesModel) {
-    try {
-      const planned = planContextSummaryRequest({ messages: state.messages, previousSummary: state.contextSummary,
-        fromMessage, throughMessage, maxInputTokens });
-      return { sourceCursor, batch: planned.batch, previousSummary: planned.input.previousSummary,
-        sourceComplete: planned.input.sourceComplete, request: planned.request };
-    } catch (error) {
-      // Preserve the exact rejected source position, even if the caller later
-      // observes a newer Session cursor. Other errors keep their original form.
-      if (error instanceof ContextSummaryRequestBudgetError) error.sourceCursor = sourceCursor;
-      throw error;
-    }
-  }
-  const batch = selectContextSummaryBatch(state.messages, { fromMessage, throughMessage });
-  const previousSummary = structuredClone(state.contextSummary);
-  return { sourceCursor, batch, previousSummary,
-    sourceComplete: batch.sourceComplete && previousSummary?.sourceComplete !== false, request: null };
-}
-
-function createBatchSelector(messages) {
   if (!Array.isArray(messages)) throw new Error("Context summary messages 必须是数组");
+  if (!Number.isSafeInteger(fromMessage) || fromMessage < 0 || fromMessage > messages.length) {
+    throw new Error("Context summary fromMessage 无效");
+  }
+  if (!Number.isSafeInteger(throughMessage) || throughMessage <= fromMessage || throughMessage > messages.length) {
+    throw new Error("Context summary throughMessage 无效");
+  }
+  if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error("Context summary maxChars 必须是正整数");
+
+  const selected = [];
   const cache = new Map();
   const at = (index) => {
     if (!cache.has(index)) cache.set(index, compactMessage(messages[index]));
     return cache.get(index);
   };
-  return (options) => selectBatch(messages, options, at);
-}
-
-function selectBatch(messages, {
-  fromMessage = 0,
-  throughMessage,
-  maxChars = 48_000,
-}, at) {
-  validateSourceRange(messages, fromMessage, throughMessage);
-  if (!Number.isSafeInteger(maxChars) || maxChars < 1) throw new Error("Context summary maxChars 必须是正整数");
-
-  const selected = [];
   let cursor = fromMessage;
   let chars = 0;
   let sourceChars = 2;
@@ -232,15 +135,6 @@ function selectBatch(messages, {
     throughMessage: cursor,
     sourceComplete,
   };
-}
-
-function validateSourceRange(messages, fromMessage, throughMessage) {
-  if (!Number.isSafeInteger(fromMessage) || fromMessage < 0 || fromMessage > messages.length) {
-    throw new Error("Context summary fromMessage 无效");
-  }
-  if (!Number.isSafeInteger(throughMessage) || throughMessage <= fromMessage || throughMessage > messages.length) {
-    throw new Error("Context summary throughMessage 无效");
-  }
 }
 
 export function normalizeSemanticSummary(value) {

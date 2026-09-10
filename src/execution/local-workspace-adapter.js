@@ -3,6 +3,7 @@ import { realpathSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { createExecutionSpec } from "./interface.js";
+import { createOutputNotifier } from "./output-notifier.js";
 
 export const DEFAULT_ENVIRONMENT_ALLOWLIST = Object.freeze([
   "PATH",
@@ -83,7 +84,7 @@ export class LocalWorkspaceAdapter {
       child.stdout.setEncoding("utf8");
       child.stderr.setEncoding("utf8");
       const output = createOutputCollector(normalized.maxOutputChars);
-      const notifications = createOutputNotifier(onOutput);
+      const notifications = createOutputNotifier(onOutput, { sources: [child.stdout, child.stderr] });
       let settled = false;
       let timedOut = false;
       let forceKillTimer = null;
@@ -97,6 +98,7 @@ export class LocalWorkspaceAdapter {
         child.kill(signalName);
       };
       const requestTermination = () => {
+        notifications.stop();
         killExecution("SIGTERM");
         forceKillTimer ||= setTimeout(() => killExecution("SIGKILL"), this.killGraceMs);
         forceKillTimer.unref?.();
@@ -118,14 +120,16 @@ export class LocalWorkspaceAdapter {
       timer?.unref?.();
 
       const cleanup = () => {
+        notifications.stop();
         if (timer) clearTimeout(timer);
         if (forceKillTimer) clearTimeout(forceKillTimer);
         signal?.removeEventListener("abort", onAbort);
       };
-      child.once("error", (error) => {
+      child.once("error", async (error) => {
         if (settled) return;
         settled = true;
         cleanup();
+        await notifications.drain();
         reject(new WorkspaceExecutionError(`无法启动本机执行：${error.message}`, { code: "spawn_failed" }));
       });
       child.once("close", async (exitCode, closeSignal) => {
@@ -198,19 +202,6 @@ function createOutputCollector(limit) {
       return Object.fromEntries(Object.keys(values).map((key) => [key, truncated[key]
         ? `${values[key]}\n…（已截断）`
         : values[key]]));
-    },
-  };
-}
-
-function createOutputNotifier(callback) {
-  let tail = Promise.resolve();
-  return {
-    emit(event) {
-      if (!callback) return;
-      tail = tail.then(() => callback(event)).catch(() => {});
-    },
-    async drain() {
-      await tail;
     },
   };
 }

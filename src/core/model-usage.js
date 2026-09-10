@@ -4,8 +4,12 @@ export const TOKEN_ESTIMATOR_VERSION = "utf8-bytes-div3-v1";
 // This is an estimate, not a claim about the provider's tokenizer.
 export function measureModelRequest({ systemPrompt = "", messages = [], tools = [] } = {}) {
   const fixedTokens = estimateTokenValue(systemPrompt) + estimateTokenValue(tools) + 8;
-  const messageTokens = messages.reduce((total, message) => total + estimateTokenValue(message) + 4, 0);
+  const messageTokens = measureModelMessages(messages);
   return { fixedTokens, messageTokens, estimatedInputTokens: fixedTokens + messageTokens };
+}
+
+export function measureModelMessages(messages) {
+  return messages.reduce((total, message) => total + estimateTokenValue(message) + 4, 0);
 }
 
 export function estimateTokenValue(value) {

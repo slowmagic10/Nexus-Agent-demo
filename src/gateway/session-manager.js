@@ -28,6 +28,7 @@ import { PermissionToolHostRouter } from "../tools/permission-router.js";
 import { revokeSessionGrant } from "../tools/authorization.js";
 import { evaluateSession } from "../evaluation/session-evaluation.js";
 import { ArchiveExportError } from "../persistence/archive-limits.js";
+import { attachSessionStateCache } from "./session-state-cache.js";
 
 const PERMISSION_MODE_INFO = Object.freeze([
   Object.freeze({
@@ -829,6 +830,9 @@ export class GatewaySessionManager {
       maxTokensPerTurn,
       maxInputTokens: runtimeProfile.maxInputTokens,
       contextBudget: runtimeProfile.contextBudget,
+      ...(runtimeProfile.summaryMaxInputTokens !== undefined ? {
+        summaryMaxInputTokens: runtimeProfile.summaryMaxInputTokens,
+      } : {}),
     };
     entry.runtime = this.runtimeFactory
       ? this.runtimeFactory(runtimeOptions)
@@ -841,7 +845,7 @@ export class GatewaySessionManager {
           reconcile: ({ signal } = {}) => reconcileMemoryOutbox({ session, memory: this.memory, signal }),
           flushMemory: (input) => runtimeProfile.memoryFlushPolicy.flush(input),
         });
-    session.subscribe((next) => this.update(entry, next));
+    attachSessionStateCache(entry, this, nativeUpdate);
     this.sessions.set(session.id, entry);
     return entry;
   }
@@ -1027,6 +1031,8 @@ export class GatewaySessionManager {
   }
 }
 
+const nativeUpdate = GatewaySessionManager.prototype.update;
+
 function createRuntimeAgentProfiles({
   catalog,
   snapshot,
@@ -1046,6 +1052,7 @@ function createRuntimeAgentProfiles({
   if (snapshot) {
     const fixed = assertAgentProfileSnapshot(snapshot);
     const contextBudget = configuredContextBudget(fixed.provider);
+    const providerBudget = resolveContextBudget(fixed.provider);
     return {
       defaultProfile: fixed.id,
       profiles: [{
@@ -1057,6 +1064,7 @@ function createRuntimeAgentProfiles({
         maxTokensPerTurn: runtimeLimit(fixed.budgets.maxTokensPerTurn),
         maxInputTokens: contextBudget?.maxInputTokens ?? normalizeMaxInputTokens(fixed.provider.contextWindowTokens ?? maxInputTokens),
         contextBudget,
+        summaryMaxInputTokens: providerBudget.contextWindowTokens - providerBudget.reservedOutputTokens,
         memoryScope: fixed.memoryScope,
         systemPrompt,
         provider: providerClient,
@@ -1116,7 +1124,9 @@ function createRuntimeAgentProfiles({
       contextWindowTokens,
     };
     const contextBudget = configuredContextBudget(descriptor);
-    const profileMaxInputTokens = resolveContextBudget(descriptor).maxInputTokens;
+    const providerBudget = resolveContextBudget(descriptor);
+    const profileMaxInputTokens = providerBudget.maxInputTokens;
+    const declaredCapacity = definition.provider?.contextWindowTokens ?? baseDescriptor.contextWindowTokens;
     const snapshotFactory = () => createAgentProfileSnapshot({
       id: definition.id,
       provider: descriptor,
@@ -1140,6 +1150,9 @@ function createRuntimeAgentProfiles({
       maxTokensPerTurn: profileMaxTokens,
       maxInputTokens: profileMaxInputTokens,
       contextBudget,
+      ...(declaredCapacity !== undefined && declaredCapacity !== null ? {
+        summaryMaxInputTokens: providerBudget.contextWindowTokens - providerBudget.reservedOutputTokens,
+      } : {}),
       memoryScope: profileMemoryScope,
       systemPrompt: profileSystemPrompt,
       provider: binding.provider,

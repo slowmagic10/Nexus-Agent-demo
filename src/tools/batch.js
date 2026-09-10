@@ -1,3 +1,5 @@
+import { dispatchSessionAction } from "../core/session-action.js";
+
 export const TOOL_BATCH_VERSION = "native-read-batch-v1";
 export const MAX_PARALLEL_READS = 3;
 
@@ -38,7 +40,7 @@ export async function runToolBatch(calls, context, { prepareRead, executeSerial 
       if (item.status === "rejected") { errors.push(item.reason); continue; }
       const outcome = item.value;
       if (outcome.action) {
-        try { await context.session.dispatch(outcome.action); }
+        try { await dispatchSessionAction(context.session, outcome.action); }
         catch (error) { errors.push(error); }
       }
       if (outcome.error) errors.push(outcome.error);

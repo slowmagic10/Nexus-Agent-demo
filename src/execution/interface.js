@@ -19,6 +19,8 @@ const FILESYSTEM_MODES = new Set(["workspace-write", "read-only"]);
 /**
  * WorkspaceExecution context 可选提供 onOutput({channel, chunk})，Adapter 必须按观察顺序发布 stdout/stderr，
  * 并在 execute settle 前等待已发布通知闭合；通知失败不能改变子进程执行结果。
+ * 慢观察者可通过暂停读取向子进程施加背压；取消/超时后可停止新增实时通知，
+ * 但必须恢复管道排空并按原输出限额收集清理尾部，已接受的通知仍需等待闭合。
  */
 
 export function createExecutionSpec(input) {

@@ -174,6 +174,7 @@ class RuntimeAssembly {
     maxTokensPerTurn,
     contextBudget,
     maxInputTokens,
+    summaryMaxInputTokens,
   } = {}) {
     this.#assertOpen();
     if (!this.#activation) throw new Error("Runtime Assembly 尚未激活");
@@ -192,6 +193,14 @@ class RuntimeAssembly {
       ? providerBudget.maxInputTokens
       : this.config.runtime.maxInputTokens ?? providerBudget.maxInputTokens);
     const effectiveContextBudget = contextBudget === undefined ? declaredContextBudget : contextBudget;
+    if (summaryMaxInputTokens !== undefined
+      && (!Number.isSafeInteger(summaryMaxInputTokens) || summaryMaxInputTokens < 1)) {
+      throw new Error("Runtime Assembly summaryMaxInputTokens 必须是安全的正整数");
+    }
+    // Summarizing discarded history needs the Provider's capacity, independently
+    // of the narrower target used to select the main conversation window.
+    const summaryCapacity = providerBudget.contextWindowTokens - providerBudget.reservedOutputTokens;
+    const effectiveSummaryMaxInputTokens = Math.min(summaryMaxInputTokens ?? summaryCapacity, summaryCapacity);
     const flushPolicy = memoryFlushPolicy || new MemoryFlushPolicy({
       memory: this.store.memory,
       extractCandidates: createModelMemoryExtractor(provider),
@@ -215,6 +224,7 @@ class RuntimeAssembly {
       maxTokensPerTurn,
       maxInputTokens: effectiveMaxInputTokens,
       contextBudget: effectiveContextBudget,
+      summaryMaxInputTokens: effectiveSummaryMaxInputTokens,
     });
   }
 

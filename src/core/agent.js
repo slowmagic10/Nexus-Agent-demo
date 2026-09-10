@@ -6,6 +6,8 @@ import { resolveObjectiveMode, isObjectiveStatusQuestion } from "./objective-con
 import { refreshVerification } from "./verification.js";
 import { ProgressMonitor } from "./progress-monitor.js";
 import { ToolBatchError } from "../tools/batch.js";
+import { readSessionState } from "./session-state-view.js";
+import { dispatchSessionAction } from "./session-action.js";
 
 export class AgentRuntime {
   constructor({
@@ -23,6 +25,7 @@ export class AgentRuntime {
     maxTokensPerTurn = Infinity,
     maxInputTokens = 32_000,
     contextBudget = null,
+    summaryMaxInputTokens,
     memorySearchTimeoutMs = 2_000,
     memoryReconcileTimeoutMs = 2_000,
     contextSummaryTimeoutMs = 15_000,
@@ -71,6 +74,7 @@ export class AgentRuntime {
       summarizeContext,
       maxInputTokens,
       contextBudget,
+      summaryMaxInputTokens,
       memorySearchTimeoutMs,
       contextSummaryTimeoutMs,
       modelRetryDelaysMs,
@@ -88,8 +92,15 @@ export class AgentRuntime {
     return this.session.dispatch(action);
   }
 
+  #dispatchAction(action) {
+    const dispatch = this.dispatch;
+    return dispatch === nativeRuntimeDispatch
+      ? dispatchSessionAction(this.session, action)
+      : dispatch.call(this, action);
+  }
+
   async runTurn(content, requestApproval, { objective, objectiveMode } = {}) {
-    const resolvedObjectiveMode = resolveObjectiveMode(this.state, content, { objective, objectiveMode });
+    const resolvedObjectiveMode = resolveObjectiveMode(readSessionState(this.session, ["objective"]), content, { objective, objectiveMode });
     const abortController = new AbortController();
     this.abortController = abortController;
     try {
@@ -100,18 +111,18 @@ export class AgentRuntime {
       await raceWithSignal(this.reconcile({ signal: reconcileSignal }), reconcileSignal);
     } catch (error) {
       if (abortController.signal.aborted) {
-        await this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务" });
+        await this.#dispatchAction({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务" });
         if (this.abortController === abortController) this.abortController = null;
         return this.state;
       }
-      await this.dispatch({
+      await this.#dispatchAction({
         type: "MEMORY_RECONCILIATION_DEGRADED",
         error: redactSensitiveText(error.message),
       });
     }
-    if (["completed", "failed", "cancelled"].includes(this.state.phase)) await this.dispatch({ type: "READY" });
-    const tokenBaseline = this.state.metrics.totalTokens || 0;
-    await this.dispatch({
+    if (["completed", "failed", "cancelled"].includes(readSessionState(this.session, ["phase"]).phase)) await this.#dispatchAction({ type: "READY" });
+    const tokenBaseline = readSessionState(this.session, ["metrics"]).metrics.totalTokens || 0;
+    await this.#dispatchAction({
       type: "USER_MESSAGE",
       content,
       objectiveMode: resolvedObjectiveMode,
@@ -130,7 +141,7 @@ export class AgentRuntime {
         query: content,
         signal: abortController.signal,
         assertCanRequest: () => {
-          if (this.state.metrics.totalTokens - tokenBaseline >= this.maxTokensPerTurn) {
+          if (readSessionState(this.session, ["metrics"]).metrics.totalTokens - tokenBaseline >= this.maxTokensPerTurn) {
             throw new RecoverableTaskError(`本轮累计 Token 用量已达到预算 ${this.maxTokensPerTurn}；不能追加模型请求，已保留目标与计划。`, "model_token_budget");
           }
         },
@@ -154,33 +165,34 @@ export class AgentRuntime {
             })),
           } : {}),
         };
-        await this.dispatch({ type: "ASSISTANT_MESSAGE", message: assistantMessage });
+        await this.#dispatchAction({ type: "ASSISTANT_MESSAGE", message: assistantMessage });
         assertNormalModelFinish(response);
 
         if (!response.toolCalls.length) {
           throwIfAborted(abortController.signal);
-          if (this.state.plan?.blockedReason) {
-            throw new RecoverableTaskError(`任务存在阻塞：${this.state.plan.blockedReason}`, "objective_blocked");
+          const { plan } = readSessionState(this.session, ["plan"]);
+          if (plan?.blockedReason) {
+            throw new RecoverableTaskError(`任务存在阻塞：${plan.blockedReason}`, "objective_blocked");
           }
-          if (this.state.plan?.acceptance?.length) {
+          if (plan?.acceptance?.length) {
             const context = { session: this.session, signal: abortController.signal };
             if (typeof this.toolHost.refreshVerification === "function") await this.toolHost.refreshVerification(context);
             else await refreshVerification(context);
             throwIfAborted(abortController.signal);
           }
-          const reasons = completionIssues(this.state, response.text);
+          const reasons = completionIssues(readSessionState(this.session, ["objective", "plan", "delegations", "events"]), response.text);
           if (reasons.length) {
             if (completionCorrections >= MAX_COMPLETION_CORRECTIONS) {
               throw new RecoverableTaskError(`模型提前结束，自动纠正 ${MAX_COMPLETION_CORRECTIONS} 次后仍未满足完成条件；已保留目标与计划，可继续任务。`, "completion_validation_exhausted");
             }
-            if (this.state.metrics.totalTokens - tokenBaseline >= this.maxTokensPerTurn) {
+            if (readSessionState(this.session, ["metrics"]).metrics.totalTokens - tokenBaseline >= this.maxTokensPerTurn) {
               throw new RecoverableTaskError(`本轮累计 Token 用量已达到预算 ${this.maxTokensPerTurn}；无法追加完成纠正请求，任务尚未完成。`, "completion_token_budget");
             }
             if (index + 1 >= this.maxSteps) {
               throw new RecoverableTaskError(`达到最大步骤数 ${this.maxSteps}；任务未通过完成检查，已保留目标与计划。`, "completion_step_budget");
             }
             completionCorrections += 1;
-            await this.dispatch({
+            await this.#dispatchAction({
               type: "COMPLETION_REJECTED",
               attempt: completionCorrections,
               reasons,
@@ -188,16 +200,16 @@ export class AgentRuntime {
             });
             continue;
           }
-          await this.dispatch({ type: "COMPLETED" });
+          await this.#dispatchAction({ type: "COMPLETED" });
           try {
             await this.flushMemory({
               session: this.session,
-              messages: currentTurnMessages(this.state.messages),
+              messages: currentTurnMessages(readSessionState(this.session, ["messages"]).messages),
               sourceCursor: turnSourceCursor,
               signal: abortController.signal,
             });
           } catch (error) {
-            await this.dispatch({
+            await this.#dispatchAction({
               type: "MEMORY_FLUSH_DEGRADED",
               sourceCursor: turnSourceCursor,
               error: redactSensitiveText(error.message),
@@ -206,7 +218,7 @@ export class AgentRuntime {
           return this.state;
         }
 
-        if (this.state.metrics.totalTokens - tokenBaseline > this.maxTokensPerTurn) {
+        if (readSessionState(this.session, ["metrics"]).metrics.totalTokens - tokenBaseline > this.maxTokensPerTurn) {
           throw new Error(`本轮累计 Token 用量超过预算 ${this.maxTokensPerTurn}；尚未执行最新工具调用。可通过 NEXUS_MAX_TOKENS_PER_TURN 或 --max-tokens-per-turn 调整`);
         }
 
@@ -217,15 +229,15 @@ export class AgentRuntime {
         // Finish the entire assistant tool batch before adding any feedback;
         // never split the Provider's assistant/tool protocol with a system message.
         const intervention = progressMonitor.takeIntervention();
-        if (intervention) await this.dispatch(intervention);
+        if (intervention) await this.#dispatchAction(intervention);
       }
       throw new Error(`达到最大步骤数 ${this.maxSteps}，已停止本轮任务。`);
     } catch (error) {
       if (abortController.signal.aborted) {
-        await this.dispatch({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务",
+        await this.#dispatchAction({ type: "CANCELLED", reason: abortController.signal.reason?.message || "用户取消了任务",
           ...(error instanceof ToolBatchError ? { toolBatchFailure: true } : {}) });
       } else {
-        await this.dispatch({
+        await this.#dispatchAction({
           type: "FAILED",
           error: redactSensitiveText(error.message),
           ...(error instanceof RecoverableTaskError ? { recoverable: true, reason: error.reason } : {}),
@@ -246,14 +258,14 @@ export class AgentRuntime {
   async #completeProvider(request) {
     if (typeof this.provider.stream !== "function") return this.provider.complete(request);
 
-    await this.dispatch({ type: "MODEL_STREAM_STARTED" });
+    await this.#dispatchAction({ type: "MODEL_STREAM_STARTED" });
     const buffer = new DurableModelStreamBuffer();
     let completed = null;
     try {
       for await (const event of this.provider.stream(request)) {
         if (event?.type === "text_delta") {
           const delta = buffer.push(event.delta);
-          if (delta) await this.dispatch({ type: "MODEL_STREAM_DELTA", delta });
+          if (delta) await this.#dispatchAction({ type: "MODEL_STREAM_DELTA", delta });
           continue;
         }
         if (event?.type === "completed") {
@@ -264,22 +276,24 @@ export class AgentRuntime {
       }
     } catch (error) {
       const tail = buffer.flush();
-      if (tail) await this.dispatch({ type: "MODEL_STREAM_DELTA", delta: tail });
+      if (tail) await this.#dispatchAction({ type: "MODEL_STREAM_DELTA", delta: tail });
       throw error;
     }
 
     const tail = buffer.flush();
-    if (tail) await this.dispatch({ type: "MODEL_STREAM_DELTA", delta: tail });
+    if (tail) await this.#dispatchAction({ type: "MODEL_STREAM_DELTA", delta: tail });
     if (!completed || typeof completed !== "object") throw new Error("模型输出流没有返回 completed 事件");
     completed = {
       ...completed,
       text: String(completed.text || ""),
       toolCalls: Array.isArray(completed.toolCalls) ? completed.toolCalls : [],
     };
-    await this.dispatch({ type: "MODEL_STREAM_COMPLETED" });
+    await this.#dispatchAction({ type: "MODEL_STREAM_COMPLETED" });
     return completed;
   }
 }
+
+const nativeRuntimeDispatch = AgentRuntime.prototype.dispatch;
 
 class DurableModelStreamBuffer {
   constructor() {

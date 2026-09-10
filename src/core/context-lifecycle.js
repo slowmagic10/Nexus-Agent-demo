@@ -4,11 +4,13 @@ import { assertContextBudget } from "../providers/request-policy.js";
 import { redactSensitiveText } from "../security/redact.js";
 import { RecoverableTaskError } from "./completion-guard.js";
 import { noModelUsage, normalizeModelUsage } from "./model-usage.js";
+import { readSessionState } from "./session-state-view.js";
+import { dispatchSessionAction } from "./session-action.js";
+import { prepareSessionContextSummary } from "./session-summary.js";
 import {
   createModelContextSummarizer,
+  ContextSummaryRequestBudgetError,
   normalizeSemanticSummary,
-  prepareContextSummaryRequest,
-  selectContextSummaryBatch,
 } from "./context-summary.js";
 
 const DEFAULT_MAX_INPUT_TOKENS = 32_000;
@@ -27,6 +29,7 @@ export class ContextLifecycle {
     retrieveMemory = async () => [],
     summarizeContext,
     maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
+    summaryMaxInputTokens,
     contextBudget = null,
     memorySearchTimeoutMs = DEFAULT_MEMORY_SEARCH_TIMEOUT_MS,
     contextSummaryTimeoutMs = DEFAULT_CONTEXT_SUMMARY_TIMEOUT_MS,
@@ -61,6 +64,11 @@ export class ContextLifecycle {
     }
     this.contextBudget = contextBudget === null ? null : assertContextBudget(contextBudget);
     this.maxInputTokens = Math.min(maxInputTokens, this.contextBudget?.maxInputTokens ?? maxInputTokens);
+    const summaryCapacity = this.contextBudget
+      ? this.contextBudget.contextWindowTokens - this.contextBudget.reservedOutputTokens : null;
+    if (summaryMaxInputTokens !== undefined) validatePositiveInteger(summaryMaxInputTokens, "summaryMaxInputTokens");
+    this.summaryMaxInputTokens = Math.min(summaryMaxInputTokens ?? summaryCapacity ?? DEFAULT_MAX_INPUT_TOKENS,
+      summaryCapacity ?? Number.MAX_SAFE_INTEGER);
     this.memorySearchTimeoutMs = memorySearchTimeoutMs;
     this.contextSummaryTimeoutMs = contextSummaryTimeoutMs;
     this.modelRetryDelaysMs = [...modelRetryDelaysMs];
@@ -97,7 +105,7 @@ export class ContextLifecycle {
     } catch (error) {
       retrieval = { status: "degraded", error: redactSensitiveText(error?.message || "Memory retrieval 失败") };
     }
-    await this.session.dispatch({ type: "MEMORY_CONTEXT_SET", query, memories, retrieval });
+    await dispatchSessionAction(this.session, { type: "MEMORY_CONTEXT_SET", query, memories, retrieval });
   }
 
   async #completeModelStep(signal, maxInputTokens, assertCanRequest) {
@@ -121,16 +129,31 @@ export class ContextLifecycle {
     const usesModel = this.summarizeContext.usesModel !== false;
     for (let attempt = 0; attempt < 2 && current.contextPlan.compacted; attempt += 1) {
       const plan = current.contextPlan.summary;
-      const throughMessage = this.session.state.contextSummary?.throughMessage || 0;
+      const throughMessage = readSessionState(this.session, ["contextSummary"]).contextSummary?.throughMessage || 0;
       if (!plan || plan.included || plan.requiredThroughMessage <= throughMessage) break;
       turnSignal.throwIfAborted();
       if (usesModel) assertCanRequest();
-      const batch = selectContextSummaryBatch(this.session.state.messages, {
-        fromMessage: throughMessage,
-        throughMessage: plan.requiredThroughMessage,
-      });
-      const sourceCursor = this.session.cursor;
-      await this.session.dispatch({
+      let source;
+      try {
+        source = prepareSessionContextSummary(this.session, {
+          fromMessage: throughMessage, throughMessage: plan.requiredThroughMessage,
+          usesModel, maxInputTokens: this.summaryMaxInputTokens,
+        });
+      } catch (error) {
+        if (!(error instanceof ContextSummaryRequestBudgetError) || !Object.hasOwn(error, "sourceCursor")) throw error;
+        turnSignal.throwIfAborted();
+        assertCanRequest();
+        await dispatchSessionAction(this.session, {
+          type: "CONTEXT_SUMMARY_DEGRADED", fromMessage: throughMessage,
+          throughMessage: plan.requiredThroughMessage, sourceCursor: error.sourceCursor, modelCall: false,
+          ...noModelUsage(), durationMs: 0, error: error.message,
+        });
+        break;
+      }
+      const { batch, sourceCursor, sourceComplete } = source;
+      turnSignal.throwIfAborted();
+      if (usesModel) assertCanRequest();
+      await dispatchSessionAction(this.session, {
         type: "CONTEXT_SUMMARY_REQUESTED",
         fromMessage: batch.fromMessage,
         throughMessage: batch.throughMessage,
@@ -142,16 +165,20 @@ export class ContextLifecycle {
         AbortSignal.timeout(this.contextSummaryTimeoutMs),
       ]);
       const started = performance.now();
+      const summaryState = readSessionState(this.session, ["objective", "plan"]);
       const summaryInput = {
-        previousSummary: this.session.state.contextSummary,
+        // Source history and previous summary belong to the same pre-admission
+        // snapshot. Observer updates to objective/plan remain visible below.
+        previousSummary: source.previousSummary,
         messages: batch.messages,
+        sourceComplete,
         fromMessage: batch.fromMessage,
         throughMessage: batch.throughMessage,
-        objective: this.session.state.objective,
-        plan: this.session.state.plan,
+        objective: summaryState.objective,
+        plan: summaryState.plan,
         signal: summarySignal,
       };
-      const summaryRequest = usesModel ? prepareContextSummaryRequest(summaryInput) : null;
+      const summaryRequest = usesModel ? { ...source.request, signal: summarySignal } : null;
       let admitted = false;
       let response;
       try {
@@ -165,13 +192,13 @@ export class ContextLifecycle {
         const accounting = usesModel
           ? normalizeModelUsage(response?.usage, summaryRequest, response?.usageOutput || { text: JSON.stringify(summary) })
           : noModelUsage();
-        await this.session.dispatch({
+        await dispatchSessionAction(this.session, {
           type: "CONTEXT_SUMMARY_COMPLETED",
           summary,
           fromMessage: batch.fromMessage,
           throughMessage: batch.throughMessage,
           sourceCursor,
-          sourceComplete: batch.sourceComplete,
+          sourceComplete,
           model: response?.model || this.provider.name || "unknown",
           modelCall: usesModel,
           ...accounting,
@@ -190,7 +217,7 @@ export class ContextLifecycle {
             accounting = normalizeModelUsage(null, summaryRequest, output);
           }
         }
-        await this.session.dispatch({
+        await dispatchSessionAction(this.session, {
           type: "CONTEXT_SUMMARY_DEGRADED",
           fromMessage: batch.fromMessage,
           throughMessage: batch.throughMessage,
@@ -218,15 +245,15 @@ export class ContextLifecycle {
       signal.throwIfAborted();
       assertCanRequest();
       const { contextPlan, ...request } = current;
-      await this.session.dispatch({ type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
-      await this.session.dispatch({ type: "MODEL_REQUESTED" });
+      await dispatchSessionAction(this.session, { type: "MODEL_CONTEXT_PREPARED", plan: contextPlan });
+      await dispatchSessionAction(this.session, { type: "MODEL_REQUESTED" });
       signal.throwIfAborted();
       assertCanRequest();
       const started = performance.now();
       try {
         const response = await this.requestModel({ ...request, signal });
         const accounting = normalizeModelUsage(response.usage, request, response);
-        await this.session.dispatch({
+        await dispatchSessionAction(this.session, {
           type: "MODEL_COMPLETED",
           ...accounting,
           durationMs: Math.round(performance.now() - started),
@@ -241,49 +268,49 @@ export class ContextLifecycle {
           if (!failure) throw error;
           let failedUsage;
           try {
-            failedUsage = failedRequestUsage(error, contextPlan, this.session.state, failure.retryable);
+            failedUsage = failedRequestUsage(error, contextPlan, readSessionState(this.session, ["modelStreamChunks"]), failure.retryable);
           } catch {
             failure = { kind: "protocol_error", status: failure.status, code: "invalid_token_usage", retryable: false };
             failedUsage = { usage: { inputTokens: 0, outputTokens: 0, totalTokens: 0 }, usageEstimated: true };
           }
-          await this.session.dispatch({
+          await dispatchSessionAction(this.session, {
             type: "MODEL_REQUEST_FAILED",
             contextHash: contextPlan.contextHash,
             failure,
             ...failedUsage,
             durationMs: Math.round(performance.now() - started),
           });
-          if (this.session.state.modelStream) {
-            await this.session.dispatch({ type: "MODEL_STREAM_DISCARDED", reason: failure.retryable ? "model_retry" : "model_failure" });
+          if (readSessionState(this.session, ["modelStream"]).modelStream) {
+            await dispatchSessionAction(this.session, { type: "MODEL_STREAM_DISCARDED", reason: failure.retryable ? "model_retry" : "model_failure" });
           }
           if (!failure.retryable) {
             throw new RecoverableTaskError(`模型请求失败（${describeFailure(failure)}）；已保留目标与计划，请修正接口配置或响应问题后继续。`, "model_request_failed");
           }
           if (retries >= this.modelRetryDelaysMs.length) {
-            await this.session.dispatch({ type: "MODEL_RETRY_EXHAUSTED", retries, failure, reason: "attempt_limit" });
+            await dispatchSessionAction(this.session, { type: "MODEL_RETRY_EXHAUSTED", retries, failure, reason: "attempt_limit" });
             throw new RecoverableTaskError(`模型请求因暂时性故障失败（${describeFailure(failure)}），自动重试 ${retries} 次后仍失败；已保留目标与计划，可稍后继续。`, "model_retry_exhausted");
           }
           try {
             assertCanRequest();
           } catch (budgetError) {
-            await this.session.dispatch({ type: "MODEL_RETRY_EXHAUSTED", retries, failure, reason: "token_budget" });
+            await dispatchSessionAction(this.session, { type: "MODEL_RETRY_EXHAUSTED", retries, failure, reason: "token_budget" });
             throw budgetError;
           }
           const delayMs = this.modelRetryDelaysMs[retries];
           retries += 1;
-          await this.session.dispatch({ type: "MODEL_RETRY_REQUESTED", attempt: retries, maxRetries: this.modelRetryDelaysMs.length, delayMs, failure });
+          await dispatchSessionAction(this.session, { type: "MODEL_RETRY_REQUESTED", attempt: retries, maxRetries: this.modelRetryDelaysMs.length, delayMs, failure });
           signal.throwIfAborted();
           await delay(delayMs, undefined, { signal });
           continue;
         }
-        if (this.session.state.modelStream) {
-          await this.session.dispatch({ type: "MODEL_STREAM_DISCARDED", reason: "context_replan" });
+        if (readSessionState(this.session, ["modelStream"]).modelStream) {
+          await dispatchSessionAction(this.session, { type: "MODEL_STREAM_DISCARDED", reason: "context_replan" });
         }
         const durationMs = Math.round(performance.now() - started);
         const outputCannotFit = Number.isSafeInteger(overflow.contextLimit)
           && (this.contextBudget?.reservedOutputTokens || 0) >= overflow.contextLimit;
         if (replanAttempts > 0 || outputCannotFit) {
-          await this.session.dispatch({
+          await dispatchSessionAction(this.session, {
             type: "MODEL_CONTEXT_REPLAN_EXHAUSTED",
             contextHash: contextPlan.contextHash,
             maxInputTokens: contextPlan.maxInputTokens,
@@ -297,7 +324,7 @@ export class ContextLifecycle {
 
         replanAttempts += 1;
         const nextMaxInputTokens = nextOverflowBudget(contextPlan, overflow, this.contextBudget?.reservedOutputTokens || 0);
-        await this.session.dispatch({
+        await dispatchSessionAction(this.session, {
           type: "MODEL_CONTEXT_REPLAN_REQUESTED",
           contextHash: contextPlan.contextHash,
           maxInputTokens: contextPlan.maxInputTokens,
@@ -306,7 +333,7 @@ export class ContextLifecycle {
           overflow,
         });
         const replanned = this.#prepareRequest(nextMaxInputTokens);
-        await this.session.dispatch({
+        await dispatchSessionAction(this.session, {
           type: "MODEL_CONTEXT_REPLANNED",
           fromContextHash: contextPlan.contextHash,
           toContextHash: replanned.contextPlan.contextHash,

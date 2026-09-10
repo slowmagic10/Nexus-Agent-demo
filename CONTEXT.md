@@ -43,7 +43,12 @@ _Avoid_: Key-order normalization changing existing patches, swallowed serializer
 **Dispatch Receipt**:
 AgentSession 同一次durable提交直接返回的 `{state,cursor}`；并发调用通过dispatchWithReceipt获取自身来源位置，而不是await后读取可能已前进的Session.cursor。原dispatch仍返回独立state，队列、observer隔离、提交失败和close语义保留。Tool Host据此为新Tool Result绑定实际TOOL_REQUESTED cursor，旧日志缺字段时不补造。
 仅需要来源位置时可显式includeState:false省去回执中的整份state副本，默认与订阅者快照保持。SQLite初始化通过同次事务的state/cursor/events receipt保证基态与游标一致，提交在事务内检查expectedCursor，冲突拒绝且不发布。
+忽略返回值的内部动作可通过dispatchSessionAction等待提交；未修改的原生Session使用无state receipt，旧适配器/Proxy/dispatch或receipt钩子仍走原dispatch一次并保持原Promise。Runtime自身dispatch覆盖也保留。公开dispatch、默认receipt、订阅与工具dispatch/onOutput仍返回各自原快照；此内部helper不能用于读取状态或猜测来源cursor。
 _Avoid_: Reading the latest cursor as the current operation identity, display event seq as a receipt, observers as commit authority
+
+**Session State View**:
+AgentSession.readState(fields)同步取得指定顶层自有字段的独立快照，整体一次clone保留选中字段间别名但不暴露私有引用；未知/继承字段为undefined，选择器只接受字段名列表。readSessionState兼容旧state getter，新API异常直接传播。预算/摘要/路由在各自决策边界重读，不跨await缓存权限或用量；完成检查保留真实验收events。公开state、默认receipt、订阅以及ToolHost自定义available/policy/execute保持完整状态契约。它优化复制范围，不提供权限隔离或跨进程最新状态保证。
+_Avoid_: Selector callbacks receiving private state, state views as authorization boundaries, stale snapshots across awaits, shrinking custom tool state contracts
 
 **Artifact**:
 不适合直接放进 Model Context 或 Journal event 主体的大型结果对象。首版只保存不超过 4 MB 的脱敏 UTF-8 文本，以 Session ID 作为读取边界，并记录 media type、byte size 和 SHA-256；成功、失败、取消、超时等 Tool 终态共享同一 Artifact policy，Adapter 不得在 Tool Host 前提前截断。Tool Result 只携带预览与引用，模型通过 `read_artifact` 分段读取。Portable Journal 可携带完整内容并在 Import 时重绑定目标 Session；Branch 只复制指定 cursor 已引用的内容到自己的 scope。Child 不隐式继承 Parent Artifact。
@@ -64,10 +69,13 @@ _Avoid_: Whole-file replacement for every edit, partial hunk as a valid patch, r
 **Model Context**:
 由 durable session event 投影得到、允许模型看到的消息、短期记忆、相关长期记忆和已加载 Skills。
 AgentSession通过私有ModelContextProjection维护messages、memory、contextMemory、contextSummary、loadedSkills、objective、plan、delegations八个字段。无关事件不复制旧历史，增量先完整检查/克隆再写内部数组；引用不对外暴露，请求继续保留systemPrompt参数、消息和tools的独立快照。恢复缺patch采用最终fallback，空patch保持无变化；公开纯函数仍返回独立值。此优化不改变上下文选择策略或请求Hash。
+原生请求的内置提示按defineSystemPrompt显式声明的字段取快照，另保留contextMemory/contextSummary供规划；原始字符串不取无用历史，Profile附加保持依赖。普通自定义回调、Proxy、bind和其他包装仍读完整八字段快照，公开prepareModelRequest保持原复制行为；依赖声明按确切函数身份保存，不读取可伪造属性，也不缓存生成的提示。内置提示正文和请求Hash保持。
+原生历史来源通过有界普通数据与消息形状检查后，在内部只读使用私有messages，省去投影前的全量副本；每轮结果仍独立复制，不连接私有历史。特殊值、继承模型字段、对象正文/参数或检查预算耗尽使用原副本路径；资格逐请求判断。公开输入快照、回调顺序、同轮/跨轮引用关系、opaque协议和最终Hash保持，完整分组、投影与计量仍然执行。
 _Avoid_: Full state, UI state, prompt state
 
 **Context Window Plan**:
 一次模型请求对 Model Context 的确定性成本投影；固定计算 system prompt、Skills、工具 schema 和完整 turn 成本。`provider.contextWindowTokens` 描述当前模型声明的单请求窗口能力，默认兼容值为 32,000，可由全局或具名 Agent Profile 独立配置；它与累计 Turn Budget 不是同一个概念。Context Lifecycle 在窗口内仍执行有界工具历史投影，并在需要省略完整旧轮次时使用语义摘要与连续的最近完整 turn。估算超过目标不会阻止当前请求，若 Provider 返回真实 overflow 再收紧并重试一次。
+压缩选择在单次请求内按需缓存各完整轮消息成本并累计连续后缀，摘要候选复用该索引；有/无工具档案说明分别计算完整固定成本，保留UTF-8取整和coverage。短历史、特殊序列化、动态标记或探测预算超限回退原选择器；索引不跨请求复用，最终请求仍单独计量及Hash。message估算与usage共用measureModelMessages，不改变真实容量或当前完整轮保留规则。
 _Avoid_: Message slice, token truncation
 
 **Historical Tool Transcript Projection**:
@@ -81,6 +89,15 @@ _Avoid_: Keeping only the last message, orphan tool results, compacting the late
 **Context Lifecycle**:
 管理一个用户 turn 内模型可见上下文完整生命周期的 deep Module。`startTurn` 在 Durable User Message 之后执行有界 Memory retrieval，并返回只公开 `completeModelStep` 的 turn Interface；该 Interface 在内部维护可收紧的 Context 压缩目标，集中完成 Historical/Active Tool Transcript Projection、Context Window Plan、durable semantic summary、模型请求审计、usage 计量、Provider overflow 单次 replan 和 degraded audit。AgentRuntime 只协调 turn、工具循环和最终状态；`model-context` 纯投影与 Memory retrieval Adapter 是 Context Lifecycle 的内部 Implementation，不扩散给调用者。
 _Avoid_: Agent loop coordinating summary batches, caller-owned overflow retries, resetting tightened budget between tool rounds, pass-through context wrapper
+
+**Summary Source Batch**:
+滚动摘要本次消费的历史来源。默认以实际 `JSON.stringify(messages).length` 限制在48,000个UTF-16字符内，包含JSON转义、元数据和省略说明；此限额不包含旧摘要、提示词和请求外壳，也不是Token窗口。普通批次保持完整历史轮边界；首轮过大时提供先脱敏的连续首尾摘录及显式省略区间，游标按原轮次推进并标记sourceComplete=false。此false在新滚动摘要动作中累计传播，摘要输入及主请求历史摘要明确说明证据不完整；旧Journal动作按原语义重放。完整路径字节保持，不完整提示有意改变未来请求内容及Hash。摘要不能替代Journal，opaque provider_items不进入摘要来源，当前轮和原始工具协议不改写。
+_Avoid_: First-turn budget exemption, character bound as a complete-request token bound, excerpt length as a durable cursor, later complete source repairing prior omissions, retroactively rewriting old sourceComplete facts
+
+**Summary Request Plan**:
+模型摘要调用前的完整请求估算与来源选择。它冻结同一sourceCursor的历史和旧摘要，完整计量摘要提示词、旧摘要、来源、省略说明及JSON外壳；原请求能容纳时保持原样，否则在48,000字符来源边界内有界缩小批次，缓存已脱敏记录，只返回估算通过的请求。旧摘要不被悄悄截断，无法容纳时在REQUESTED之前记录零调用/零Token的degraded，主任务继续既有降级路径。REQUESTED之后只重读objective/plan；历史来源不被observer替换。摘要额度由已知Provider窗口减输出预留派生，与主输入软目标和累计Turn Budget独立；缺容量描述的旧直接调用默认32,000操作预算。估算不是远端Tokenizer保证，自定义summarizer改写请求的额外成本不由此计划担保。
+AgentSession.prepareContextSummary在私有已提交状态上同步完成来源选择，只返回独立的选中消息、旧摘要、请求和sourceCursor，省去选择前的整份messages快照；预算拒绝携带同次来源游标。内部helper仅在原生readState/cursor未覆盖时采用继承的新方法，旧适配器、Proxy和原读取钩子保持快照路径；显式新适配器拥有自己的同步准备契约。当前请求准备、reducer和订阅中的其他历史复制不由此消除。
+_Avoid_: Main soft target as summary capacity, counting a locally rejected request as a model call, truncating previous summary to fit, estimating a different payload from the one sent, claiming optimal source fill
 
 **Turn Budget**:
 一次用户任务内所有模型调用的累计 Token 成本边界，与单次请求的 `provider.contextWindowTokens`、Context Window Plan 和工具循环 `maxSteps` 分别配置。步骤与累计 Token 默认均为 unlimited；用户显式设置边界后，达到边界的新工具调用必须在 Adapter 启动前停止并闭合模型工具协议，最终模型回答不能因事后预算检查而丢失。扩大模型窗口不得隐式扩大累计成本边界，反之累计预算也不得伪装成模型窗口。
@@ -183,6 +200,10 @@ _Avoid_: New baseline, source of truth, loading all checkpoints before choosing 
 **Session State Cache**:
 sessions.state_json中的完整兼容投影，Journal仍是恢复事实来源。SQLite schema11的cache_cursor标记已知写入基态；只有带expectedCursor、缓存身份/schema/cursor合格的提交可用受限SQL patch更新。旧direct commit、显式save、坏缓存与不支持的patch完整保存；到期checkpoint与cache复用序列化。cache_generation变化区分新writer，旧writer直接改正文会作废cursor/安全小标题。列表优先小标题，缺失时完整解析旧缓存；Journal恢复不预读冗余cache正文。降低的是JS完整快照处理和参数绑定量，SQLite仍处理完整JSON。
 _Avoid_: Cache as Journal authority, incomplete snapshot for legacy readers, inferring cursor from unverified cache, bound bytes as WAL savings
+
+**Gateway State Snapshot Cache**:
+Gateway内存entry.state的按需完整快照。原生Session订阅绑定最近一次状态通知的已提交版本，首次读取才复制，同版本复用；下一次通知替换来源而不积累队列。事件订阅仍先于状态通知，旧缓存和客户端修改不连接私有状态。subscribeStateReader默认即时固化，仅显式可信reducer及本次实际Journal方法身份均匹配才延后；自定义store/subscribe/update保持完整快照和旧钩子。它减少未被读取的Gateway副本，不改变SQLite缓存、公开state/receipt或旧完整订阅，也不消除reducer复制。
+_Avoid_: Lazy reads of the latest version losing notification order, exposing private committed state, deferred snapshots for arbitrary mutable reducers, skipped durable events, clone bytes as end-to-end speedup
 
 **Session Deletion**:
 用户明确删除一个任务及其委派后代的生命周期操作。Gateway 先阻止目标的新操作，取消 Runtime、审批与子任务，并等待执行、在途 API 与 dispatch 队列收束；SessionStore 在单一事务中删除 Session、Journal、Checkpoint 和 Artifact，仅保留 ID 与删除时间的 tombstone，阻止旧写入及原 ID 恢复。独立 Branch、项目文件、长期记忆和 Project Grant 不属于删除范围；仍由 Parent 等待的 Child 单独删除返回冲突。删除通知是提交后的控制消息，不伪装成已被删除的 Journal Event。
@@ -300,6 +321,7 @@ _Avoid_: Hidden default timeout, no deadline means detached job, PTY/job control
 
 **Tool Output Stream**:
 WorkspaceExecution 在运行期间发布有序的 stdout/stderr observation，Tool Host 把它收敛为有界、整行发布且先脱敏再持久化的 durable preview。Session 的 `toolStreams` 只是尚未闭合 Tool Call 的实时投影，最终 Tool Result/Artifact 仍拥有完整结果并在闭合时取代该投影；取消、超时和 `execution_unknown` 继续使用同一条工具终态链路。无 deadline 的长运行仍只保留有界 durable preview，不能因为运行时间不受限而产生无限 Journal。浏览器只消费 Session State Patch，不直接读取子进程，也不把原始 chunk 保存到客户端私有状态。
+预览只保留一条在途及一条最新pending，合并调用共享提交回执，close排空末尾并去重；中间预览事件可减少，最终结果独立采集。执行端在通知未闭合时暂停两个输出来源，取消/超时恢复管道继续采集尾部、停止新增实时通知并等待已接受项；drain涵盖同步重入。预览关闭错误不能覆盖原执行/取消原因，已返回输出保留且规范化不重复。不以静默丢原始chunk代替背压，也不保证任意不合作callback可以被强制结束。
 _Avoid_: Browser-only terminal output, raw chunk per journal event, persisting incomplete credential-bearing lines, replacing final Tool Result with a live preview
 
 **Config Composition**:

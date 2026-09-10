@@ -3,12 +3,15 @@ import { redactSensitiveValue } from "../security/redact.js";
 import { createStatePatch } from "../state-patch.js";
 import { ModelContextProjection } from "./model-context.js";
 import { queryToolHistory } from "./tool-history.js";
+import { selectSessionStateFields } from "./session-state-view.js";
+import { prepareContextSummarySource } from "./context-summary.js";
 
 export class AgentSession {
   #state;
   #reducer;
   #journal;
   #subscribers = new Set();
+  #stateReaders = new WeakMap();
   #eventSubscribers = new Set();
   #dispatchTail = Promise.resolve();
   #cursor = 0;
@@ -36,6 +39,10 @@ export class AgentSession {
 
   get state() {
     return structuredClone(this.#state);
+  }
+
+  readState(fields) {
+    return selectSessionStateFields(this.#state, fields);
   }
 
   get cursor() {
@@ -74,8 +81,24 @@ export class AgentSession {
     return () => this.#subscribers.delete(listener);
   }
 
+  // Internal opt-in for known immutable reducer/Journal implementations. Other
+  // commits capture an eager snapshot, including a Journal override that resets
+  // itself while committing. The reader returns one detached snapshot of this
+  // version and keeps the state-observer order, after event observers.
+  subscribeStateReader(listener, { immutableReducer, immutableJournalCommit } = {}) {
+    if (typeof listener !== "function") throw new Error("会话订阅者必须是函数");
+    const observer = (read) => listener(read);
+    this.#stateReaders.set(observer, { immutableReducer, immutableJournalCommit });
+    this.#subscribers.add(observer);
+    return () => this.#subscribers.delete(observer);
+  }
+
   prepareModelRequest(options) {
     return this.#modelContext.prepareRequest(options);
+  }
+
+  prepareContextSummary(options) {
+    return prepareContextSummarySource(this.#state, this.#cursor, options);
   }
 
   queryToolHistory(options = {}) {
@@ -113,7 +136,9 @@ export class AgentSession {
     const durableAction = normalizeAction(action);
     const next = this.#reducer(this.#state, durableAction);
     const patch = createStatePatch(this.#state, next);
-    const event = this.#journal?.commitSessionEvent(next, durableAction, patch, { expectedCursor: this.#cursor }) || {
+    const journalCommit = this.#journal?.commitSessionEvent;
+    const event = (this.#journal == null ? null : Reflect.apply(journalCommit, this.#journal,
+      [next, durableAction, patch, { expectedCursor: this.#cursor }])) || {
       cursor: this.#cursor + 1,
       sessionId: this.id,
       type: durableAction.type,
@@ -129,11 +154,31 @@ export class AgentSession {
       subscription.cursor = event.cursor;
       notifyObserver(subscription.listener, structuredClone(event));
     }
-    for (const listener of this.#subscribers) notifyObserver(listener, structuredClone(next));
+    for (const listener of this.#subscribers) {
+      const reader = this.#stateReaders.get(listener);
+      notifyObserver(listener, reader
+        ? snapshotReader(next, reader.immutableReducer === this.#reducer
+          && typeof reader.immutableJournalCommit === "function" && reader.immutableJournalCommit === journalCommit)
+        : structuredClone(next));
+    }
     // Return this commit's cursor with its detached state. Another queued
     // dispatch may finish before the caller resumes from awaiting the receipt.
     return includeState ? { state: this.state, cursor: event.cursor } : { cursor: event.cursor };
   }
+}
+
+function snapshotReader(state, deferred) {
+  let ready = !deferred;
+  let snapshot = ready ? structuredClone(state) : undefined;
+  if (ready) state = null;
+  return () => {
+    if (!ready) {
+      snapshot = structuredClone(state);
+      ready = true;
+      state = null;
+    }
+    return snapshot;
+  };
 }
 
 function notifyObserver(listener, value) {

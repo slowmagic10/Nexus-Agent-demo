@@ -1,9 +1,11 @@
 // FOUNDATION — event-derived projection of everything visible to the model.
 import { createHash } from "node:crypto";
+import { types } from "node:util";
 import { applyStatePatch } from "../state-patch.js";
 import { renderContextSummaryMessage } from "./context-summary.js";
-import { measureModelRequest } from "./model-usage.js";
+import { measureModelRequest, measureModelMessages, estimateTokenValue } from "./model-usage.js";
 import { isFixedProgressFeedback } from "./progress-feedback.js";
+import { systemPromptFields } from "./system-prompt.js";
 
 const MODEL_CONTEXT_DEFAULTS = {
   messages: [],
@@ -73,8 +75,7 @@ export class ModelContextProjection {
   }
 
   prepareRequest(options) {
-    // Preserve the separate prompt callback and request-history snapshots.
-    return prepareModelRequest(this.#context, options);
+    return composeModelRequest(this.#context, options, true);
   }
 }
 
@@ -94,20 +95,26 @@ export function applyModelContextEvent(context, event, fallbackState) {
     : selectModelContext(fallbackState);
 }
 
-export function prepareModelRequest(context, {
+export function prepareModelRequest(context, options) {
+  // Public inputs and arbitrary callbacks retain the full detached snapshot.
+  return composeModelRequest(context, options);
+}
+
+function composeModelRequest(context, {
   systemPrompt,
   tools,
   maxInputTokens = DEFAULT_MAX_INPUT_TOKENS,
-}) {
+}, ownedContext = false) {
   if (!Number.isInteger(maxInputTokens) || maxInputTokens < 1) {
     throw new Error("Model Context maxInputTokens 必须是正整数");
   }
-  const promptContext = structuredClone(context);
+  const fields = ownedContext ? systemPromptFields(systemPrompt) : null;
+  const promptContext = snapshotPromptContext(context, fields);
   const memoryPlan = summarizeContextMemories(promptContext.contextMemory);
   const prompt = typeof systemPrompt === "function"
     ? String(systemPrompt(promptContext) || "")
     : String(systemPrompt || "");
-  const durableMessages = structuredClone(context.messages);
+  const durableMessages = historyForProjection(context.messages, ownedContext);
   const { messages: requestHistory, feedback, hasProgress } = projectRuntimeFeedback(durableMessages);
   // Compatible chat templates may permit system instructions only at the head.
   // Relocate trusted current-turn feedback before measuring, selecting, or hashing
@@ -140,6 +147,7 @@ export function prepareModelRequest(context, {
   const compactedSystemPrompt = `${baseSystemPrompt}\n\n${COMPACTION_MARKER}`;
   const turns = projectedTurns.map((turn) => turn.messages);
   const fixed = measureRequest(compactedSystemPrompt, [], durableTools);
+  const budgetIndex = buildTurnBudgetIndex(turns, compactedSystemPrompt, durableTools);
   const recentOnly = selectCompactedTurns({
     systemPrompt: compactedSystemPrompt,
     turns,
@@ -147,6 +155,7 @@ export function prepareModelRequest(context, {
     maxInputTokens,
     prefixMessages: [],
     strictLatest: true,
+    budgetIndex,
   });
   if (recentOnly.omittedMessages === 0) {
     const measured = measureRequest(baseSystemPrompt, recentOnly.selectedMessages, durableTools);
@@ -177,6 +186,7 @@ export function prepareModelRequest(context, {
       maxInputTokens,
       prefixMessages: [candidateMessage],
       strictLatest: false,
+      budgetIndex,
     });
     if (!withSummary) {
       summary = summaryPlan(availableSummary, {
@@ -213,6 +223,47 @@ export function prepareModelRequest(context, {
     ...memoryPlan,
     summary,
   });
+}
+
+function snapshotPromptContext(context, fields) {
+  if (fields === null) return structuredClone(context);
+  // Keep planner metadata in the same clone: callback edits to the summary and
+  // aliases within selected fields retain their previous request-local behavior.
+  const selected = new Set([...fields, "contextMemory", "contextSummary"]);
+  return structuredClone(Object.fromEntries(Object.keys(context)
+    .filter((key) => selected.has(key)).map((key) => [key, context[key]])));
+}
+
+function historyForProjection(messages, owned) {
+  // Only borrow Session-owned, already detached ordinary data. Every historical
+  // or active turn projection below constructs its own detached result before
+  // any tool schema callback or Provider can run. Special data retains the
+  // initial snapshot so coercion/serialization hooks never see private values.
+  if (owned && Array.isArray(messages) && !hasInheritedHistoryFields()
+    && stableTokenInputs(messages) && messages.every(hasPlainHistoryShape)) return messages;
+  return structuredClone(messages);
+}
+
+function hasPlainHistoryShape(message) {
+  // Content and arguments are coerced to strings before a projected copy is
+  // made. Object-valued variants can have inherited conversion behavior.
+  const scalar = (value) => value === null || typeof value !== "object";
+  if (!message || typeof message !== "object" || Array.isArray(message)
+    || typeof message.role !== "string" || !scalar(message.content)) return false;
+  if (message.tool_calls == null) return true;
+  return Array.isArray(message.tool_calls) && message.tool_calls.every((call) =>
+    call && typeof call === "object" && !Array.isArray(call)
+    && (!call.function || (typeof call.function === "object" && !Array.isArray(call.function)
+      && scalar(call.function.arguments))));
+}
+
+function hasInheritedHistoryFields() {
+  // These reads precede the per-turn clone. Reject inherited data as well as
+  // accessors: neither belongs to the Session-owned graph checked below.
+  const fields = ["role", "runtime_feedback", "content", "tool_calls", "provider_items",
+    "tool_call_id", "id", "function", "name", "arguments", Symbol.toPrimitive];
+  return [Object.prototype, Array.prototype].some((prototype) =>
+    fields.some((field) => Object.hasOwn(prototype, field)));
 }
 
 function selectModelContext(state) {
@@ -300,7 +351,85 @@ function buildRequest(systemPrompt, messages, tools, contextPlan) {
   };
 }
 
-function selectCompactedTurns({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest }) {
+function buildTurnBudgetIndex(turns, systemPrompt, tools) {
+  // Inputs are request-local snapshots. Do not carry measured costs across
+  // requests, edits, retries or Provider policy changes.
+  if (turns.length < 3 || !stableTokenInputs(tools)) return null;
+  const groups = new Map();
+  const fixedTokens = new Map();
+  const index = {
+    valid: true,
+    messageCount: turns.reduce((sum, turn) => sum + turn.length, 0),
+    group(position) {
+      if (!groups.has(position)) {
+        const messages = turns[position] || [];
+        if (!messages.every((message) => message && typeof message === "object" && !Array.isArray(message))
+          || !stableTokenInputs(messages)) {
+          index.valid = false;
+          return null;
+        }
+        groups.set(position, { tokens: measureModelMessages(messages), count: messages.length,
+          hasArchive: messages.some((message) => message.context_archive === TOOL_HISTORY_ARCHIVE_KIND) });
+      }
+      return groups.get(position);
+    },
+    fixed(hasArchive) {
+      if (!fixedTokens.has(hasArchive)) {
+        fixedTokens.set(hasArchive, measureModelRequest({
+          systemPrompt: hasArchive ? `${systemPrompt}\n\n${TOOL_HISTORY_INSTRUCTIONS}` : systemPrompt,
+          messages: [], tools,
+        }).fixedTokens);
+      }
+      return fixedTokens.get(hasArchive);
+    },
+  };
+  return index;
+}
+
+function selectCompactedTurns({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest, budgetIndex }) {
+  if (!budgetIndex?.valid || !stableTokenInputs(prefixMessages)) {
+    return selectCompactedTurnsLegacy({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest });
+  }
+  const { messageCount } = budgetIndex;
+  const latestTurn = turns.at(-1) || [];
+  const latestGroup = budgetIndex.group(turns.length - 1);
+  if (!latestGroup) return selectCompactedTurnsLegacy({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest });
+  const prefixTokens = measureModelMessages(prefixMessages);
+  let tokens = prefixTokens + latestGroup.tokens;
+  let hasArchive = latestGroup.hasArchive || prefixMessages.some((message) => message.context_archive === TOOL_HISTORY_ARCHIVE_KIND);
+  let firstIncludedTurn = Math.max(0, turns.length - 1);
+  let includedMessages = latestTurn.length;
+  let includedTurns = latestTurn.length ? 1 : 0;
+  const latestCost = tokens + budgetIndex.fixed(hasArchive);
+  if (!Number.isSafeInteger(latestCost)) {
+    return selectCompactedTurnsLegacy({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest });
+  }
+  if (latestCost > maxInputTokens) {
+    if (!strictLatest) return null;
+  } else {
+    for (let index = turns.length - 2; index >= 0; index--) {
+      const group = budgetIndex.group(index);
+      if (!group) return selectCompactedTurnsLegacy({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest });
+      const nextArchive = hasArchive || group.hasArchive;
+      const candidateCost = tokens + group.tokens + budgetIndex.fixed(nextArchive);
+      if (!Number.isSafeInteger(candidateCost)) {
+        return selectCompactedTurnsLegacy({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest });
+      }
+      if (candidateCost > maxInputTokens) break;
+      tokens += group.tokens;
+      hasArchive = nextArchive;
+      includedMessages += group.count;
+      includedTurns++;
+      firstIncludedTurn = index;
+    }
+  }
+  return { selectedMessages: turns.slice(firstIncludedTurn).flat(), firstIncludedTurn,
+    includedMessages, omittedMessages: messageCount - includedMessages, includedTurns, omittedTurns: firstIncludedTurn };
+}
+
+// Compatibility path for unusual cloneable values with serialization hooks or
+// snapshots too large/deep to establish stable additive costs within the probe.
+function selectCompactedTurnsLegacy({ systemPrompt, turns, tools, maxInputTokens, prefixMessages, strictLatest }) {
   const latestTurn = turns.at(-1) || [];
   const latestMessages = [...prefixMessages, ...latestTurn];
   const latest = measureRequest(systemPrompt, latestMessages, tools);
@@ -333,6 +462,40 @@ function selectCompactedTurns({ systemPrompt, turns, tools, maxInputTokens, pref
     includedTurns: selectedTurns.length,
     omittedTurns: Math.max(0, firstIncludedTurn),
   };
+}
+
+function stableTokenInputs(input) {
+  const ancestors = new Set();
+  let remaining = 100_000;
+  function visit(value, depth) {
+    if (--remaining < 0 || depth > 128) return false;
+    if (value === null || typeof value !== "object") return typeof value !== "function";
+    if (ancestors.has(value) || types.isProxy(value)) return false;
+    const prototype = Object.getPrototypeOf(value);
+    if (Array.isArray(value) ? prototype !== Array.prototype : prototype !== Object.prototype && prototype !== null) return false;
+    for (const field of ["toJSON", "context_archive"]) {
+      for (let owner = value; owner !== null; owner = Object.getPrototypeOf(owner)) {
+        if (types.isProxy(owner)) return false;
+        const descriptor = Object.getOwnPropertyDescriptor(owner, field);
+        if (!descriptor) continue;
+        if (!("value" in descriptor) || (field === "toJSON" && typeof descriptor.value === "function")) return false;
+        break;
+      }
+    }
+    ancestors.add(value);
+    try {
+      const keys = Array.isArray(value) ? null : Object.keys(value);
+      const count = keys ? keys.length : value.length;
+      if (count > remaining) return false;
+      for (let index = 0; index < count; index++) {
+        const key = keys ? keys[index] : String(index);
+        const descriptor = Object.getOwnPropertyDescriptor(value, key);
+        if (!descriptor || !("value" in descriptor) || !visit(descriptor.value, depth + 1)) return false;
+      }
+      return true;
+    } finally { ancestors.delete(value); }
+  }
+  return visit(input, 0);
 }
 
 function summaryPlan(summary, {
@@ -692,12 +855,11 @@ function measureRequest(systemPrompt, messages, tools) {
 }
 
 function estimateMessages(messages) {
-  return messages.reduce((total, message) => total + estimateValue(message) + 4, 0);
+  return measureModelMessages(messages);
 }
 
 function estimateValue(value) {
-  const serialized = typeof value === "string" ? value : JSON.stringify(value);
-  return Math.max(1, Math.ceil(new TextEncoder().encode(serialized || "").length / 3));
+  return estimateTokenValue(value);
 }
 
 function hashModelRequest(value) {

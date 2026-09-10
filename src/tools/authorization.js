@@ -5,6 +5,8 @@ import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { createPermissionProfile } from "./permission-profile.js";
 import { projectIdentity } from "./project-grant-store.js";
+import { readSessionState } from "../core/session-state-view.js";
+import { dispatchSessionAction } from "../core/session-action.js";
 
 const DECISIONS = new Set(["allow", "approval_required", "deny"]);
 const RISKS = new Set(["R0", "R1", "R2", "R3"]);
@@ -232,25 +234,25 @@ export function createProjectGrant({
 }
 
 export async function issueSessionGrant(session, grant) {
-  if (grant.sessionId !== session.id || path.resolve(grant.workspace) !== path.resolve(session.state.workspace)) {
+  if (grant.sessionId !== session.id || path.resolve(grant.workspace) !== path.resolve(readSessionState(session, ["workspace"]).workspace)) {
     throw new Error("Session Grant 不能跨 Session 或 workspace 签发");
   }
-  await session.dispatch({ type: "TOOL_GRANT_ISSUED", grant });
+  await dispatchSessionAction(session, { type: "TOOL_GRANT_ISSUED", grant });
   return grant;
 }
 
 export async function revokeSessionGrant(session, grantId, reason = "用户撤销授权") {
   if (typeof grantId !== "string" || !grantId) throw new Error("Session Grant ID 无效");
-  await session.dispatch({ type: "TOOL_GRANT_REVOKED", grantId, reason });
+  await dispatchSessionAction(session, { type: "TOOL_GRANT_REVOKED", grantId, reason });
 }
 
 export async function consumeSessionGrant(session, grantId, callId) {
-  const grant = session.state.toolGrants?.find((candidate) => candidate.id === grantId);
+  const grant = readSessionState(session, ["toolGrants"]).toolGrants?.find((candidate) => candidate.id === grantId);
   if (!grant) throw new Error(`未找到 Session Grant：${grantId}`);
   if (grantUsage(grant) !== "single_use") return false;
   if (grant.consumedAt) throw new Error(`Session Grant 已消费：${grantId}`);
   if (grant.callId && grant.callId !== callId) throw new Error(`Session Grant 与 Tool Call 不匹配：${grantId}`);
-  await session.dispatch({ type: "TOOL_GRANT_CONSUMED", grantId, callId });
+  await dispatchSessionAction(session, { type: "TOOL_GRANT_CONSUMED", grantId, callId });
   return true;
 }
 

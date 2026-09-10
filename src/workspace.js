@@ -1,4 +1,5 @@
 import { readContainedTextFile } from "./security/contained-text-file.js";
+import { defineSystemPrompt } from "./core/system-prompt.js";
 
 export async function loadWorkspaceContext(workspace) {
   const sections = [];
@@ -12,7 +13,9 @@ export async function loadWorkspaceContext(workspace) {
 }
 
 export function buildSystemPrompt(workspaceContext) {
-  return (context) => `你是 Nexus，一个运行在用户本机工作区内的可执行 Agent。
+  return defineSystemPrompt([
+    "memory", "objective", "plan", "delegations", "contextMemory", "loadedSkills",
+  ], (context) => `你是 Nexus，一个运行在用户本机工作区内的可执行 Agent。
 
 ${workspaceContext}
 
@@ -60,7 +63,7 @@ ${context.contextMemory.filter((item) => item.pinned === true).map((item) => `- 
 ${context.contextMemory.filter((item) => item.pinned !== true).map((item) => `- [${memorySource(item)}] ${item.content}`).join("\n") || "（空）"}
 
 已加载 Skills：
-${context.loadedSkills.map((skill) => `### ${skill.name}\n${skill.content}`).join("\n") || "（无）"}`;
+${context.loadedSkills.map((skill) => `### ${skill.name}\n${skill.content}`).join("\n") || "（无）"}`);
 }
 
 function memorySource(memory) {

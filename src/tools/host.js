@@ -7,6 +7,8 @@ import { redactSensitiveText } from "../security/redact.js";
 import { createToolOutputStream } from "./output-stream.js";
 import { runToolBatch } from "./batch.js";
 import { refreshVerification as refreshSessionVerification } from "../core/verification.js";
+import { readSessionState } from "../core/session-state-view.js";
+import { dispatchSessionAction } from "../core/session-action.js";
 import {
   consumeSessionGrant,
   createProjectGrant,
@@ -54,7 +56,7 @@ export class ToolHost {
   }
 
   async refreshVerification({ session, signal } = {}) {
-    if (!session?.state.plan?.acceptance?.length) return;
+    if (!readSessionState(session, ["plan"])?.plan?.acceptance?.length) return;
     if (typeof this.registry.refreshVerification !== "function") {
       return refreshSessionVerification({ session, signal });
     }
@@ -204,7 +206,7 @@ export class ToolHost {
 
     const validationError = validateArguments(definition.parameters, call.arguments);
     if (validationError) {
-      await session.dispatch({
+      await dispatchSessionAction(session, {
         type: "TOOL_VALIDATION_FAILED",
         call,
         argsHash,
@@ -233,7 +235,7 @@ export class ToolHost {
       return await finish(call, { ok: false, status: "capability_unavailable",
         result: "读取授权已变化，本次调用未启动；请按当前权限重新请求。", durationMs: 0 });
     }
-    await session.dispatch({
+    await dispatchSessionAction(session, {
       type: "TOOL_AUTHORIZATION_DECIDED",
       call,
       argsHash,
@@ -260,7 +262,7 @@ export class ToolHost {
     if (authorization.decision === "approval_required") {
       if (typeof requestApproval !== "function") throw new Error(`工具 ${call.name} 需要 Approval callback`);
       const approvalScopes = authorization.approvalScopes || ["once", "session", ...(this.projectGrantStore ? ["project"] : [])];
-      await session.dispatch({
+      await dispatchSessionAction(session, {
         type: "APPROVAL_REQUESTED",
         call,
         argsHash,
@@ -293,7 +295,7 @@ export class ToolHost {
         call,
         state: session.state,
         argsHash: currentArgsHash,
-        projectGrants: this.projectGrantStore?.list({ workspace: session.state.workspace }) || [],
+        projectGrants: this.projectGrantStore?.list({ workspace: readSessionState(session, ["workspace"]).workspace }) || [],
       }) : null;
       const stale = !currentDefinition
         || !definitionAvailable(currentDefinition, session.state)
@@ -303,7 +305,7 @@ export class ToolHost {
         || currentAuthorization.policyVersion !== authorization.policyVersion
         || currentAuthorization.capabilityHash !== authorization.capabilityHash
         || hashValue(currentAuthorization.resources) !== hashValue(authorization.resources);
-      await session.dispatch({
+      await dispatchSessionAction(session, {
         type: "APPROVAL_DECIDED",
         call,
         approved: approval.approved,
@@ -322,7 +324,7 @@ export class ToolHost {
         });
       }
       if (stale) {
-        await session.dispatch({
+        await dispatchSessionAction(session, {
           type: "TOOL_APPROVAL_STALE",
           call,
           argsHash,
@@ -341,7 +343,7 @@ export class ToolHost {
       const issuedAt = new Date().toISOString();
       const grant = approval.scope === "project"
         ? createProjectGrant({
-            workspace: session.state.workspace,
+            workspace: readSessionState(session, ["workspace"]).workspace,
             tool: call.name,
             capabilityHash: authorization.capabilityHash,
             policyVersion: authorization.policyVersion,
@@ -350,7 +352,7 @@ export class ToolHost {
           })
         : createSessionGrant({
             sessionId: session.id,
-            workspace: session.state.workspace,
+            workspace: readSessionState(session, ["workspace"]).workspace,
             tool: call.name,
             capabilityHash: authorization.capabilityHash,
             policyVersion: authorization.policyVersion,
@@ -361,7 +363,7 @@ export class ToolHost {
           });
       if (approval.scope === "project") {
         this.projectGrantStore.issue(grant);
-        await session.dispatch({ type: "TOOL_PROJECT_GRANT_ISSUED", grant });
+        await dispatchSessionAction(session, { type: "TOOL_PROJECT_GRANT_ISSUED", grant });
       } else {
         await issueSessionGrant(session, grant);
       }
@@ -399,7 +401,7 @@ export class ToolHost {
         ? null
         : new Date(executionStartedAt.getTime() + effectiveTimeoutMs).toISOString();
       try {
-        await session.dispatch({
+        await dispatchSessionAction(session, {
           type: "TOOL_EXECUTION_STARTED",
           at: executionStartedAt.toISOString(),
           call,
@@ -432,6 +434,17 @@ export class ToolHost {
       const started = performance.now();
       let implementationStarted = false;
       let executionActive = false;
+      let executionReturned = false;
+      let returnedValue;
+      let normalizationAttempted = false;
+      let returnedOutput;
+      const normalizeReturnedOutput = () => {
+        if (!normalizationAttempted) {
+          normalizationAttempted = true;
+          returnedOutput = normalizeResult(returnedValue);
+        }
+        return returnedOutput;
+      };
       let finalizedChanges = null;
       const finishExecution = async (result) => {
         finalizedChanges ||= finalizeTrackedChanges(changeCapture, {
@@ -476,17 +489,29 @@ export class ToolHost {
             deadlineAt,
           });
         }, executionSignal, { settleAfterAbortMs, waitForSettlement: Boolean(settings.admission) });
+        executionReturned = true;
+        returnedValue = value;
         await closeOutputStream();
         return await finishExecution({
           ok: true,
           status: "completed",
-          result: normalizeResult(value),
+          result: normalizeReturnedOutput(),
           durationMs: Math.round(performance.now() - started),
           effectiveTimeoutMs,
           terminationReason: "completed",
         });
       } catch (error) {
-        await closeOutputStream();
+        try { await closeOutputStream(); }
+        catch {
+          // Preserve the execution/cancellation failure and still attempt the
+          // terminal Tool Result. A secondary preview failure is not proof
+          // that the tool never ran or that the original output was absent.
+        }
+        let outputError = error;
+        if (executionReturned && !error?.result?.output) {
+          try { outputError = { result: { output: normalizeReturnedOutput() } }; }
+          catch { /* Preserve the original failure if the returned value cannot be normalized. */ }
+        }
         const durationMs = Math.round(performance.now() - started);
         if (termination.cause === "cancelled" || (!termination.cause && signal?.aborted)) {
           if (!implementationStarted) await cancelledBeforeStart(finish, call, signal, durationMs, effectiveTimeoutMs);
@@ -497,7 +522,7 @@ export class ToolHost {
             status: unknown ? "execution_unknown" : "cancelled",
             result: appendExecutionErrorOutput(unknown
               ? "任务已取消：工具已经启动，副作用结果未知，不会自动重试。"
-              : "任务已取消：工具执行已停止等待。", error),
+              : "任务已取消：工具执行已停止等待。", outputError),
             durationMs,
             effectiveTimeoutMs,
             terminationReason: "cancelled",
@@ -523,7 +548,7 @@ export class ToolHost {
             status: unknown ? "execution_unknown" : "timeout",
             result: appendExecutionErrorOutput(unknown
               ? `工具执行超时（${effectiveTimeoutMs}ms），副作用结果未知，不会自动重试。`
-              : `工具执行超时（${effectiveTimeoutMs}ms），已停止等待。`, error),
+              : `工具执行超时（${effectiveTimeoutMs}ms），已停止等待。`, outputError),
             durationMs,
             effectiveTimeoutMs,
             terminationReason: "timeout",
@@ -538,7 +563,7 @@ export class ToolHost {
           status: "external_failed",
           result: appendExecutionErrorOutput(
             `工具执行失败：${redactSensitiveText(error?.message || "未知错误")}`,
-            error,
+            outputError,
           ),
           durationMs,
           effectiveTimeoutMs,
@@ -567,7 +592,7 @@ function normalizeApprovalDecision(value, { projectAvailable }) {
 }
 
 async function capabilityUnavailable(session, finish, call, argsHash, registration, reason) {
-  await session.dispatch({
+  await dispatchSessionAction(session, {
     type: "TOOL_CAPABILITY_UNAVAILABLE",
     call,
     argsHash,
@@ -595,7 +620,7 @@ async function cancelledBeforeStart(finish, call, signal, durationMs = 0, effect
 }
 
 async function executionUnknown(session, call, definition, argsHash, reason, durationMs = 0, effectiveTimeoutMs = undefined) {
-  await session.dispatch({
+  await dispatchSessionAction(session, {
     type: "TOOL_EXECUTION_UNKNOWN",
     call,
     argsHash,
@@ -652,7 +677,7 @@ async function complete(session, call, result) {
     ...(result.verification ? { verification: result.verification } : {}),
   };
   if (resultSink) await resultSink(action);
-  else await session.dispatch(action);
+  else await dispatchSessionAction(session, action);
   return { ...publicResult, result: safeResult, ...(artifact ? { artifact } : {}) };
 }
 
@@ -817,7 +842,7 @@ async function beginTrackedChanges(definition, args, host, session) {
       return Array.isArray(value) ? value.map((item) => item?.[definition.changeTracking.pathField]) : [];
     });
     return await beginFileChangeCapture({
-      workspace: session.state.workspace,
+      workspace: readSessionState(session, ["workspace"]).workspace,
       mode: definition.changeTracking.mode,
       paths,
       authorizeRead: createInternalReadGuard({ registry: host.registry, policy: host.policy, session }),
@@ -843,7 +868,7 @@ export function createInternalReadGuard({ registry, policy, session }) {
     // Resolve on every read, exactly as native path tools do. Avoid cloning a
     // long conversation for every file; a new durable cursor refreshes inputs.
     if (!readState || readCursor !== session.cursor || session.cursor === undefined) {
-      const state = session.state;
+      const state = readSessionState(session, ["id", "workspace", "permissionProfile"]);
       readCursor = session.cursor;
       readState = { id: state.id, workspace: state.workspace, permissionProfile: state.permissionProfile, toolGrants: [] };
     }

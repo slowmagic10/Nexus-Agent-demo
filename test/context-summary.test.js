@@ -45,7 +45,8 @@ test("Context Summary Batch 按完整 turn 前向推进并标记过长来源", (
   });
 
   assert.equal(first.throughMessage, 2);
-  assert.deepEqual(first.messages.map((message) => message.role), ["user", "assistant"]);
+  assert.deepEqual(first.messages.map((message) => message.role), ["user", "context_source_notice", "assistant"]);
+  assert.ok(JSON.stringify(first.messages).length <= 10_000);
   assert.equal(first.sourceComplete, false);
 
   const second = selectContextSummaryBatch(messages, {

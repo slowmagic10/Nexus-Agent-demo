@@ -7,6 +7,7 @@ import {
   parseMaxTokensPerTurn,
 } from "../runtime-options.js";
 import { normalizeProviderRequestPolicy, providerRequestOverrides } from "../providers/request-policy.js";
+import { defineSystemPrompt, systemPromptFields } from "./system-prompt.js";
 
 const SAFE_PERMISSION_PROFILES = new Set([
   "read-only",
@@ -90,10 +91,12 @@ export function inspectNamedAgentProfiles(catalog) {
 export function appendAgentInstructions(systemPrompt, instructions) {
   const addition = String(instructions || "").trim();
   if (!addition) return systemPrompt;
-  return (context) => {
+  const prompt = (context) => {
     const base = typeof systemPrompt === "function" ? systemPrompt(context) : systemPrompt;
     return `${String(base || "").trim()}\n\n## Agent Profile instructions\n${addition}`.trim();
   };
+  const fields = systemPromptFields(systemPrompt);
+  return fields === null ? prompt : defineSystemPrompt(fields, prompt);
 }
 
 function normalizeProfile(id, value, defaults) {

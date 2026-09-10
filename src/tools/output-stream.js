@@ -27,9 +27,10 @@ class ToolOutputStream {
   #minUpdateChars;
   #raw = "";
   #truncated = false;
-  #publishedBoundary = 0;
-  #publishedPreview = null;
   #lastChannel = "stdout";
+  #published = null;
+  #active = null;
+  #pending = null;
   #tail = Promise.resolve();
   #closed = false;
 
@@ -47,54 +48,90 @@ class ToolOutputStream {
     const remaining = this.#maxPreviewChars - this.#raw.length;
     if (remaining > 0) this.#raw += chunk.slice(0, remaining);
     if (chunk.length > remaining) this.#truncated = true;
-
-    const boundary = completeLineBoundary(this.#raw);
-    if (boundary <= this.#publishedBoundary) return this.#tail;
-    if (this.#publishedPreview !== null
-      && !this.#truncated
-      && boundary - this.#publishedBoundary < this.#minUpdateChars) return this.#tail;
-    return this.#publish(boundary);
+    return this.#publish(completeLineBoundary(this.#raw));
   }
 
   async close() {
     if (this.#closed) return await this.#tail;
     this.#closed = true;
     const boundary = this.#truncated ? completeLineBoundary(this.#raw) : this.#raw.length;
-    await this.#publish(boundary, { force: true });
-    return await this.#tail;
+    return await this.#publish(boundary, { force: true });
   }
 
   #publish(boundary, { force = false } = {}) {
-    const visible = this.#raw.slice(0, boundary);
-    let preview = redactSensitiveText(visible);
-    if (this.#truncated) {
-      preview = preview
-        ? `${preview}${preview.endsWith("\n") ? "" : "\n"}…（实时输出达到预览上限）`
-        : "…（实时输出达到预览上限；不完整首行未写入预览）";
+    const snapshot = { boundary, visible: this.#raw.slice(0, boundary),
+      capturedChars: this.#raw.length, truncated: this.#truncated, channel: this.#lastChannel };
+    if (!snapshot.visible && !snapshot.truncated) return this.#tail;
+    if (this.#pending) {
+      // All burst callers share this acknowledgement. No per-chunk Promise or
+      // captured action accumulates while the current dispatch is unresolved.
+      this.#pending.snapshot = snapshot;
+      return this.#pending.promise;
     }
-    if (!preview || (!force && preview === this.#publishedPreview)) return this.#tail;
-    if (force && preview === this.#publishedPreview) return this.#tail;
-
-    const action = {
-      type: "TOOL_OUTPUT_UPDATED",
-      callId: this.#call.id,
-      tool: this.#call.name,
-      preview,
-      capturedChars: this.#raw.length,
-      truncated: this.#truncated,
-      channel: this.#lastChannel,
-    };
-    const operation = this.#tail
-      .catch(() => {})
-      .then(() => this.#dispatch(action))
-      .then((value) => {
-        this.#publishedBoundary = boundary;
-        this.#publishedPreview = preview;
-        return value;
-      });
-    this.#tail = operation;
-    return operation;
+    if (this.#active) {
+      if (!force && sameVisible(snapshot, this.#active.snapshot)) return this.#active.promise;
+      // close keeps one pending retry even for the active preview: a successful
+      // active commit deduplicates it, while a failed one may be repaired.
+      this.#pending = deferredSnapshot(snapshot);
+      this.#tail = this.#pending.promise;
+      return this.#tail;
+    }
+    if (this.#published) {
+      if (sameVisible(snapshot, this.#published.snapshot)) return this.#tail;
+      if (!force && !snapshot.truncated
+        && boundary - this.#published.snapshot.boundary < this.#minUpdateChars) return this.#tail;
+    }
+    const slot = deferredSnapshot(snapshot);
+    this.#tail = slot.promise;
+    this.#start(slot);
+    return slot.promise;
   }
+
+  #start(slot) {
+    this.#active = slot;
+    const snapshot = slot.snapshot;
+    let preview;
+    Promise.resolve().then(() => {
+      preview = redactSensitiveText(snapshot.visible);
+      if (snapshot.truncated) {
+        preview = preview
+          ? `${preview}${preview.endsWith("\n") ? "" : "\n"}…（实时输出达到预览上限）`
+          : "…（实时输出达到预览上限；不完整首行未写入预览）";
+      }
+      if (preview === this.#published?.preview) return this.#published.value;
+      return this.#dispatch({ type: "TOOL_OUTPUT_UPDATED", callId: this.#call.id, tool: this.#call.name,
+        preview, capturedChars: snapshot.capturedChars, truncated: snapshot.truncated, channel: snapshot.channel });
+    }).then((value) => {
+      this.#published = { snapshot, preview, value };
+      slot.resolve(value);
+      this.#finish(slot);
+    }, (error) => {
+      slot.reject(error);
+      this.#finish(slot);
+    });
+  }
+
+  #finish(slot) {
+    if (this.#active !== slot) return;
+    this.#active = null;
+    const next = this.#pending;
+    this.#pending = null;
+    if (next) this.#start(next);
+  }
+}
+
+function sameVisible(left, right) {
+  return left.visible === right.visible && left.truncated === right.truncated;
+}
+
+function deferredSnapshot(snapshot) {
+  let resolve;
+  let reject;
+  const promise = new Promise((success, failure) => { resolve = success; reject = failure; });
+  // Fire-and-forget producers are supported. The original Promise still
+  // rejects for callers/close; this only prevents an unobserved rejection.
+  promise.catch(() => {});
+  return { snapshot, promise, resolve, reject };
 }
 
 function normalizeOutputEvent(event) {
